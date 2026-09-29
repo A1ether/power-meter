@@ -519,7 +519,7 @@ body {
   gap: 7px;
 }
 
-/* 默认只显示前 5 条，其余折叠；展开状态由 .lots__list--expanded 切换。
+/* 默认只显示前 VISIBLE_LOTS 条（见 app.js），其余折叠；展开由 .lots__list--expanded 切换。
    选择器要带上 .lots__list 才能压过后面的 `.lot { display: grid }`（同优先级时后定义者胜） */
 .lots__list .lot--collapsed {
   display: none;

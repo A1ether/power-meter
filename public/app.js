@@ -1,7 +1,7 @@
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
 /** 每张卡片默认展示的积分数，其余折叠 */
-const VISIBLE_LOTS = 5;
+const VISIBLE_LOTS = 3;
 
 const state = {
   data: null,
@@ -371,7 +371,7 @@ function buildCard(provider, thresholds) {
       list.append(item);
     });
 
-    // 超过 5 条的折叠起来，避免单个平台把整屏占满
+    // 超出 VISIBLE_LOTS 的折叠起来，避免单个平台把整屏占满
     const hiddenCount = credits.length - VISIBLE_LOTS;
     if (hiddenCount > 0) {
       const toggle = element('button', 'lots__toggle', `展开其余 ${hiddenCount} 个 ⌄`);
