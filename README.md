@@ -9,6 +9,8 @@
 
 > 开发前的 GitHub 开源项目调研、复用评估与接口实测记录见
 > [`docs/开源项目调研与复用评估.md`](docs/开源项目调研与复用评估.md)。
+> **换成自己的账号（逐平台抓凭证 + 字段映射 + 排错）见
+> [`docs/凭证配置指南.md`](docs/凭证配置指南.md)。**
 
 ---
 
@@ -223,13 +225,17 @@ interface ProviderSnapshot {
 
 #### 取 Cookie / Token 的通用步骤
 
-1. 浏览器登录目标平台，打开 DevTools → Network → 筛 Fetch/XHR；
+> 每个平台的**逐步操作说明、字段映射写法与排错表**见
+> [`docs/凭证配置指南.md`](docs/凭证配置指南.md)。
+
+1. 浏览器登录目标平台，打开 DevTools（`⌥⌘I`）→ Network → 筛 Fetch/XHR；
 2. 进入「用量 / 账单 / 账户」页面，找到返回余额或积分列表的请求；
-3. 复制请求头里的 `Cookie`（或 `Authorization`）填入 `credentials`；
-4. 右键 → Copy as cURL，把 **URL** 填进 `options.endpoint`，
+3. 复制请求头里的 `Cookie`（或 `Authorization`）填入 `credentials`
+   —— 也可以直接粘贴整段 **Copy as cURL**，程序会自动剥出请求头；
+4. **仅无公开接口的平台需要**：右键 → Copy as cURL，把 **URL** 填进 `options.endpoint`，
    响应 JSON 的字段路径填进 `options.mapping`。
 
-**Qoder / Trae 不需要第 4 步**（接口已内置）。
+**Qoder / Trae 不需要第 4 步**（接口已内置）。改完先跑 `npm run probe` 验证，再开浏览器。
 
 ### 示例：接入一个自建网关
 

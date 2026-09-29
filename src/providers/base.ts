@@ -201,15 +201,42 @@ export function optNumber(account: AccountConfig, key: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-/** 把裸 Cookie 值 / `Cookie:` 头 / cURL 抓包统一成可直接发送的 Cookie 头 */
-export function normalizeCookieHeader(raw: string): string {
+/**
+ * 从任意粘贴形式里抽出指定请求头的值。兼容以下三种常见做法：
+ *   1. DevTools 右键请求 → Copy as cURL：
+ *      curl 'https://x' -H 'cookie: a=1; b=2' -H "authorization: Bearer x"
+ *   2. 从 Request Headers 直接复制一整行：Cookie: a=1; b=2
+ *   3. 只复制值本身：a=1; b=2
+ */
+export function extractHeaderValue(raw: string, headerName: string): string {
   const value = raw.trim();
   if (!value) return '';
-  const curlCookie = /-H\s+'cookie:\s*([^']+)'/i.exec(value);
-  if (curlCookie?.[1]) return curlCookie[1].trim();
-  const header = /^cookie\s*:\s*([\s\S]+)$/i.exec(value);
-  if (header?.[1]) return header[1].replace(/\\\r?\n/g, ' ').replace(/\s+/g, ' ').trim();
-  return value.replace(/\s+/g, ' ');
+  const name = headerName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const curl = new RegExp(
+    `(?:-H|--header)\\s+(['"])\\s*${name}\\s*:\\s*([\\s\\S]*?)\\1`,
+    'i',
+  ).exec(value);
+  if (curl?.[2]) return curl[2].trim();
+  const line = new RegExp(`(?:^|\\n)\\s*${name}\\s*:\\s*([^\\n]+)`, 'i').exec(value);
+  if (line?.[1]) return line[1].trim();
+  return value;
+}
+
+/**
+ * 把裸 Cookie 值 / `Cookie:` 头 / cURL 抓包统一成可直接发送的 Cookie 头。
+ * 另外兼容 Cookie 被换行折行的情况：只把后续仍然长得像 `k=v` 的行拼回来，
+ * 这样多行 cURL 命令行不会被误吞。
+ */
+export function normalizeCookieHeader(raw: string): string {
+  const first = extractHeaderValue(raw, 'cookie').replace(/\s+/g, ' ').trim();
+  if (!first) return '';
+  const continuations = raw
+    .split(/\r?\n/)
+    .slice(1)
+    .map((line) => line.trim())
+    .filter((line) => /^[^\s:=]+=[^\s;]*;?$/.test(line));
+  if (continuations.length === 0) return first;
+  return `${first} ${continuations.join(' ')}`.replace(/\s+/g, ' ').trim();
 }
 
 /** 从多个候选字段里抽取过期时间，兼容各家命名 */

@@ -6,6 +6,7 @@ import {
   buildSnapshot,
   cred,
   extractExpiry,
+  extractHeaderValue,
   failure,
   makeLot,
   makeWindow,
@@ -117,8 +118,9 @@ export const traeAdapter: ProviderAdapter = {
     const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
     if (!rawToken) return notConfigured(traeAdapter, account, ctx, ['accessToken']);
 
-    const accessToken = rawToken
-      .replace(/^authorization\s*:\s*/i, '')
+    // 支持直接粘贴令牌、粘贴 `Authorization: Cloud-IDE-JWT xxx`，
+    // 或直接粘贴 DevTools 的 Copy as cURL 整段文本
+    const accessToken = extractHeaderValue(rawToken, 'authorization')
       .replace(/^cloud-ide-jwt\s+/i, '')
       .trim();
     if (!accessToken || /[\r\n]/.test(accessToken)) {

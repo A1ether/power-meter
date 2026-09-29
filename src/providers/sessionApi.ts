@@ -126,12 +126,20 @@ export function createSessionApiAdapter(preset: SessionApiPreset): ProviderAdapt
           )
         : {};
 
-      const missing = preset.requiredCredentialKeys.filter(
-        (key) =>
-          !account.credentials[key] &&
-          !(key === 'cookie' && cookie) &&
-          !(key === 'authorization' && extraHeaders.Authorization),
+      // 平台要求的凭证不一定只有 Cookie：有的平台更适合放 Authorization / X-Auth-Token，
+      // 只要提供了任一可用的鉴权材料，就不再判为「未配置」。
+      const hasAlternativeAuth = Boolean(
+        extraHeaders.Authorization ??
+          extraHeaders.authorization ??
+          extraHeaders['X-Auth-Token'] ??
+          extraHeaders['x-auth-token'],
       );
+      const missing = preset.requiredCredentialKeys.filter((key) => {
+        if (account.credentials[key]) return false;
+        if (key === 'cookie' && (cookie !== '' || hasAlternativeAuth)) return false;
+        if (key === 'authorization' && hasAlternativeAuth) return false;
+        return true;
+      });
       if (missing.length > 0) return notConfigured(adapter, account, ctx, missing);
 
       const method = (optString(account, 'method') || preset.defaultMethod) as 'GET' | 'POST';
