@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Power Meter · 多平台余额看板</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%E2%9A%A1%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="glow" aria-hidden="true"></div>
+
+    <header class="topbar">
+      <div class="topbar__brand">
+        <span class="logo">⚡</span>
+        <div>
+          <h1>Power Meter</h1>
+          <p id="subtitle">多平台余额 / 积分看板</p>
+        </div>
+      </div>
+
+      <div class="topbar__actions">
+        <label class="switch" title="每 5 分钟自动刷新">
+          <input type="checkbox" id="auto-refresh" checked />
+          <span>自动刷新</span>
+        </label>
+        <button class="btn btn--primary" id="refresh-btn" type="button">立即刷新</button>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <section class="summary" id="summary" aria-label="总体汇总"></section>
+
+      <section class="alert" id="alert" hidden></section>
+
+      <section class="toolbar" aria-label="排序与筛选">
+        <div class="toolbar__group">
+          <label for="sort">排序</label>
+          <select id="sort">
+            <option value="expiry">最快到期优先</option>
+            <option value="risk">仅看有到期风险的</option>
+            <option value="amount-asc">余额从少到多</option>
+            <option value="amount-desc">余额从多到少</option>
+            <option value="status">异常优先</option>
+            <option value="name">按名称</option>
+          </select>
+        </div>
+
+        <div class="toolbar__group">
+          <label for="search">筛选</label>
+          <input id="search" type="search" placeholder="平台名 / 批次 / 币种" />
+        </div>
+
+        <div class="toolbar__meta" id="meta"></div>
+      </section>
+
+      <section class="grid" id="grid" aria-live="polite"></section>
+
+      <section class="panel" aria-label="到期时间线">
+        <div class="panel__head">
+          <h2>到期时间线</h2>
+          <p class="muted">按过期时间升序，优先消耗排在最前面的积分</p>
+        </div>
+        <ol class="timeline" id="timeline"></ol>
+      </section>
+
+      <section class="panel" aria-label="诊断信息">
+        <div class="panel__head">
+          <h2>诊断</h2>
+          <p class="muted">凭证与配置问题会在这里提示</p>
+        </div>
+        <div id="diagnostics" class="diagnostics"></div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span id="footer-updated"></span>
+      <span>数据仅在本机内存中缓存，凭证不会被下发到浏览器</span>
+    </footer>
+
+    <template id="card-template">
+      <article class="card">
+        <div class="card__glow" aria-hidden="true"></div>
+        <header class="card__head">
+          <div class="card__title">
+            <span class="dot"></span>
+            <h3 class="card__name"></h3>
+          </div>
+          <div class="card__tags"></div>
+        </header>
+
+        <div class="card__balance">
+          <span class="card__amount">–</span>
+          <span class="card__currency"></span>
+        </div>
+        <p class="card__plan muted"></p>
+
+        <div class="meter" hidden>
+          <div class="meter__bar"><span class="meter__fill"></span></div>
+          <div class="meter__legend"><span class="meter__left"></span><span class="meter__right"></span></div>
+        </div>
+
+        <div class="lots">
+          <div class="lots__head">
+            <span>积分批次</span>
+            <span>过期 / 剩余</span>
+          </div>
+          <ul class="lots__list"></ul>
+        </div>
+
+        <p class="card__note" hidden></p>
+
+        <footer class="card__foot">
+          <span class="card__updated muted"></span>
+          <a class="card__link" target="_blank" rel="noreferrer noopener">打开面板 ↗</a>
+        </footer>
+      </article>
+    </template>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

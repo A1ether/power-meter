@@ -1,0 +1,152 @@
+{
+  "_comment": [
+    "复制为 accounts.json 后按需修改（该文件已被 .gitignore 忽略）。",
+    "credentials 里建议写 ${ENV_VAR} 引用环境变量，避免把凭证明文写进文件。",
+    "保存文件后服务会自动热加载，无需重启。",
+    "provider 支持：qoder / trae / codebuddy / codearts / custom / demo:*"
+  ],
+  "accounts": [
+    {
+      "provider": "qoder",
+      "displayName": "Qoder 国际站",
+      "enabled": false,
+      "credentials": {
+        "cookie": "${QODER_COOKIE}"
+      },
+      "options": {
+        "site": "global"
+      }
+    },
+    {
+      "provider": "qoder",
+      "displayName": "Qoder 大陆站",
+      "enabled": false,
+      "credentials": {
+        "cookie": "${QODER_COOKIE}"
+      },
+      "options": {
+        "site": "cn"
+      }
+    },
+    {
+      "provider": "trae",
+      "displayName": "Trae",
+      "enabled": false,
+      "credentials": {
+        "accessToken": "${TRAE_ACCESS_TOKEN}",
+        "deviceId": "${TRAE_DEVICE_ID}"
+      },
+      "options": {}
+    },
+    {
+      "provider": "codebuddy",
+      "displayName": "CodeBuddy",
+      "enabled": false,
+      "credentials": {
+        "cookie": "${CODEBUDDY_COOKIE}"
+      },
+      "options": {
+        "endpoint": "从 DevTools 抓到的接口完整 URL",
+        "method": "GET",
+        "mapping": {
+          "wrap": "data",
+          "balance": { "path": "balance|credits", "currency": "CREDITS" },
+          "creditLots": {
+            "path": "creditPackages|packs",
+            "amount": "remaining|remain|amount",
+            "expiresAt": "expireTime|expiresAt|endTime",
+            "label": "name|packageName",
+            "currency": "CREDITS"
+          },
+          "plan": "planName|plan"
+        }
+      }
+    },
+    {
+      "provider": "codearts",
+      "displayName": "CodeArts 华为云",
+      "enabled": false,
+      "credentials": {
+        "cookie": "${CODEARTS_COOKIE}"
+      },
+      "options": {
+        "endpoint": "从 DevTools 抓到的接口完整 URL",
+        "method": "GET",
+        "headers": {
+          "X-Auth-Token": "${CODEARTS_AUTH_TOKEN}"
+        },
+        "mapping": {
+          "wrap": "data",
+          "balance": { "path": "balance|amount", "currency": "CNY" },
+          "creditLots": {
+            "path": "resources|packages",
+            "amount": "remaining|available",
+            "expiresAt": "expireTime|validUntil",
+            "label": "name|resourceName",
+            "currency": "CNY"
+          }
+        }
+      }
+    },
+    {
+      "provider": "custom",
+      "displayName": "自建/第三方平台示例",
+      "enabled": false,
+      "credentials": {},
+      "options": {
+        "providerId": "custom-a",
+        "endpoint": "https://your-gateway.example.com/api/usage",
+        "method": "GET",
+        "headers": {
+          "Authorization": "Bearer ${CUSTOM_API_KEY}"
+        },
+        "mapping": {
+          "wrap": "data",
+          "balance": { "path": "remaining", "currency": "USD" },
+          "creditLots": {
+            "path": "grants",
+            "amount": "remaining",
+            "expiresAt": "expiresAt",
+            "label": "name",
+            "currency": "USD"
+          }
+        }
+      }
+    },
+    {
+      "provider": "demo:qoder",
+      "displayName": "Qoder（示例）",
+      "enabled": true,
+      "credentials": {},
+      "options": {}
+    },
+    {
+      "provider": "demo:trae",
+      "displayName": "Trae（示例）",
+      "enabled": true,
+      "credentials": {},
+      "options": {}
+    },
+    {
+      "provider": "demo:codebuddy",
+      "displayName": "CodeBuddy（示例）",
+      "enabled": true,
+      "credentials": {},
+      "options": {}
+    },
+    {
+      "provider": "demo:codearts",
+      "displayName": "CodeArts 华为云（示例）",
+      "enabled": true,
+      "credentials": {},
+      "options": {}
+    },
+    {
+      "provider": "demo:no-expiry",
+      "displayName": "示例 · 无过期时间",
+      "enabled": false,
+      "credentials": {},
+      "options": {}
+    }
+  ]
+}
