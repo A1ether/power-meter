@@ -46,9 +46,10 @@ export interface WindowInput {
 
 /** 归一化额度窗口，百分比与 remaining 由 used/limit 推导，避免上游字段不一致 */
 export function makeWindow(input: WindowInput): QuotaWindow {
-  const used = Math.max(0, input.used);
-  const limit = Math.max(0, input.limit);
-  const remaining = Math.max(0, input.remaining ?? limit - used);
+  const round = (value: number): number => Math.round(value * 100) / 100;
+  const used = round(Math.max(0, input.used));
+  const limit = round(Math.max(0, input.limit));
+  const remaining = round(Math.max(0, input.remaining ?? limit - used));
   const usedPercent = limit > 0 ? clamp((used / limit) * 100, 0, 100) : 0;
   return {
     kind: input.kind ?? 'billing',
@@ -72,6 +73,7 @@ export function makeLot(input: {
   currency: Currency;
   expiresAt?: string | null;
   note?: string;
+  basis?: 'remaining' | 'granted';
 }): CreditLot {
   return {
     id: input.id,
@@ -80,6 +82,7 @@ export function makeLot(input: {
     currency: input.currency,
     expiresAt: input.expiresAt ? toIso(input.expiresAt) : null,
     note: input.note ?? '',
+    basis: input.basis ?? 'remaining',
   };
 }
 

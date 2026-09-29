@@ -57,6 +57,13 @@ export interface CreditLot {
   currency: Currency;
   expiresAt: string | null;
   note: string;
+  /**
+   * amount 的口径：
+   * - `remaining`（默认）：该批次**当前剩余**，可直接累加进总额
+   * - `granted`：该批次**授予总量**（平台只给账户级剩余、不提供批次级剩余时使用），
+   *   此时仅用于展示「什么时候到期」，不参与汇总，避免与 balance 重复计算
+   */
+  basis: 'remaining' | 'granted';
 }
 
 export interface MoneyBalance {

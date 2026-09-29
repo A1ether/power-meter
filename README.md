@@ -17,10 +17,10 @@
 ## 快速开始
 
 ```bash
-# 1. 安装（仅开发依赖）
+# 1. 安装（仅开发依赖，运行时零依赖）
 npm install
 
-# 2. 生成账号配置（内含示例数据，开箱即可看到完整看板）
+# 2. 生成账号配置
 cp accounts.example.json accounts.json
 
 # 3. 启动
@@ -28,8 +28,22 @@ npm start
 # 打开 http://127.0.0.1:8787
 ```
 
-启动后你会看到 4 个示例平台（Trae 2 天后到期会被标红脉冲高亮、Qoder 6 天后到期等）。
-把真实凭证填进 `accounts.json`（保存即生效），再把对应示例条目的 `enabled` 改成 `false` 即可。
+### 接入自己的账号（推荐：自动抓取，约 1 分钟）
+
+```bash
+npm run chrome:debug     # ① 弹出一个调试专用 Chrome 窗口
+                         #   ② 在里面登录 Qoder / Trae / CodeBuddy / CodeArts
+                         #      并各自打开「用量 / 账单」页面
+npm run capture          # ③ 自动抓取四个平台的登录态，写入 .env
+npm run probe            # ④ 验证取数是否正常
+# 刷新 http://127.0.0.1:8787
+```
+
+四个平台都只需要**一个 Cookie**，其余全部自动完成 —— 包括 Trae 那个只有 1 天有效期的
+JWT，由适配器用 Cookie 自动续签，不需要手工维护。
+
+> 调试窗口用的是独立 profile（`~/.power-meter/chrome-profile`），与你日常的 Chrome 完全隔离。
+> 原因：Chrome 136+ 禁止对默认资料目录开启远程调试端口。
 
 ### 常用命令
 
@@ -37,22 +51,35 @@ npm start
 | --- | --- |
 | `npm start` | 启动看板服务 |
 | `npm run dev` | 带文件监听的热重载开发模式 |
-| `npm run probe` | **命令行探测凭证是否可用**（改配置后先跑这个最快）|
+| `npm run chrome:debug` | 启动带调试端口的独立 Chrome（抓取凭证用）|
+| `npm run capture` | **自动抓取四个平台的登录态并写入 `.env`** |
+| `npm run capture -- --dry-run` | 只预览，不写文件 |
+| `npm run probe` | **命令行探测取数是否正常**（改配置后先跑这个最快）|
 | `npm run probe -- qoder trae` | 只探测指定平台 |
 | `npm run probe -- --json` | 输出机器可读结果 |
 | `npm run typecheck` | 类型检查 |
 | `npm run build && npm run serve` | 编译到 `dist/` 后以纯 JS 运行 |
 
-`npm run probe` 的实测输出示例：
+手工配置（不用抓取工具）的完整步骤、各平台接口说明与排错表见
+[`docs/凭证配置指南.md`](docs/凭证配置指南.md)。
+
+`npm run probe` 的实测输出示例（真实账号）：
 
 ```
-● Qoder 假凭证                  unauthorized     198ms  HTTP 401 {"errorCode":"Unauthorized",...}
-● Trae 假凭证                   unauthorized      74ms  HTTP 401 {"code":1001,...}
-● CodeArts 未配端点              notConfigured      0ms  CodeArts 华为云 没有公开接口，需要你从浏览器抓一次真实请求后填入 options.endpoint。
-● Qoder 示例                   demo               1ms
-                          余额 1860 CREDITS  最快到期 2026-10-05
-                            · 大模型积分（本期剩余）       1860   过期 2026-10-05
-                            · 活动赠送积分            420    过期 2026-11-09
+● Qoder              ok    252ms
+                  余额 500 CREDITS  最快到期 2026-10-23
+                    · 赠送资源包     100   过期 2026-10-29
+                    · 赠送资源包     100   过期 2026-10-23
+● Trae               ok    228ms
+                  余额 3538.45 CREDITS  最快到期 2026-09-30
+                  积分额度（本期）: 3538.45/4900
+● CodeBuddy          ok    849ms
+                  余额 2789.65 CREDITS  最快到期 2026-09-30
+● CodeArts 华为云      ok   1129ms
+                  余额 8500 CREDITS  最快到期 2026-10-26
+                    · 基础套餐积分   500    过期 2026-10-26
+                    · 赠送积分包    8000    过期 2026-10-26
+合计 4 个平台，正常 4 个，异常 0 个。
 ```
 
 ---
@@ -201,10 +228,10 @@ interface ProviderSnapshot {
 ```jsonc
 {
   "provider": "qoder",              // 平台 id，支持别名，见下表
-  "displayName": "Qoder 国际站",     // 可选，自定义展示名
+  "displayName": "Qoder",            // 可选，自定义展示名
   "enabled": true,
   "credentials": { "cookie": "${QODER_COOKIE}" },  // 敏感值，建议引用环境变量
-  "options": { "site": "global" }    // 非敏感配置
+  "options": { "site": "cn" }        // 非敏感配置
 }
 ```
 
@@ -213,15 +240,19 @@ interface ProviderSnapshot {
 
 ### 各平台配置
 
+四个平台的凭证都只需要 **一个 Cookie**：
+
 | 平台 | `provider` | 需要的凭证 | 关键 `options` |
 | --- | --- | --- | --- |
-| Qoder 国际站 | `qoder` | `cookie` | `site: "global"` |
-| Qoder 大陆站 | `qoder` 或 `qoder.cn` | `cookie` | `site: "cn"`（或 `origin: "https://qoder.cn"`）|
-| Trae | `trae` / `trae.cn` | `accessToken`（`Cloud-IDE-JWT` 值）| 可选 `deviceId` |
-| CodeBuddy | `codebuddy` | `cookie` | `endpoint`、`mapping` |
-| CodeArts | `codearts` | `cookie` 或 `headers["X-Auth-Token"]` | `endpoint`、`mapping` |
+| Qoder | `qoder` / `qoder.cn` | `cookie` | `site: "cn"`（国内，默认）或 `"global"` |
+| Trae | `trae` / `trae.cn` | `cookie` | JWT 由 Cookie 自动续签；可选 `accessToken` 覆盖 |
+| CodeBuddy | `codebuddy` | `cookie`（**必须含 `www` 子域**）| — |
+| CodeArts | `codearts` | `cookie`（含 `devclouddevuibjtcftk`）| 可选 `resourceType`、`region` |
 | 任意平台 | `custom` | 按需 `headers` | `providerId`、`endpoint`、`mapping` |
 | 示例数据 | `demo:qoder` / `demo:trae` / `demo:codebuddy` / `demo:codearts` / `demo:no-expiry` | 无 | — |
+
+另有一个全局变量 `HTTP_USER_AGENT`：**CodeBuddy 的 WAF 会校验 UA**，
+缺失或版本过旧会直接 401，`npm run capture` 会自动写入本机浏览器的真实 UA。
 
 #### 取 Cookie / Token 的通用步骤
 
@@ -313,16 +344,18 @@ interface ProviderSnapshot {
 
 ## 已知限制
 
-- **CodeBuddy / CodeArts 需要一次性抓包配置**。这两个平台在 GitHub 上没有任何开源实现
-  （CodexBar 的 60+ provider、token-monitor 的 41+ provider 都没覆盖），
-  其接口路径通过浏览器登录后才能确定，因此本项目不硬编码猜测路径，而是提供声明式映射。
-  接口一旦变化，只改配置、不改代码。
-- **Qoder / Trae 依赖浏览器登录态**，Cookie 会过期。过期后卡片会显示 `unauthorized`
-  并保留上次数据（标记"数据可能过期"），重新复制 Cookie 即可。
-- **Trae 的过期时间**取决于上游是否在权益包里返回；若没有返回，
-  界面会给出提示建议以官方页面为准。
+- **所有平台都依赖浏览器登录态**，Cookie 会过期。过期后卡片会显示 `unauthorized`
+  并保留上次数据（标记"数据可能过期"），重新登录 + `npm run capture` 即可。
+- **Trae 的 JWT 只有 1 天有效**，但适配器会用 Cookie 自动续签，因此你只需保证 Cookie 有效。
+- **批次金额有两种口径**：平台提供批次级剩余时按「剩余量」展示（Qoder / CodeArts）；
+  只提供账户级剩余时按「周期授予量」展示并在界面标注（Trae / CodeBuddy），
+  这类批次**不参与汇总**，只用于计算「最快到期」。
+- **CodeBuddy 对请求很敏感**：WAF 校验 `User-Agent`，且会话 Cookie 挂在 `www` 子域下。
+  请通过 `npm run capture` 抓取；手工配置时注意 `HTTP_USER_AGENT` 与子域 Cookie。
+- **CodeBuddy / CodeArts 的接口是通过抓包定位的**，上游若改动字段，适配器会以明确的
+  错误信息暴露出来（例如「响应缺少 xxx」），届时更新对应单文件即可。
 - CodeArts 官方另有一套 AK/SK 签名的 API 网关，本项目优先支持网页登录态；
-  若要接 AK/SK，可通过 `options.headers` 注入签名头，或基于 `sessionApi.ts` 扩展适配器。
+  若要接 AK/SK，可基于 `codearts.ts` 扩展，用 `options.headers` 注入签名头。
 - 服务默认只监听 `127.0.0.1`，且不含鉴权。若要暴露到局域网，
   请自行加反向代理鉴权——因为该服务持有你所有平台的登录态。
 

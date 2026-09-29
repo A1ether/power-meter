@@ -1,5 +1,7 @@
 import type { AccountConfig } from '../config.js';
 import type { ProviderAdapter } from './base.js';
+import { codeartsAdapter } from './codearts.js';
+import { codebuddyAdapter } from './codebuddy.js';
 import { demoAdapters } from './demo.js';
 import { sessionApiAdapters } from './presets.js';
 import { qoderAdapter } from './qoder.js';
@@ -11,7 +13,14 @@ import { traeAdapter } from './trae.js';
  */
 const REGISTRY = new Map<string, ProviderAdapter>();
 
-for (const adapter of [qoderAdapter, traeAdapter, ...sessionApiAdapters, ...demoAdapters]) {
+for (const adapter of [
+  qoderAdapter,
+  traeAdapter,
+  codebuddyAdapter,
+  codeartsAdapter,
+  ...sessionApiAdapters,
+  ...demoAdapters,
+]) {
   REGISTRY.set(adapter.id, adapter);
 }
 

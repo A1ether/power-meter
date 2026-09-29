@@ -353,10 +353,12 @@ function buildCard(provider, thresholds) {
       const level = levelFor(days, thresholds);
       const item = element('li', 'lot');
       item.dataset.level = level;
-      item.append(
-        element('span', 'lot__label', lot.label),
-        element('span', 'lot__amount', `${fmtNumber(lot.amount)} ${lot.currency}`),
-      );
+      const amount = element('span', 'lot__amount', `${fmtNumber(lot.amount)} ${lot.currency}`);
+      if (lot.basis === 'granted') {
+        // 平台只给账户级剩余时，批次金额是「该周期授予量」，避免被误当成剩余
+        amount.append(element('span', 'lot__basis', ' 授予量'));
+      }
+      item.append(element('span', 'lot__label', lot.label), amount);
       const expiry = element('div', 'lot__expiry');
       expiry.append(
         element('span', null, lot.expiresAt ? `过期：${fmtDate(lot.expiresAt)}` : '不过期'),

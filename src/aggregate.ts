@@ -28,7 +28,8 @@ export function buildTotals(snapshots: ProviderSnapshot[]): DashboardTotals {
     else failed += 1;
 
     for (const lot of snapshot.credits) {
-      if (lot.amount <= 0) continue;
+      // basis='granted' 的批次只表达「何时到期」，不参与累加，避免与 balance 重复计算
+      if (lot.amount <= 0 || lot.basis === 'granted') continue;
       creditsByCurrency[lot.currency] = round((creditsByCurrency[lot.currency] ?? 0) + lot.amount);
     }
     if (snapshot.balance && snapshot.balance.amount > 0) {

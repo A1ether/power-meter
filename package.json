@@ -11,6 +11,8 @@
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
     "probe": "tsx src/cli/probe.ts",
+    "capture": "tsx src/cli/capture.ts",
+    "chrome:debug": "tools/chrome-debug.sh",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.json",
     "serve": "node dist/server.js"

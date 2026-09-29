@@ -1,8 +1,23 @@
 import { isRecord } from './json.js';
 
-export const BROWSER_USER_AGENT =
+const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
-  '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+  '(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+
+/**
+ * 用哪个 User-Agent 请求上游。
+ *
+ * 这不是可选项：部分平台（实测 CodeBuddy）的 WAF 会校验 UA，
+ * 缺失或版本过旧会直接返回 401。因此 `npm run capture` 会把本机浏览器的
+ * 真实 UA 写进 .env 的 HTTP_USER_AGENT，这里优先使用它。
+ *
+ * 采用惰性读取而不是模块级常量：config.ts 里的 .env 解析要等到
+ * loadConfig() 才执行，早于它的模块初始化读不到变量。
+ */
+export function browserUserAgent(): string {
+  const override = process.env.HTTP_USER_AGENT?.trim();
+  return override || DEFAULT_USER_AGENT;
+}
 
 export class HttpError extends Error {
   readonly status: number;
@@ -59,7 +74,7 @@ export async function fetchJson(
       method: init.method ?? 'GET',
       headers: {
         Accept: 'application/json, text/plain, */*',
-        'User-Agent': BROWSER_USER_AGENT,
+        'User-Agent': browserUserAgent(),
         ...(init.body ? { 'Content-Type': 'application/json' } : {}),
         ...(init.headers ?? {}),
       },
