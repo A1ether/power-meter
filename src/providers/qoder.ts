@@ -42,6 +42,17 @@ import {
 
 const QODER_TIMEOUT_FALLBACK = 12_000;
 
+/** 归一化后属于「免费档」的套餐名，不展示在卡片上 */
+const FREE_TIER_LABELS = new Set([
+  'free',
+  'free tier',
+  'community',
+  'community edition',
+  '社区版',
+  '免费',
+  '免费版',
+]);
+
 /** 同一笔额度可能出现在多个容器里，用 id 去重 */
 function parseQuotaDetail(container: unknown): unknown[] {
   const detail = pick(container, 'quotaDetail', 'quota_detail');
@@ -192,12 +203,16 @@ function parsePlanLabel(body: unknown): string {
       pick(candidate, 'name'),
     );
     if (!raw) continue;
-    return raw
+    const label = raw
       .replace(/^ORGANIZATION_PLAN_TIER_/i, '')
       .replace(/^PLAN_TIER_/i, '')
       .replace(/[_-]+/g, ' ')
       .replace(/\bpro\s+plus\b/i, 'Pro+')
       .replace(/\b\w/g, (char) => char.toUpperCase());
+
+    // 免费档不展示：没有套餐名本身就说明是免费，多一行反而让卡片与其它平台不一致
+    if (FREE_TIER_LABELS.has(label.trim().toLowerCase())) return '';
+    return label;
   }
   return '';
 }

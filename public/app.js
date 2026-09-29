@@ -322,7 +322,10 @@ function buildCard(provider, thresholds) {
   const planText = [provider.plan, provider.source === 'local' ? '本地示例' : null]
     .filter(Boolean)
     .join(' · ');
-  node.querySelector('.card__plan').textContent = planText;
+  const planNode = node.querySelector('.card__plan');
+  planNode.textContent = planText;
+  // 没有套餐名时整行隐藏，避免空 <p> 带着负 margin 参与排版，让各卡片高度不一致
+  planNode.hidden = planText === '';
 
   const meter = node.querySelector('.meter');
   const primaryWindow = provider.windows.find((window) => window.showMeter);
