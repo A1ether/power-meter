@@ -6,11 +6,14 @@ import {
   buildSnapshot,
   cred,
   failure,
+  hiddenLotsNote,
+  joinNotes,
   makeLot,
   makeWindow,
   normalizeCookieHeader,
   notConfigured,
   optString,
+  splitByExpiry,
   type ProbeContext,
   type ProviderAdapter,
 } from './base.js';
@@ -228,11 +231,7 @@ export const codeartsAdapter: ProviderAdapter = {
         expiresAt,
       });
 
-      const notes: string[] = [];
-      if (overview.expiringAmount > 0) {
-        notes.push(`有 ${overview.expiringAmount} 积分临近过期`);
-      }
-      if (!expiresAt) notes.push('未取到订阅到期时间，可检查 cftk 是否随 Cookie 一并提供');
+      const { active, expired } = splitByExpiry(lots, ctx.now);
 
       return buildSnapshot({
         adapter: codeartsAdapter,
@@ -240,9 +239,13 @@ export const codeartsAdapter: ProviderAdapter = {
         status: 'ok',
         now: ctx.now,
         balance: { amount: overview.total.remain, currency: 'CREDITS' },
-        credits: lots,
+        credits: active,
         windows: [window],
-        note: notes.length > 0 ? notes.join('；') : null,
+        note: joinNotes(
+          hiddenLotsNote(expired),
+          overview.expiringAmount > 0 ? `有 ${overview.expiringAmount} 积分临近过期` : null,
+          !expiresAt ? '未取到订阅到期时间，可检查 cftk 是否随 Cookie 一并提供' : null,
+        ),
       });
     } catch (error) {
       const status = error instanceof HttpError ? error.kind : 'error';

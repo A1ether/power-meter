@@ -6,11 +6,14 @@ import {
   buildSnapshot,
   cred,
   failure,
+  hiddenLotsNote,
+  joinNotes,
   makeLot,
   makeWindow,
   normalizeCookieHeader,
   notConfigured,
   optString,
+  splitByExpiry,
   type ProbeContext,
   type ProviderAdapter,
 } from './base.js';
@@ -256,7 +259,9 @@ export const qoderAdapter: ProviderAdapter = {
         resetsAt,
       });
 
-      const datedLots = parsed.lots.filter((lot) => lot.expiresAt !== null).length;
+      // 只展示还有效的批次，已过期的汇总成一句提示
+      const { active, expired } = splitByExpiry(parsed.lots, ctx.now);
+      const datedLots = active.filter((lot) => lot.expiresAt !== null).length;
 
       return buildSnapshot({
         adapter: { ...qoderAdapter, region: site === 'global' ? 'global' : 'cn' },
@@ -265,14 +270,15 @@ export const qoderAdapter: ProviderAdapter = {
         now: ctx.now,
         plan: plan || null,
         balance: { amount: parsed.remainingCredits, currency: 'CREDITS' },
-        credits: parsed.lots,
+        credits: active,
         windows: [window],
-        note:
+        note: joinNotes(
+          hiddenLotsNote(expired),
           datedLots === 0 && resetsAt
             ? '未返回独立过期时间，未用完的积分将在本期重置时作废'
-            : parsed.resetsAt && !resetsAt
-              ? '上游返回的重置时间早于当前时间，已忽略'
-              : null,
+            : null,
+          parsed.resetsAt && !resetsAt ? '上游返回的重置时间早于当前时间，已忽略' : null,
+        ),
       });
     } catch (error) {
       const status =

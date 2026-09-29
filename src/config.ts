@@ -132,13 +132,18 @@ export function loadConfig(): LoadConfigResult {
       warnings.push('跳过一条缺少 provider 字段的账号');
       continue;
     }
-    accounts.push({
+    const enabled = raw.enabled !== false;
+    // 只为「已启用」的账号收集缺失变量，否则禁用掉的示例配置也会一直报缺
+    const accountMissing = new Set<string>();
+    const account: AccountConfig = {
       provider,
-      enabled: raw.enabled !== false,
+      enabled,
       displayName: typeof raw.displayName === 'string' ? raw.displayName : null,
-      credentials: toStringRecord(raw.credentials, missing),
-      options: (expandDeep(raw.options, missing) as Record<string, unknown>) ?? {},
-    });
+      credentials: toStringRecord(raw.credentials, accountMissing),
+      options: (expandDeep(raw.options, accountMissing) as Record<string, unknown>) ?? {},
+    };
+    if (enabled) for (const name of accountMissing) missing.add(name);
+    accounts.push(account);
   }
 
   return {

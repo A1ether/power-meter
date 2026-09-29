@@ -1,5 +1,8 @@
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
+/** 每张卡片默认展示的积分数，其余折叠 */
+const VISIBLE_LOTS = 5;
+
 const state = {
   data: null,
   sort: 'expiry',
@@ -144,13 +147,8 @@ function renderSummary(data) {
   const { totals, expiryThresholds, expiryTimeline } = data;
   els.summary.replaceChildren();
 
-  const creditsText =
-    Object.entries(totals.creditsByCurrency)
-      .filter(([, amount]) => amount > 0)
-      .map(([currency, amount]) => `${fmtNumber(amount)} ${currency}`)
-      .join(' · ') || '–';
-  const balanceText =
-    Object.entries(totals.balanceByCurrency)
+  const available =
+    Object.entries(totals.availableByCurrency ?? {})
       .filter(([, amount]) => amount > 0)
       .map(([currency, amount]) => `${fmtNumber(amount)} ${currency}`)
       .join(' · ') || '–';
@@ -165,13 +163,17 @@ function renderSummary(data) {
 
   const stats = [
     { label: '平台总数', value: String(totals.providers), hint: `${totals.ok} 正常 / ${totals.failed} 异常` },
-    { label: '积分合计', value: creditsText, hint: '按币种汇总所有批次' },
-    { label: '金额合计', value: balanceText, hint: '现金 / 代金券余额' },
+    { label: '可用额度合计', value: available, hint: '各平台账户余额汇总，按币种' },
     {
       label: `≤${expiryThresholds.criticalDays} 天到期`,
       value: String(critical),
       hint: `${expiryThresholds.criticalDays}~${expiryThresholds.warningDays} 天内还有 ${warning} 笔`,
       accent: critical > 0,
+    },
+    {
+      label: '到期批次总数',
+      value: String(expiryTimeline.length),
+      hint: '只统计仍可用的积分批次',
     },
   ];
 
@@ -335,23 +337,23 @@ function buildCard(provider, thresholds) {
     meter.hidden = true;
   }
 
+  const lotsContainer = node.querySelector('.lots');
   const list = node.querySelector('.lots__list');
   const credits = [...provider.credits].sort(
     (a, b) => (daysUntil(a.expiresAt) ?? Number.POSITIVE_INFINITY) - (daysUntil(b.expiresAt) ?? Number.POSITIVE_INFINITY),
   );
 
   if (!healthy) {
-    const error = element('p', 'card__error', provider.message || '取数失败');
-    node.querySelector('.lots').replaceChildren(error);
+    lotsContainer.replaceChildren(element('p', 'card__error', provider.message || '取数失败'));
   } else if (credits.length === 0) {
-    node.querySelector('.lots').replaceChildren(
-      element('p', 'card__note muted', '该平台只返回总额度，没有可拆分的积分批次'),
+    lotsContainer.replaceChildren(
+      element('p', 'card__note muted', '该平台目前没有可用的积分批次'),
     );
   } else {
-    for (const lot of credits) {
+    credits.forEach((lot, index) => {
       const days = daysUntil(lot.expiresAt);
       const level = levelFor(days, thresholds);
-      const item = element('li', 'lot');
+      const item = element('li', `lot${index >= VISIBLE_LOTS ? ' lot--collapsed' : ''}`);
       item.dataset.level = level;
       const amount = element('span', 'lot__amount', `${fmtNumber(lot.amount)} ${lot.currency}`);
       if (lot.basis === 'granted') {
@@ -367,6 +369,20 @@ function buildCard(provider, thresholds) {
       item.append(expiry);
       if (lot.note) item.title = lot.note;
       list.append(item);
+    });
+
+    // 超过 5 条的折叠起来，避免单个平台把整屏占满
+    const hiddenCount = credits.length - VISIBLE_LOTS;
+    if (hiddenCount > 0) {
+      const toggle = element('button', 'lots__toggle', `展开其余 ${hiddenCount} 个 ⌄`);
+      toggle.type = 'button';
+      toggle.setAttribute('aria-expanded', 'false');
+      toggle.addEventListener('click', () => {
+        const expanded = list.classList.toggle('lots__list--expanded');
+        toggle.textContent = expanded ? '收起 ⌃' : `展开其余 ${hiddenCount} 个 ⌄`;
+        toggle.setAttribute('aria-expanded', String(expanded));
+      });
+      lotsContainer.append(toggle);
     }
   }
 

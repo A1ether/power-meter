@@ -7,6 +7,8 @@ import {
   cred,
   extractHeaderValue,
   failure,
+  hiddenLotsNote,
+  joinNotes,
   makeLot,
   makeWindow,
   normalizeCookieHeader,
@@ -19,23 +21,23 @@ import {
 /**
  * Trae（trae.cn）
  *
- * 关键点：网页版接口用 `Cloud-IDE-JWT`，而该 Token **只有效约 1 天**。
- * 实测确认 `GetUserToken` 可以用登录态 Cookie 换取新 Token，
- * 因此这里只要求用户提供 Cookie，Token 每次刷新自动续签，无需手工更新。
+ * 关键点一：网页版接口用 `Cloud-IDE-JWT`，而该 Token **只有效约 1 天**。
+ * 实测 `GetUserToken` 可以用登录态 Cookie 换取新 Token，
+ * 因此这里只要求用户提供 Cookie，Token 每次刷新自动续签。
+ *
+ * 关键点二：**`usage.credits_amount` 是「已用量」而不是「授予量」**。
+ * 实测 `Σ usage.credits_amount === usage_summary.consumed_amount`
+ * （1361.5476 === 1361.55），因此每个包的剩余 = credits_limit - credits_amount。
+ * 用完的包会被过滤掉，不再展示。
  *
  * 请求链路（均已实测）：
  *   ① POST https://api.trae.cn/cloudide/api/v3/common/GetUserToken      （Cookie 鉴权）
  *      → { Result: { Token, ExpiredAt, TenantID } }
  *   ② POST https://api.trae.cn/trae/api/v2/pay/user_current_entitlement_list
  *      Authorization: Cloud-IDE-JWT <Token>
- *      → { usage_summary: { consumed_amount, total_amount, consumption_ratio },
- *          user_entitlement_pack_list: [ { display_desc, expire_time,
- *            entitlement_base_info: { quota: { credits_limit } }, usage } ] }
- *
- * 注意口径：实测 `Σ credits_limit === usage_summary.total_amount`，
- * 即 credits_limit 是**授予量**而非剩余量；账户级消耗只由 usage_summary 给出。
- * 所以批次标记为 basis='granted'（只用于表达到期时间，不参与汇总），
- * 余额取 total_amount - consumed_amount。
+ *      → { usage_summary: { consumed_amount, total_amount },
+ *          user_entitlement_pack_list: [ { display_desc, expire_time, usage,
+ *            entitlement_base_info: { quota: { credits_limit } } } ] }
  */
 
 const TRAE_TOKEN_URL = 'https://api.trae.cn/cloudide/api/v3/common/GetUserToken';
@@ -61,14 +63,17 @@ function cookieKey(cookie: string): string {
 export interface TraePack {
   label: string;
   limit: number;
+  used: number;
+  remaining: number;
   expiresAt: string | null;
 }
 
 export interface TraeUsage {
-  used: number;
-  limit: number;
-  remaining: number;
   packs: TraePack[];
+  /** 已用尽的包数量（会被过滤，仅用于提示） */
+  usedUpCount: number;
+  summaryUsed: number;
+  summaryTotal: number;
 }
 
 export function parseTraeUsage(body: unknown): TraeUsage {
@@ -80,6 +85,8 @@ export function parseTraeUsage(body: unknown): TraeUsage {
   }
 
   const packs: TraePack[] = [];
+  let usedUpCount = 0;
+
   for (const raw of packsRaw) {
     if (!isRecord(raw)) continue;
     const base = pick(raw, 'entitlement_base_info', 'entitlementBaseInfo') ?? raw;
@@ -87,8 +94,16 @@ export function parseTraeUsage(body: unknown): TraeUsage {
     const limit = firstNumber(
       isRecord(quota) ? pick(quota, 'credits_limit', 'creditsLimit') : undefined,
     );
-    // 没有 credits_limit 的是功能权益（免费版的开关项），不是积分，跳过
+    // 没有 credits_limit 的是功能权益（免费版的开关项），不是积分
     if (limit === null || limit <= 0) continue;
+
+    const usage = pick(raw, 'usage');
+    const used = firstNumber(isRecord(usage) ? pick(usage, 'credits_amount', 'creditsAmount') : undefined) ?? 0;
+    const remaining = Math.max(0, limit - Math.max(0, used));
+    if (remaining <= 0) {
+      usedUpCount += 1;
+      continue;
+    }
 
     const label =
       firstString(
@@ -100,42 +115,45 @@ export function parseTraeUsage(body: unknown): TraeUsage {
       toIso(pick(raw, 'expire_time', 'expireTime')) ??
       toIso(isRecord(base) ? pick(base, 'end_time', 'endTime') : undefined);
 
-    packs.push({ label, limit, expiresAt });
+    packs.push({ label, limit, used, remaining, expiresAt });
   }
 
-  if (packs.length === 0) {
-    // 全部是功能权益包时，仍允许用 usage_summary 展示总额
-    if (!isRecord(summary)) throw new Error('响应中没有可用的积分权益包');
-  }
-
-  const summaryUsed = firstNumber(isRecord(summary) ? pick(summary, 'consumed_amount', 'consumedAmount') : undefined);
-  const summaryTotal = firstNumber(isRecord(summary) ? pick(summary, 'total_amount', 'totalAmount') : undefined);
-  const packLimit = packs.reduce((sum, pack) => sum + pack.limit, 0);
-
-  const limit = summaryTotal ?? packLimit;
-  const used = summaryUsed ?? 0;
+  const summaryUsed = firstNumber(
+    isRecord(summary) ? pick(summary, 'consumed_amount', 'consumedAmount') : undefined,
+  );
+  const summaryTotal = firstNumber(
+    isRecord(summary) ? pick(summary, 'total_amount', 'totalAmount') : undefined,
+  );
 
   return {
-    used: Math.max(0, used),
-    limit: Math.max(0, limit),
-    remaining: Math.max(0, limit - used),
     packs,
+    usedUpCount,
+    summaryUsed: summaryUsed ?? 0,
+    summaryTotal: summaryTotal ?? 0,
   };
 }
 
-/**
- * 把同名的、同一时刻到期的包归并成一条，避免签到类平台出现几十条重复批次。
- */
+/** 把同名且同时到期的包归并成一条，避免签到类平台出现几十条重复批次 */
 export function mergeLots(packs: TraePack[]): CreditLot[] {
-  const grouped = new Map<string, { label: string; expiresAt: string | null; total: number; count: number }>();
+  const grouped = new Map<
+    string,
+    { label: string; expiresAt: string | null; remaining: number; limit: number; count: number }
+  >();
   for (const pack of packs) {
     const key = `${pack.label}|${pack.expiresAt ?? ''}`;
     const entry = grouped.get(key);
     if (entry) {
-      entry.total += pack.limit;
+      entry.remaining += pack.remaining;
+      entry.limit += pack.limit;
       entry.count += 1;
     } else {
-      grouped.set(key, { label: pack.label, expiresAt: pack.expiresAt, total: pack.limit, count: 1 });
+      grouped.set(key, {
+        label: pack.label,
+        expiresAt: pack.expiresAt,
+        remaining: pack.remaining,
+        limit: pack.limit,
+        count: 1,
+      });
     }
   }
 
@@ -149,13 +167,13 @@ export function mergeLots(packs: TraePack[]): CreditLot[] {
       makeLot({
         id: `trae-${key}`,
         label: entry.label,
-        amount: entry.total,
+        amount: entry.remaining,
         currency: 'CREDITS',
         expiresAt: entry.expiresAt,
         note:
-          (entry.count > 1 ? `${entry.count} 个同类权益包合计 ${entry.total}；` : '') +
-          '该包授予量，账户级剩余见上方总额',
-        basis: 'granted',
+          entry.count > 1
+            ? `${entry.count} 个同类包合计：剩余 ${Math.round(entry.remaining * 100) / 100} / 额度 ${entry.limit}`
+            : `额度 ${entry.limit}`,
       }),
     );
 }
@@ -236,18 +254,46 @@ export const traeAdapter: ProviderAdapter = {
       });
 
       const parsed = parseTraeUsage(body);
-      const lots = mergeLots(parsed.packs);
-      const nextExpiry = lots
-        .map((lot) => lot.expiresAt)
-        .filter((value): value is string => typeof value === 'string')
-        .sort((a, b) => Date.parse(a) - Date.parse(b))[0] ?? null;
+      const round = (value: number): number => Math.round(value * 100) / 100;
+
+      // 只统计「仍在有效期内且未用尽」的包，这样与 Trae 页面显示的 剩余/总额 一致
+      const alivePacks = parsed.packs.filter(
+        (pack) => !pack.expiresAt || Date.parse(pack.expiresAt) >= ctx.now,
+      );
+      const expiredPacks = parsed.packs.filter(
+        (pack) => pack.expiresAt !== null && Date.parse(pack.expiresAt) < ctx.now,
+      );
+
+      const active = mergeLots(alivePacks);
+      // 余额取「未用尽且未过期」的包之和（这是真正还能用的部分）；
+      // 窗口分母用账户级 usage_summary，与 Trae 页面显示的「总可用积分」一致
+      const usableRemaining = round(alivePacks.reduce((sum, pack) => sum + pack.remaining, 0));
+      const balance =
+        alivePacks.length > 0
+          ? usableRemaining
+          : round(Math.max(0, parsed.summaryTotal - parsed.summaryUsed));
+      const expired = expiredPacks.map((pack, index) =>
+        makeLot({
+          id: `trae-expired-${index}`,
+          label: pack.label,
+          amount: pack.remaining,
+          currency: 'CREDITS',
+          expiresAt: pack.expiresAt,
+        }),
+      );
+
+      const nextExpiry =
+        active
+          .map((lot) => lot.expiresAt)
+          .filter((value): value is string => typeof value === 'string')
+          .sort((a, b) => Date.parse(a) - Date.parse(b))[0] ?? null;
 
       const window = makeWindow({
         kind: 'billing',
         label: '积分额度（本期）',
-        used: parsed.used,
-        limit: parsed.limit,
-        remaining: parsed.remaining,
+        used: parsed.summaryUsed,
+        limit: parsed.summaryTotal,
+        remaining: balance,
         boundary: nextExpiry ? 'expiry' : 'mixed',
         expiresAt: nextExpiry,
       });
@@ -257,13 +303,13 @@ export const traeAdapter: ProviderAdapter = {
         account,
         status: 'ok',
         now: ctx.now,
-        balance: { amount: parsed.remaining, currency: 'CREDITS' },
-        credits: lots,
+        balance: { amount: balance, currency: 'CREDITS' },
+        credits: active,
         windows: [window],
-        note:
-          lots.length > 0
-            ? '批次金额为「该包授予量」，账户级剩余以卡片上方的余额为准'
-            : null,
+        note: joinNotes(
+          hiddenLotsNote(expired, parsed.usedUpCount),
+          active.length === 0 ? '所有积分包都已用尽或过期' : null,
+        ),
         fallbackExpiryFromWindow: false,
       });
     } catch (error) {

@@ -86,6 +86,44 @@ export function makeLot(input: {
   };
 }
 
+/** 分成「仍可用」与「已过期」两组：过期的批次不再逐条展示，只汇总成一句提示 */
+export function splitByExpiry(
+  lots: CreditLot[],
+  now: number,
+): { active: CreditLot[]; expired: CreditLot[] } {
+  const active: CreditLot[] = [];
+  const expired: CreditLot[] = [];
+  for (const lot of lots) {
+    if (lot.expiresAt && Date.parse(lot.expiresAt) < now) expired.push(lot);
+    else active.push(lot);
+  }
+  return { active, expired };
+}
+
+export function sumAmount(lots: CreditLot[]): number {
+  return Math.round(lots.reduce((sum, lot) => sum + lot.amount, 0) * 100) / 100;
+}
+
+/**
+ * 生成「被隐藏批次」的说明。
+ * 看板只展示还能用的批次，但不能让人以为数据丢了，所以把过滤掉的数量说清楚。
+ */
+export function hiddenLotsNote(expired: CreditLot[], usedUpCount = 0): string | null {
+  const parts: string[] = [];
+  if (usedUpCount > 0) parts.push(`已隐藏 ${usedUpCount} 个已用尽的积分包`);
+  if (expired.length > 0) {
+    parts.push(
+      `另有 ${expired.length} 个批次已过期（共 ${sumAmount(expired)} 积分作废），未在列表中展示`,
+    );
+  }
+  return parts.length > 0 ? parts.join('；') : null;
+}
+
+export function joinNotes(...notes: Array<string | null | undefined>): string | null {
+  const kept = notes.filter((note): note is string => typeof note === 'string' && note !== '');
+  return kept.length > 0 ? kept.join('；') : null;
+}
+
 export interface SnapshotInput {
   adapter: ProviderAdapter;
   account: AccountConfig;

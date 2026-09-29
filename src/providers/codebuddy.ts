@@ -6,11 +6,14 @@ import {
   buildSnapshot,
   cred,
   failure,
+  hiddenLotsNote,
+  joinNotes,
   makeLot,
   makeWindow,
   normalizeCookieHeader,
   notConfigured,
   optString,
+  splitByExpiry,
   type ProbeContext,
   type ProviderAdapter,
 } from './base.js';
@@ -93,7 +96,6 @@ export interface CodeBuddyPack {
   size: number;
   remain: number;
   expiresAt: string | null;
-  product: string;
 }
 
 export function parseCodeBuddyPackages(body: unknown): CodeBuddyPack[] {
@@ -114,13 +116,14 @@ export function parseCodeBuddyPackages(body: unknown): CodeBuddyPack[] {
     if (size <= 0 && remain <= 0) continue;
 
     // SubProductName 更短更有辨识度（如「腾讯云代码助手 (IDE) - 赠送包」），优先用它
-    const product = firstString(pick(raw, 'SubProductName', 'subProductName'));
     packs.push({
-      label: product || firstString(pick(raw, 'PackageName', 'packageName')) || '资源包',
+      label:
+        firstString(pick(raw, 'SubProductName', 'subProductName')) ||
+        firstString(pick(raw, 'PackageName', 'packageName')) ||
+        '资源包',
       size,
       remain,
       expiresAt,
-      product: '',
     });
   }
   return packs;
@@ -182,22 +185,26 @@ export const codebuddyAdapter: ProviderAdapter = {
         }
       }
 
-      const lots: CreditLot[] = packs.map((pack, index) =>
+      // 实测各包本周期剩余之和 === summary 的账户级剩余，因此批次按「剩余量」参与汇总
+      const usable = packs.filter((pack) => pack.remain > 0);
+      const usedUpCount = packs.length - usable.length;
+      const lots: CreditLot[] = usable.map((pack, index) =>
         makeLot({
           id: `cb-pack-${index}`,
           label: pack.label,
-          amount: pack.size || pack.remain,
+          amount: pack.remain,
           currency: 'CREDITS',
           expiresAt: pack.expiresAt,
-          note: `本周期剩余 ${Math.round(pack.remain * 100) / 100}；批次金额为本周期额度，账户级剩余见上方余额`,
-          basis: 'granted',
+          note: `本周期额度 ${pack.size}`,
         }),
       );
+      const { active, expired } = splitByExpiry(lots, ctx.now);
 
-      const earliest = lots
-        .map((lot) => lot.expiresAt)
-        .filter((value): value is string => typeof value === 'string')
-        .sort((a, b) => Date.parse(a) - Date.parse(b))[0] ?? null;
+      const earliest =
+        active
+          .map((lot) => lot.expiresAt)
+          .filter((value): value is string => typeof value === 'string')
+          .sort((a, b) => Date.parse(a) - Date.parse(b))[0] ?? null;
 
       const round = (value: number): number => Math.round(value * 100) / 100;
       const window = makeWindow({
@@ -216,11 +223,14 @@ export const codebuddyAdapter: ProviderAdapter = {
         status: 'ok',
         now: ctx.now,
         balance: { amount: round(summary.remaining), currency: 'CREDITS' },
-        credits: lots,
+        credits: active,
         windows: [window],
-        note: lots.some((lot) => lot.expiresAt)
-          ? null
-          : '资源包接口未返回周期结束时间，无法给出批次到期日',
+        note: joinNotes(
+          hiddenLotsNote(expired, usedUpCount),
+          active.length > 0 && active.some((lot) => lot.expiresAt)
+            ? null
+            : '资源包接口未返回周期结束时间，无法给出批次到期日',
+        ),
         fallbackExpiryFromWindow: false,
       });
     } catch (error) {

@@ -519,6 +519,36 @@ body {
   gap: 7px;
 }
 
+/* 默认只显示前 5 条，其余折叠；展开状态由 .lots__list--expanded 切换。
+   选择器要带上 .lots__list 才能压过后面的 `.lot { display: grid }`（同优先级时后定义者胜） */
+.lots__list .lot--collapsed {
+  display: none;
+}
+
+.lots__list--expanded .lot--collapsed {
+  display: grid;
+}
+
+.lots__toggle {
+  width: 100%;
+  margin-top: 8px;
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.lots__toggle:hover {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
 .lot {
   display: grid;
   grid-template-columns: 1fr auto;

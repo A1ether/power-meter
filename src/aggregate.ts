@@ -20,25 +20,44 @@ function round(value: number): number {
 export function buildTotals(snapshots: ProviderSnapshot[]): DashboardTotals {
   const creditsByCurrency: Record<string, number> = {};
   const balanceByCurrency: Record<string, number> = {};
+  const availableByCurrency: Record<string, number> = {};
   let ok = 0;
   let failed = 0;
+
+  const add = (bucket: Record<string, number>, currency: string, amount: number): number => {
+    const next = round((bucket[currency] ?? 0) + amount);
+    bucket[currency] = next;
+    return next;
+  };
 
   for (const snapshot of snapshots) {
     if (OK_STATUSES.has(snapshot.status)) ok += 1;
     else failed += 1;
 
+    // basis='granted' 的批次只表达「何时到期」，不参与累加
+    let lotsRemaining = 0;
     for (const lot of snapshot.credits) {
-      // basis='granted' 的批次只表达「何时到期」，不参与累加，避免与 balance 重复计算
       if (lot.amount <= 0 || lot.basis === 'granted') continue;
-      creditsByCurrency[lot.currency] = round((creditsByCurrency[lot.currency] ?? 0) + lot.amount);
+      lotsRemaining += lot.amount;
+      add(creditsByCurrency, lot.currency, lot.amount);
     }
+
     if (snapshot.balance && snapshot.balance.amount > 0) {
-      const key = snapshot.balance.currency;
-      balanceByCurrency[key] = round((balanceByCurrency[key] ?? 0) + snapshot.balance.amount);
+      add(balanceByCurrency, snapshot.balance.currency, snapshot.balance.amount);
+      add(availableByCurrency, snapshot.balance.currency, snapshot.balance.amount);
+    } else if (lotsRemaining > 0) {
+      add(availableByCurrency, snapshot.credits[0]?.currency ?? 'CREDITS', lotsRemaining);
     }
   }
 
-  return { providers: snapshots.length, ok, failed, creditsByCurrency, balanceByCurrency };
+  return {
+    providers: snapshots.length,
+    ok,
+    failed,
+    availableByCurrency,
+    creditsByCurrency,
+    balanceByCurrency,
+  };
 }
 
 /**

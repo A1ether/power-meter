@@ -108,7 +108,14 @@ export interface DashboardTotals {
   providers: number;
   ok: number;
   failed: number;
+  /**
+   * 可用额度合计：每个平台取「账户余额」，没有余额字段时退回「剩余批次之和」。
+   * 批次是余额的拆分，两者相加会重复计算，所以汇总只保留这一个口径。
+   */
+  availableByCurrency: Record<string, number>;
+  /** 仅供排查用的分项：剩余批次之和 */
   creditsByCurrency: Record<string, number>;
+  /** 仅供排查用的分项：账户余额之和 */
   balanceByCurrency: Record<string, number>;
 }
 
