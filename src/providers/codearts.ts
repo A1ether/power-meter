@@ -1,4 +1,4 @@
-import { fetchJson, HttpError } from '../lib/http.js';
+import { assertBusinessOk, fetchJson, HttpError } from '../lib/http.js';
 import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
 import type { AccountConfig } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
@@ -21,31 +21,37 @@ import {
 /**
  * CodeArts 华为云（codearts.huaweicloud.com，码道代码智能体）
  *
- * 三个接口全部通过 npm run capture 抓包定位并实测：
- *   ① GET  /portal/rest/me
- *      → { projectId, region, userId }   （projectId 用作 tenantId）
- *   ② GET  /portal/snap-manager/v1/package/overview
- *      → { all_credit_package, basic_package, bonus_credit_package,
- *          ondemand_credit_package, model_package[] }
- *        各包字段：package_credit_amount / package_credit_used / package_credit_remain
- *   ③ POST /portal/rest/bss/v1/cloudservices/countdown-iam5
- *      body: { tenantId, cloudServiceType, resourceType, regionId, resourceIds[] }
- *      → cloudServiceCountDowns[].countDownTips（JSON 字符串）→ { effTime, expTime }
+ * 接口全部通过 npm run capture 抓包定位并实测。分两层：
+ *
+ * 【汇总层】
+ *   ① GET /portal/rest/me                          → projectId / domainId / region
+ *   ② GET /portal/snap-manager/v1/package/overview  → 账户级总额度与各桶剩余
+ *   ③ POST /portal/rest/bss/v1/cloudservices/countdown-iam5 → 订阅到期时间
+ *
+ * 【逐笔明细层】—— 页面上「套餐及积分包 / 活动福利」里每一笔的来源
+ *   ④ GET /portal/promptcenter/v1/ops/credit/overview          → 活动列表（含 campaignId）
+ *   ⑤ GET /portal/promptcenter/v1/ops/credit/campaign/{id}     → 该活动下每一笔的独立到期时间
+ *      benefits[]: { benefitId, claimedAmount, consumedAmount, expiredAmount,
+ *                    claimedAt, expireAt, validDuration }
+ *
+ * 为什么需要 ④⑤：② 只给出聚合桶（basic 500 / bonus 8000），
+ * 而「每日签到领1000积分 共4笔」各自有独立的 expireAt，
+ * 只有 ④⑤ 才能还原出与官方页面一致的分笔列表。
  *
  * 必需请求头（实测踩坑）：
- *   x-requested-with: XMLHttpRequest、x-language: zh-cn  —— 缺失会被网关当成前端路由，返回 SPA 的 HTML
- *   cftk: <值>  —— ②不需要，③必需；其值等于 Cookie `devclouddevuibjtcftk`，因此可从 Cookie 自动推导
- *
- * 口径：三个包的 remain 之和 === all_credit_package.package_credit_remain，
- * 因此批次按 basis='remaining' 正常参与汇总。
+ *   x-requested-with: XMLHttpRequest、x-language: zh-cn
+ *     —— 缺失会被网关当成前端路由，返回 SPA 的 HTML（HTTP 200 但不是 JSON）
+ *   cftk: <值>  —— ②④⑤ 不强制，③ 必需；其值等于 Cookie `devclouddevuibjtcftk`，从 Cookie 推导
  */
 
 const CA_BASE = 'https://codearts.huaweicloud.com';
 const CA_TIMEOUT_FALLBACK = 12_000;
 const CFTK_COOKIE_NAME = 'devclouddevuibjtcftk';
 const DEFAULT_RESOURCE_TYPE = 'hws.resource.type.codearts.snap';
+/** 活动数量上限，避免异常账号拉出几百个请求 */
+const MAX_CAMPAIGNS = 20;
 
-/** 从拼好的 Cookie 头里取某个 cookie 的值（华为云的 CSRF token 就是放在 cookie 里的） */
+/** 从拼好的 Cookie 头里取某个 cookie 的值（华为云的 CSRF token 就放在 cookie 里） */
 export function cookieValue(cookieHeader: string, name: string): string {
   for (const part of cookieHeader.split(';')) {
     const trimmed = part.trim();
@@ -107,6 +113,67 @@ export function parseCodeArtsOverview(body: unknown): CodeArtsOverview {
   };
 }
 
+export interface CreditCampaign {
+  id: number;
+  title: string;
+  claimCount: number;
+  claimed: number;
+  consumed: number;
+}
+
+export interface CampaignBenefit {
+  benefitId: string;
+  amount: number;
+  expiresAt: string | null;
+  claimedAt: string | null;
+  validDuration: string;
+}
+
+/** ④ 活动列表 */
+export function parseCampaignList(body: unknown): CreditCampaign[] {
+  const data = pick(body, 'data');
+  const items = isRecord(data) ? pick(data, 'items') : undefined;
+  if (!Array.isArray(items)) return [];
+  const campaigns: CreditCampaign[] = [];
+  for (const raw of items) {
+    if (!isRecord(raw)) continue;
+    const id = firstNumber(pick(raw, 'campaignId', 'campaign_id'));
+    if (id === null) continue;
+    campaigns.push({
+      id,
+      title: firstString(pick(raw, 'campaignTitle', 'campaign_title')) || `活动 ${id}`,
+      claimCount: firstNumber(pick(raw, 'claimCount', 'claim_count')) ?? 0,
+      claimed: firstNumber(pick(raw, 'totalClaimed', 'total_claimed')) ?? 0,
+      consumed: firstNumber(pick(raw, 'totalConsumed', 'total_consumed')) ?? 0,
+    });
+  }
+  return campaigns;
+}
+
+/** ⑤ 单个活动下每一笔的明细（含各自 expireAt） */
+export function parseCampaignBenefits(body: unknown): CampaignBenefit[] {
+  const data = pick(body, 'data');
+  const benefits = isRecord(data) ? pick(data, 'benefits') : undefined;
+  if (!Array.isArray(benefits)) return [];
+  const out: CampaignBenefit[] = [];
+  for (const raw of benefits) {
+    if (!isRecord(raw)) continue;
+    const claimed = firstNumber(pick(raw, 'claimedAmount', 'claimed_amount')) ?? 0;
+    const consumed = firstNumber(pick(raw, 'consumedAmount', 'consumed_amount')) ?? 0;
+    const expired = firstNumber(pick(raw, 'expiredAmount', 'expired_amount')) ?? 0;
+    const amount = claimed - consumed - expired;
+    if (amount <= 0) continue;
+    out.push({
+      benefitId: firstString(pick(raw, 'benefitId', 'benefit_id')) || `${out.length}`,
+      amount,
+      expiresAt: toIso(pick(raw, 'expireAt', 'expire_at')),
+      claimedAt: toIso(pick(raw, 'claimedAt', 'claimed_at')),
+      validDuration: firstString(pick(raw, 'validDuration', 'valid_duration')),
+    });
+  }
+  return out;
+}
+
 /** countdown 接口把详情塞在 JSON 字符串里 */
 export function parseCountdownExpiry(body: unknown): string | null {
   const list = pick(body, 'cloudServiceCountDowns', 'cloudServiceCountdowns');
@@ -129,7 +196,6 @@ export function parseCountdownExpiry(body: unknown): string | null {
     if (iso) times.push(iso);
   }
   times.sort((a, b) => Date.parse(a) - Date.parse(b));
-  // 取最晚的到期时间（订阅整体到期）
   return times[times.length - 1] ?? null;
 }
 
@@ -159,26 +225,29 @@ export const codeartsAdapter: ProviderAdapter = {
       Referer: `${CA_BASE}/portal/settings/personal-usage?locale=zh-cn`,
       ...(cftk ? { cftk } : {}),
     };
+    const stamp = (path: string): string => `${CA_BASE}${path}${path.includes('?') ? '&' : '?'}_=${Date.now()}`;
 
     try {
-      const overviewResponse = await fetchJson(
-        `${CA_BASE}/portal/snap-manager/v1/package/overview?_=${Date.now()}`,
-        { headers, timeoutMs },
-      );
+      // ② 账户级汇总
+      const overviewResponse = await fetchJson(stamp('/portal/snap-manager/v1/package/overview'), {
+        headers,
+        timeoutMs,
+      });
       const overview = parseCodeArtsOverview(overviewResponse.body);
 
-      // 取到期时间：先拿 projectId / region，再调 countdown
-      let expiresAt: string | null = null;
+      // ③ 订阅到期时间
+      let subscriptionExpiry: string | null = null;
+      let tenantId = '';
+      let regionId = optString(account, 'region') || 'cn-north-4';
       if (overview.resourceId) {
         try {
-          const meResponse = await fetchJson(`${CA_BASE}/portal/rest/me?_=${Date.now()}`, {
+          const meResponse = await fetchJson(stamp('/portal/rest/me'), {
             headers,
             timeoutMs: Math.min(timeoutMs, 8_000),
           });
           const me = isRecord(meResponse.body) ? meResponse.body : {};
-          const tenantId = firstString(pick(me, 'projectId', 'project_id'));
-          const regionId =
-            firstString(pick(me, 'region', 'regionId')) || optString(account, 'region') || 'cn-north-4';
+          tenantId = firstString(pick(me, 'projectId', 'project_id'));
+          regionId = firstString(pick(me, 'region', 'regionId')) || regionId;
 
           const countdownResponse = await fetchJson(
             `${CA_BASE}/portal/rest/bss/v1/cloudservices/countdown-iam5`,
@@ -195,31 +264,114 @@ export const codeartsAdapter: ProviderAdapter = {
               timeoutMs: Math.min(timeoutMs, 8_000),
             },
           );
-          expiresAt = parseCountdownExpiry(countdownResponse.body);
+          subscriptionExpiry = parseCountdownExpiry(countdownResponse.body);
         } catch (error) {
-          ctx.log(`CodeArts 到期时间获取失败（不影响余额）：${(error as Error).message}`);
+          ctx.log(`CodeArts 订阅到期时间获取失败（不影响余额）：${(error as Error).message}`);
         }
       } else {
-        ctx.log('CodeArts 未找到 resource_id，跳过到期时间查询');
+        ctx.log('CodeArts 未找到 resource_id，跳过订阅到期时间查询');
       }
 
+      // ④⑤ 逐笔明细：把 bonus 桶展开成每笔活动奖励
       const lots: CreditLot[] = [];
-      const push = (label: string, pack: CreditPackage | null, id: string): void => {
-        if (!pack || pack.remain <= 0) return;
-        lots.push(
+      let campaignNote: string | null = null;
+      let benefitTotal = 0;
+
+      try {
+        const listResponse = await fetchJson(
+          stamp('/portal/promptcenter/v1/ops/credit/overview'),
+          { headers, timeoutMs },
+        );
+        assertBusinessOk(listResponse.body);
+        const campaigns = parseCampaignList(listResponse.body).slice(0, MAX_CAMPAIGNS);
+
+        for (const campaign of campaigns) {
+          const detailResponse = await fetchJson(
+            stamp(`/portal/promptcenter/v1/ops/credit/campaign/${campaign.id}`),
+            { headers, timeoutMs: Math.min(timeoutMs, 8_000) },
+          );
+          assertBusinessOk(detailResponse.body);
+          for (const benefit of parseCampaignBenefits(detailResponse.body)) {
+            benefitTotal += benefit.amount;
+            lots.push(
+              makeLot({
+                id: `codearts-campaign-${campaign.id}-${benefit.benefitId}`,
+                label: campaign.title,
+                amount: benefit.amount,
+                currency: 'CREDITS',
+                expiresAt: benefit.expiresAt,
+                note: [
+                  benefit.claimedAt ? `领取于 ${benefit.claimedAt.slice(0, 10)}` : '',
+                  benefit.validDuration ? `有效期 ${benefit.validDuration}` : '',
+                ]
+                  .filter(Boolean)
+                  .join('，'),
+              }),
+            );
+          }
+        }
+      } catch (error) {
+        campaignNote = `活动明细获取失败，已退回聚合口径：${(error as Error).message}`;
+        ctx.log(campaignNote);
+      }
+
+      // ① 基础套餐（订阅自带额度）
+      if (overview.basic && overview.basic.remain > 0) {
+        lots.unshift(
           makeLot({
-            id,
-            label,
-            amount: pack.remain,
+            id: 'codearts-basic',
+            label: '个人订阅套餐',
+            amount: overview.basic.remain,
             currency: 'CREDITS',
-            expiresAt,
-            note: `额度 ${pack.amount}，已用 ${pack.used}`,
+            expiresAt: subscriptionExpiry,
+            note: `套餐额度 ${overview.basic.amount}，已用 ${overview.basic.used}`,
           }),
         );
-      };
-      push('基础套餐积分', overview.basic, 'codearts-basic');
-      push('赠送积分包', overview.bonus, 'codearts-bonus');
-      push('按需积分包', overview.ondemand, 'codearts-ondemand');
+      }
+      // 活动奖励桶与账户级 bonus 对账：明细拉不到就退回聚合口径，差值补一条调节项
+      const bonusRemain = Math.round((overview.bonus?.remain ?? 0) * 100) / 100;
+      if (benefitTotal <= 0 && bonusRemain > 0) {
+        lots.push(
+          makeLot({
+            id: 'codearts-bonus',
+            label: '活动奖励积分（合计）',
+            amount: bonusRemain,
+            currency: 'CREDITS',
+            expiresAt: subscriptionExpiry,
+            note: '活动明细不可用，已退回聚合额度',
+          }),
+        );
+      } else {
+        const gap = Math.round((bonusRemain - benefitTotal) * 100) / 100;
+        if (gap >= 1) {
+          lots.push(
+            makeLot({
+              id: 'codearts-bonus-gap',
+              label: '活动奖励积分（未明细部分）',
+              amount: gap,
+              currency: 'CREDITS',
+              expiresAt: subscriptionExpiry,
+              note: `活动明细合计 ${benefitTotal}，与聚合额度 ${bonusRemain} 的差额`,
+            }),
+          );
+        }
+      }
+
+      // 按需积分包（如有）
+      if (overview.ondemand && overview.ondemand.remain > 0) {
+        lots.push(
+          makeLot({
+            id: 'codearts-ondemand',
+            label: '按需积分包',
+            amount: overview.ondemand.remain,
+            currency: 'CREDITS',
+            expiresAt: subscriptionExpiry,
+            note: '按需计费额度',
+          }),
+        );
+      }
+
+      const { active, expired } = splitByExpiry(lots, ctx.now);
 
       const window = makeWindow({
         kind: 'billing',
@@ -227,11 +379,9 @@ export const codeartsAdapter: ProviderAdapter = {
         used: overview.total.used,
         limit: overview.total.amount,
         remaining: overview.total.remain,
-        boundary: expiresAt ? 'expiry' : 'mixed',
-        expiresAt,
+        boundary: subscriptionExpiry ? 'expiry' : 'mixed',
+        expiresAt: subscriptionExpiry,
       });
-
-      const { active, expired } = splitByExpiry(lots, ctx.now);
 
       return buildSnapshot({
         adapter: codeartsAdapter,
@@ -243,8 +393,9 @@ export const codeartsAdapter: ProviderAdapter = {
         windows: [window],
         note: joinNotes(
           hiddenLotsNote(expired),
+          campaignNote,
           overview.expiringAmount > 0 ? `有 ${overview.expiringAmount} 积分临近过期` : null,
-          !expiresAt ? '未取到订阅到期时间，可检查 cftk 是否随 Cookie 一并提供' : null,
+          !subscriptionExpiry ? '未取到订阅到期时间，可检查 cftk 是否随 Cookie 一并提供' : null,
         ),
       });
     } catch (error) {
