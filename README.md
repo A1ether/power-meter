@@ -5,7 +5,7 @@
 
 - 运行时**零第三方依赖**（只用 Node 内置模块），`npm install` 只装 `tsx` / `typescript`
 - 后端聚合 + 缓存 + 失败降级，前端纯静态（无构建步骤）
-- 凭证**不下发到浏览器**，配置文件改动后**热加载**，无需重启
+- 凭证**不下发到浏览器**，`accounts.json` / `.env` 改动后**热加载**，无需重启
 
 > 开发前的 GitHub 开源项目调研、复用评估与接口实测记录见
 > [`docs/开源项目调研与复用评估.md`](docs/开源项目调研与复用评估.md)。
@@ -159,13 +159,13 @@ interface ProviderSnapshot {
   Qoder 会掉出时间线——所以补了一条**合成事件**「本期额度重置（未用完即作废）」，
   金额取该平台积分合计。这让"重置即作废"的平台也能参与排序。
 
-**第三层：前端分级高亮。** 阈值可配（默认 7 天 / 30 天）：
+**第三层：前端分级高亮。** 阈值可配（默认 5 天 / 14 天）：
 
 | 剩余时间 | 视觉表现 |
 | --- | --- |
-| ≤ 7 天 | 卡片顶部红条 + 状态点脉冲动画 + 批次左侧红边 + 顶部 danger 告警条 |
-| 8~30 天 | 橙色边框 + 批次橙边 + warning 告警条 |
-| > 30 天 | 绿色 |
+| ≤ 5 天 | 红色：卡片顶部红条 + 状态点脉冲动画 + 批次左侧红边 + 顶部 danger 告警条 |
+| 6~14 天 | 黄色：卡片黄边 + 批次黄边 + warning 告警条 |
+| ≥ 15 天 | 绿色（safe） |
 | 无过期时间 | 灰色，排序恒排最后 |
 
 同时 `prefers-reduced-motion` 下关闭脉冲动画。
@@ -206,7 +206,8 @@ interface ProviderSnapshot {
   刷新失败的缓存只保留 15s，避免连续失败被放大。
 - **失败降级**：上游报错时回退到上一次成功值并标记 `stale: true`，
   卡片显示"数据可能过期"黄标而不是变成空白。
-- **配置热加载**：轮询 `accounts.json` 的 mtime，改完保存即生效。
+- **配置热加载**：轮询 `accounts.json` **与 `.env`** 的 mtime，改完保存即生效——
+  `npm run capture` 刷新 Cookie 后**不需要重启服务**，页面点「立即刷新」即为新凭证的取数结果。
 - **凭证不外泄**：`/api/config` 只返回**存在哪些凭证 key**，不返回值；
   `accounts.json` 已加入 `.gitignore`，推荐用 `${ENV_VAR}` 引用 `.env`。
 
@@ -334,8 +335,8 @@ interface ProviderSnapshot {
 | `HOST` | `127.0.0.1` | 默认只听本机；改成 `0.0.0.0` 才对外暴露 |
 | `CACHE_TTL_SECONDS` | `300` | 上游取数缓存时长 |
 | `REQUEST_TIMEOUT_MS` | `12000` | 单平台请求超时 |
-| `EXPIRY_CRITICAL_DAYS` | `7` | 红色高亮阈值 |
-| `EXPIRY_WARNING_DAYS` | `30` | 橙色高亮阈值 |
+| `EXPIRY_CRITICAL_DAYS` | `5` | 红色高亮阈值：≤ 该天数到期显示红色 |
+| `EXPIRY_WARNING_DAYS` | `14` | 黄色高亮阈值：`criticalDays`~该天数到期显示黄色，更久显示绿色 |
 | `ACCOUNTS_PATH` | `./accounts.json` | 账号文件路径 |
 
 另见 `.env.example`；`src/config.ts` 内置了极简 `.env` 解析，无需 `dotenv`。

@@ -29,28 +29,60 @@ const DEFAULTS = {
   host: '127.0.0.1',
   cacheTtlSeconds: 300,
   requestTimeoutMs: 12_000,
-  expiryCriticalDays: 7,
-  expiryWarningDays: 30,
+  expiryCriticalDays: 5,
+  expiryWarningDays: 14,
 };
 
-/** 极简 .env 解析（避免引入 dotenv 依赖） */
+/** .env 的绝对路径（服务用它监听 mtime 做热加载） */
+export function resolveDotEnvPath(file = '.env'): string {
+  return resolve(process.cwd(), file);
+}
+
+/**
+ * 上一次由 .env 注入进 process.env 的键值。
+ *
+ * 存在两个原因：
+ *   1. 允许反复调用时用新值覆盖「上一次由 .env 写入的旧值」——
+ *      `npm run capture` 刷新 Cookie 后，长驻服务才能拿到新凭证；
+ *   2. 绝不覆盖由 shell / launchd 真正设置的进程环境变量（它们优先级更高）。
+ */
+const dotEnvOwned = new Map<string, string>();
+
+/** 极简 .env 解析（避免引入 dotenv 依赖）；可重复调用，后一次覆盖前一次 */
 export function loadDotEnv(file = '.env'): void {
-  const path = resolve(process.cwd(), file);
-  if (!existsSync(path)) return;
-  for (const rawLine of readFileSync(path, 'utf8').split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#')) continue;
-    const eq = line.indexOf('=');
-    if (eq <= 0) continue;
-    const key = line.slice(0, eq).trim();
-    let value = line.slice(eq + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
+  const path = resolveDotEnvPath(file);
+  const next = new Map<string, string>();
+  if (existsSync(path)) {
+    for (const rawLine of readFileSync(path, 'utf8').split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eq = line.indexOf('=');
+      if (eq <= 0) continue;
+      const key = line.slice(0, eq).trim();
+      let value = line.slice(eq + 1).trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      next.set(key, value);
     }
-    if (process.env[key] === undefined) process.env[key] = value;
+  }
+
+  // ① 本次 .env 里已删除的键：如果是我们当初写进去的，就还原（避免旧凭证残留）
+  for (const [key, value] of dotEnvOwned) {
+    if (next.has(key)) continue;
+    dotEnvOwned.delete(key);
+    if (process.env[key] === value) delete process.env[key];
+  }
+
+  // ② 写入本次的值：仅当该键尚无值，或当前值正是上一次由 .env 写入的那个
+  for (const [key, value] of next) {
+    if (process.env[key] === undefined || process.env[key] === dotEnvOwned.get(key)) {
+      process.env[key] = value;
+      dotEnvOwned.set(key, value);
+    }
   }
 }
 

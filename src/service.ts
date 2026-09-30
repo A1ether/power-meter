@@ -1,6 +1,11 @@
 import { statSync } from 'node:fs';
 import { buildPayload, type AggregateSettings } from './aggregate.js';
-import { loadConfig, type AccountConfig, type LoadConfigResult } from './config.js';
+import {
+  loadConfig,
+  resolveDotEnvPath,
+  type AccountConfig,
+  type LoadConfigResult,
+} from './config.js';
 import { TtlCache } from './lib/cache.js';
 import { resolveAdapter } from './providers/index.js';
 import type { ProviderSnapshot } from './types.js';
@@ -26,6 +31,7 @@ export class DashboardService {
   private cache: TtlCache<ProviderSnapshot>;
   private readonly lastGood = new Map<string, ProviderSnapshot>();
   private accountsMtimeMs = 0;
+  private dotEnvMtimeMs = 0;
 
   constructor() {
     this.configResult = loadConfig();
@@ -33,6 +39,7 @@ export class DashboardService {
       this.configResult.config.settings.cacheTtlSeconds * 1_000,
     );
     this.accountsMtimeMs = this.readMtime();
+    this.dotEnvMtimeMs = this.readDotEnvMtime();
   }
 
   get settings(): AggregateSettings {
@@ -187,23 +194,46 @@ export class DashboardService {
     }
   }
 
-  private readMtime(): number {
+  private static mtimeOf(path: string): number {
     try {
-      return statSync(this.configResult.config.accountsFilePath).mtimeMs;
+      return statSync(path).mtimeMs;
     } catch {
       return 0;
     }
   }
 
-  /** accounts.json 被改动后自动热加载，免去重启 */
+  private readMtime(): number {
+    return DashboardService.mtimeOf(this.configResult.config.accountsFilePath);
+  }
+
+  private readDotEnvMtime(): number {
+    return DashboardService.mtimeOf(resolveDotEnvPath());
+  }
+
+  /**
+   * accounts.json 或 .env 被改动后自动热加载，免去重启。
+   *
+   * 必须同时监听 .env：`npm run capture` 刷新 Cookie 时只重写 .env，
+   * 若只盯 accounts.json，长驻服务会一直拿着过期凭证，表现为
+   * 「npm run probe 正常，但页面刷新无效」。
+   */
   private ensureConfigFresh(): void {
-    const current = this.readMtime();
-    if (current === this.accountsMtimeMs) return;
-    this.accountsMtimeMs = current;
+    const accountsMtime = this.readMtime();
+    const dotEnvMtime = this.readDotEnvMtime();
+    if (accountsMtime === this.accountsMtimeMs && dotEnvMtime === this.dotEnvMtimeMs) return;
+
+    const changed: string[] = [];
+    if (accountsMtime !== this.accountsMtimeMs) changed.push('accounts.json');
+    if (dotEnvMtime !== this.dotEnvMtimeMs) changed.push('.env');
+    this.accountsMtimeMs = accountsMtime;
+    this.dotEnvMtimeMs = dotEnvMtime;
+
     this.configResult = loadConfig();
     this.cache = new TtlCache<ProviderSnapshot>(
       this.configResult.config.settings.cacheTtlSeconds * 1_000,
     );
-    console.log('[config] 检测到 accounts.json 变更，已重新加载');
+    // 配置变了说明用户期待新数据：清掉兜底值，避免用旧数字掩盖新凭证的失败
+    this.lastGood.clear();
+    console.log(`[config] 检测到 ${changed.join(' / ')} 变更，已重新加载配置与凭证`);
   }
 }
