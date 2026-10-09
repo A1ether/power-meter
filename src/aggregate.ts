@@ -1,8 +1,10 @@
 import { daysBetween } from './lib/json.js';
 import type {
+  Currency,
   DashboardPayload,
   DashboardTotals,
   ExpiryHit,
+  ProviderEntry,
   ProviderSnapshot,
 } from './types.js';
 import { OK_STATUSES } from './types.js';
@@ -15,6 +17,87 @@ export interface AggregateSettings {
 
 function round(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+/**
+ * 把声明了 `groupAccounts` 的平台的多条账号快照合并成一张卡片。
+ *
+ * 动机：D1V 的一个账号 = 一把项目密钥 + 一份 quota，是多份「同一种东西」。
+ * 摆成一屏的独立卡片后，真正要看的「谁快用完了」被冲散在滚动里。
+ *
+ * 合并后：
+ *   - 每个账号成为一条 `entries[]`，身份（accountId / 展示名）下移到条目里；
+ *   - 卡片余额是各条目同币种之和，`plan` 变成「N 个账号」；
+ *   - 条目按**额度升序**排列——最少的排最前，也就是最该关注的排最前，
+ *     与看板「最快到期优先」是同一个取向。
+ */
+export function groupSnapshots(snapshots: ProviderSnapshot[]): ProviderSnapshot[] {
+  const out: ProviderSnapshot[] = [];
+  const grouped = new Map<string, { card: ProviderSnapshot; entries: ProviderEntry[] }>();
+
+  for (const snapshot of snapshots) {
+    if (!snapshot.groupAccounts) {
+      out.push(snapshot);
+      continue;
+    }
+    const bucket = grouped.get(snapshot.provider);
+    if (bucket) bucket.entries.push(toEntry(snapshot));
+    else grouped.set(snapshot.provider, { card: snapshot, entries: [toEntry(snapshot)] });
+  }
+
+  for (const { card, entries } of grouped.values()) out.push(finalizeCard(card, entries));
+  return out;
+}
+
+/** 把一个账号快照压成卡片里的一条 */
+function toEntry(snapshot: ProviderSnapshot): ProviderEntry {
+  return {
+    id: snapshot.accountId,
+    label: snapshot.plan || snapshot.accountId || snapshot.provider,
+    amount: snapshot.balance?.amount ?? 0,
+    currency: snapshot.balance?.currency ?? 'CREDITS',
+    status: snapshot.status,
+    message: snapshot.message,
+    note: snapshot.note,
+    secrets: snapshot.secrets,
+  };
+}
+
+function finalizeCard(card: ProviderSnapshot, input: ProviderEntry[]): ProviderSnapshot {
+  // 额度升序：最少的排最前，也就是最该关注的排最前
+  const entries = [...input].sort((a, b) => a.amount - b.amount);
+  const healthy = entries.filter((entry) => OK_STATUSES.has(entry.status));
+  const failed = entries.filter((entry) => !OK_STATUSES.has(entry.status));
+
+  // 同一平台的条目理论上同币种；真有混币种就只汇总额度最大的那一种，
+  // 避免把不同单位硬加在一起给出一个假数字
+  const totals = new Map<string, number>();
+  for (const entry of healthy) {
+    totals.set(entry.currency, round((totals.get(entry.currency) ?? 0) + entry.amount));
+  }
+  const dominant = [...totals.entries()].sort((a, b) => b[1] - a[1])[0] ?? null;
+
+  return {
+    ...card,
+    entries,
+    // 账号身份已经下移到 entries[].id，卡片本身不再代表某一个账号
+    accountId: '',
+    // 只要有一个账号可用，这张卡片就不算坏——失败的账号在它自己那条上显示原因
+    status: healthy.length > 0 ? 'ok' : (failed[0]?.status ?? card.status),
+    balance: dominant ? { amount: dominant[1], currency: dominant[0] as Currency } : null,
+    plan: `${entries.length} 个账号${failed.length > 0 ? `（${failed.length} 个异常）` : ''}`,
+    // 不过期的额度：不参与「最快到期」，也不该被合成事件补一条
+    credits: [],
+    windows: [],
+    nextExpiryAt: null,
+    nextExpiryInDays: null,
+    secrets: [],
+    message:
+      failed.length > 0
+        ? failed.map((entry) => `${entry.label}：${entry.message ?? '取数失败'}`).join('；')
+        : null,
+    note: totals.size > 1 ? '各账号额度单位不一致，卡片总额只取了其中一种' : null,
+  };
 }
 
 export function buildTotals(snapshots: ProviderSnapshot[]): DashboardTotals {
@@ -119,8 +202,9 @@ export function buildPayload(
   settings: AggregateSettings,
   now = Date.now(),
 ): DashboardPayload {
-  const providers = [...snapshots].sort(
-    (a, b) => sortRank(a) - sortRank(b) || a.displayName.localeCompare(b.displayName),
+  // 先合并「一个平台一张卡片」的那种（多个账号 -> 一张卡片多条 entry），再排序
+  const providers = groupSnapshots(snapshots).sort(
+    (a, b) => sortRank(a) - sortRank(b) || a.displayName.localeCompare(b.displayName, 'zh-CN'),
   );
   const expiryTimeline = buildExpiryTimeline(providers, now);
 

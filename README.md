@@ -5,7 +5,8 @@
 
 - 运行时**零第三方依赖**（只用 Node 内置模块），`npm install` 只装 `tsx` / `typescript`
 - 后端聚合 + 缓存 + 失败降级，前端纯静态（无构建步骤）
-- 凭证**不下发到浏览器**，`accounts.json` / `.env` 改动后**热加载**，无需重启
+- 凭证默认**不下发到浏览器**：只有被显式声明为「可托管」的密钥才提供
+  掩码预览 + 按需复制（默认仅限本机），`accounts.json` / `.env` 改动后**热加载**，无需重启
 
 > 开发前的 GitHub 开源项目调研、复用评估与接口实测记录见
 > [`docs/开源项目调研与复用评估.md`](docs/开源项目调研与复用评估.md)。
@@ -57,6 +58,8 @@ JWT，由适配器用 Cookie 自动续签，不需要手工维护。
 | `npm run probe` | **命令行探测取数是否正常**（改配置后先跑这个最快）|
 | `npm run probe -- qoder trae` | 只探测指定平台 |
 | `npm run probe -- --json` | 输出机器可读结果 |
+| `npm run d1v:add -- <账号密钥> <项目密钥>` | **一条命令添加 D1V 账号**（先验证再写入，自动备份）|
+| `npm run d1v:add -- --list` | 列出已配置的 D1V 账号 |
 | `npm run typecheck` | 类型检查 |
 | `npm run build && npm run serve` | 编译到 `dist/` 后以纯 JS 运行 |
 
@@ -101,10 +104,11 @@ power-meter/
 └── src/
     ├── server.ts                    # HTTP 服务 + 路由 + 静态资源（Node 内置 http）
     ├── service.ts                   # 编排层：并发探测、TTL 缓存、失败回退、配置热加载
-    ├── aggregate.ts                 # 聚合：汇总统计 + 到期时间线（最快到期排序）
+    ├── aggregate.ts                 # 聚合：多账号合并成一张卡片 + 汇总统计 + 到期时间线
     ├── config.ts                    # 配置加载：.env 解析、${VAR} 展开、mtime 监控
     ├── types.ts                     # 统一数据契约
     ├── cli/probe.ts                 # 命令行凭证探测工具
+    ├── cli/d1v-add.ts               # 一条命令添加 D1V 账号（先验证再写入）
     ├── lib/
     │   ├── http.ts                  # 带硬超时的 fetch + HTTP/业务错误码映射
     │   ├── cache.ts                 # TTL + in-flight 去重 + last-good 兜底
@@ -114,6 +118,9 @@ power-meter/
         ├── index.ts                 # 注册表 + 平台别名解析
         ├── qoder.ts                 # qoder.com / qoder.com.cn / qoder.cn
         ├── trae.ts                  # trae.cn（权益包按过期时间拆批次）
+        ├── codebuddy.ts             # codebuddy.cn（WAF 校验 UA）
+        ├── codearts.ts              # codearts.huaweicloud.com（多接口拼批次）
+        ├── d1v.ts                   # d1v.ai（API 密钥取数 + 托管 D1V_PAI_API_KEY）
         ├── sessionApi.ts            # 声明式"登录态 + JSON 映射"适配器工厂
         ├── presets.ts               # codebuddy / codearts / custom 预设
         └── demo.ts                  # 示例数据平台（demo:*）
@@ -175,6 +182,7 @@ interface ProviderSnapshot {
 | 策略 | 适用 | 实现 |
 | --- | --- | --- |
 | 内置适配器 | Qoder / Trae 等有稳定接口 | `qoder.ts` / `trae.ts`，含精确字段解析与错误语义 |
+| 内置适配器（API 密钥）| D1V 这类有公开 OpenAPI 的平台 | `d1v.ts`：`Authorization: Bearer <apiKey>`，无需登录态 |
 | 声明式映射 | CodeBuddy / CodeArts 等无公开接口 | `sessionApi.ts`：填 `endpoint` + `headers` + `mapping`（JSON 路径）即可接入 |
 | 示例数据 | 首次运行预览界面 | `demo.ts`，确定性 fixture，界面上标注"示例数据" |
 
@@ -208,7 +216,9 @@ interface ProviderSnapshot {
   卡片显示"数据可能过期"黄标而不是变成空白。
 - **配置热加载**：轮询 `accounts.json` **与 `.env`** 的 mtime，改完保存即生效——
   `npm run capture` 刷新 Cookie 后**不需要重启服务**，页面点「立即刷新」即为新凭证的取数结果。
-- **凭证不外泄**：`/api/config` 只返回**存在哪些凭证 key**，不返回值；
+- **凭证默认不外泄**：`/api/config` 只返回**存在哪些凭证 key**，不返回值；
+  只有适配器显式声明 `revealableSecrets()` 的密钥（目前仅 D1V 的项目密钥）
+  才会以掩码形式出现在快照里，明文要靠 `/api/reveal` 按需读取，且默认仅限本机；
   `accounts.json` 已加入 `.gitignore`，推荐用 `${ENV_VAR}` 引用 `.env`。
 
 ### 5. 前端零构建
@@ -241,7 +251,7 @@ interface ProviderSnapshot {
 
 ### 各平台配置
 
-四个平台的凭证都只需要 **一个 Cookie**：
+除 D1V 外，其余平台的凭证都只需要 **一个 Cookie**：
 
 | 平台 | `provider` | 需要的凭证 | 关键 `options` |
 | --- | --- | --- | --- |
@@ -249,6 +259,7 @@ interface ProviderSnapshot {
 | Trae | `trae` / `trae.cn` | `cookie` | JWT 由 Cookie 自动续签；可选 `accessToken` 覆盖 |
 | CodeBuddy | `codebuddy` | `cookie`（**必须含 `www` 子域**）| — |
 | CodeArts | `codearts` | `cookie`（含 `devclouddevuibjtcftk`）| 可选 `resourceType`、`region` |
+| D1V | `d1v` / `d1v.ai` | `apiKey`（查余额）<br>`paiApiKey`（托管复制） | `baseUrl`、`revealApiKey` |
 | 任意平台 | `custom` | 按需 `headers` | `providerId`、`endpoint`、`mapping` |
 | 示例数据 | `demo:qoder` / `demo:trae` / `demo:codebuddy` / `demo:codearts` / `demo:no-expiry` | 无 | — |
 
@@ -297,6 +308,147 @@ interface ProviderSnapshot {
 }
 ```
 
+### 示例：托管多个 D1V 账号（余额 + 密钥复制）
+
+D1V 是目前唯一**不用 Cookie、纯 API 密钥**的平台，且天然分两层密钥：
+
+| 密钥 | 从哪来 | 能做什么 |
+| --- | --- | --- |
+| `D1V_API_KEY`（账号密钥）| <https://www.d1v.ai/settings?tab=api-key> 创建具名密钥，**只在创建时完整显示一次** | 查询余额、用量（`api.d1v.ai`）|
+| `D1V_PAI_API_KEY`（项目密钥）| 项目 Dashboard → `Create Project Environment` 后复制 | 只能调模型（`pai.d1v.ai/v1`），**不能查余额** |
+
+因为账号密钥不能反查项目密钥（列表接口只有 `key_prefix`，没有明文），
+看板的定位就是一个**托管面板**：账号密钥用来取数，项目密钥存下来给你随时复制。
+
+#### 加账号：一条命令
+
+不用手工改两个文件——密钥成对出现，手抄一次就多一次抄错的机会：
+
+```bash
+npm run d1v:add -- <账号密钥> <项目密钥>
+```
+
+或者直接把整段粘贴进去（会按「项目 / 个人」关键词自动认哪把是哪把）：
+
+```bash
+npm run d1v:add -- --text "个人apikey：sk-...
+对应的项目apikey：..."
+```
+
+它会依次做四件事：
+
+1. **验证账号密钥**：调 `pai-project-usage/overview` 拿真实 quota 与邮箱，
+   顺手把额度、到期时间、`quota` 与钱包的差额打出来给你确认；
+2. **验证项目密钥**：打 `GET https://pai.d1v.ai/v1/models`，
+   返回模型列表才算通过（这个端点只读、不花钱）；
+3. **备份** `.env` 与 `accounts.json` 到 `.run/d1v-add-<时间戳>/`
+   （`.run/` 已 gitignore，不会把凭证明文带进 git）；
+4. 写入 `.env` 的 `D1V_<X>_API_KEY` / `D1V_<X>_PAI_API_KEY`
+   （自动挑下一个空闲字母，或复用 `.env` 里已有的空槽位），
+   并在 `accounts.json` 追加一条 `provider: "d1v"`。
+
+**两把密钥都验证通过才会写文件**，任何一步失败都原样退出、不留半截配置。
+账号名默认取邮箱前缀（如 `D1V · sb4hnm`），可用 `--name` 覆盖；
+`--dry-run` 只验证不写入；重复添加同一把账号密钥会被拒绝（除非 `--force`）。
+
+服务监听这两个文件的 mtime，**写完即热加载，不用重启**。
+想临时停用就把该条目的 `enabled` 改成 `false`；想删除就连同 `.env` 里那两行一起删。
+
+写完之后 `accounts.json` 里就是普通条目，也可以手工维护——多个账号就是多条
+`provider: "d1v"`，靠 `displayName` 区分：
+
+```jsonc
+{
+  "accounts": [
+    {
+      "provider": "d1v",
+      "displayName": "D1V · sb4hnm",       // 多账号靠它区分，也会显示在卡片上
+      "enabled": true,
+      "credentials": {
+        "apiKey": "${D1V_B_API_KEY}",       // 查余额
+        "paiApiKey": "${D1V_B_PAI_API_KEY}" // 托管，卡片上可一键复制
+      },
+      "options": {
+        "revealApiKey": false   // 是否也允许在卡片上复制账号密钥本身（默认 false）
+      }
+    }
+  ]
+}
+```
+
+#### ⚠ 余额单位是 QUOTA；钱包 USD 直接忽略
+
+D1V 有两套计量，但**只有 quota 有意义**：
+
+| 计量 | 含义 | 说明 |
+| --- | --- | --- |
+| `QUOTA`（`quota_remaining`）| 模型调用实际扣减的单位 | **永不过期**；为 0 时账号立刻不可用 |
+| `USD`（`total_balance_usd`）| 钱包账面数字 | 不参与实际消耗，而且**系统性虚高** |
+
+两个真实账号的实测：
+
+```
+账号 A: 钱包 $8.764224   quota 3,382,112 ≈ $6.764224   差额 $2.000000
+账号 B: 钱包 $8.800000   quota 3,400,000 ≈ $6.800000   差额 $2.000000
+```
+
+换算率恒定（`1 USD = 500,000 quota`，4 条扣减记录的 `quota ÷ usd`
+都精确等于 `500000.0000`），而钱包恒定比 quota 折合值多 **$2.00**。
+既然 quota 不过期、USD 又不参与消耗，看板就**完全不显示 USD**——
+摆一个用不上还偏大的数字只会误导人，这正是「余额还有、quota 没了」的来源。
+
+#### 整个 D1V 只占一张卡片
+
+一个 D1V 账号 = 一把项目密钥 + 一份 quota，天然是「同一种东西的多份」，
+所以适配器声明了 `groupAccounts: true`：聚合层把所有 D1V 账号**合并成一张卡片**，
+卡片里一条条列出「账号 · 托管密钥 · 可用额度」：
+
+```
+● D1V                                        [国际] [永不过期]
+8,892,423 QUOTA
+3 个账号
+账号 · 托管密钥                                     可用额度
+┌───────────────────────────────────────────────────────────┐
+│ jwig5h@qabq.com                          2,110,311 QUOTA  │
+│ D1V_PAI_API_KEY            [显示] [复制]                   │
+│ ftWJ0G…B7tK                                               │
+│ 项目：项目环境；已用 1,274,966 quota（279 次请求）           │
+├───────────────────────────────────────────────────────────┤
+│ mehopo8168@meinvr.com                    3,382,112 QUOTA  │
+│ D1V_PAI_API_KEY            [显示] [复制]                   │
+│ wITpPj…XCO7                                               │
+├───────────────────────────────────────────────────────────┤
+│ sb4hnm@qabq.com                          3,400,000 QUOTA  │
+│ D1V_PAI_API_KEY            [显示] [复制]                   │
+│ 07aHCH…1fM4                                               │
+└───────────────────────────────────────────────────────────┘
+```
+
+- 条目按**额度升序**：最少的最靠前，也就是最该关注的排最前；
+- 某条 quota 归零时该条标红并提示「quota 已用尽，该账号调不动」——
+  这是事实判断，不需要任何阈值；
+- 账号名取 `email`（比 displayName 更能认出是谁），`plan` 一行显示「N 个账号」；
+- **quota 不过期，所以不参与「最快到期」**：无批次、无进度条、
+  也不进到期时间线，不会去跟真正要作废的额度抢注意力。
+
+> 副作用：因为 Quota 永不「到期风险」，D1V 卡片在默认的「最快到期优先」
+> 排序里会排在最后。想让它靠前，用工具栏的排序下拉切到「按名称」，
+> 或参考「已知限制」里关于低额度告警的说明。
+
+新增账号仍然是一条命令：`npm run d1v:add -- <账号密钥> <项目密钥>`。
+
+D1V 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>），只用到两个接口：
+
+| 用途 | 接口 |
+| --- | --- |
+| 可用 quota（**唯一必需**）| `GET /api/wallet/pai-project-usage/overview` |
+| 账号标识（卡片里那条显示 email）| `GET /api/user/info` |
+| 托管密钥读取（看板自己的接口）| `POST /api/reveal` |
+
+托管密钥默认只显示掩码（如 `ftWJ0G…B7tK`），
+点「显示」或「复制」才会通过 `/api/reveal` 按需读取明文——
+**接口默认只允许本机访问**，规则见下节。
+
 ---
 
 ## 接口
@@ -307,7 +459,24 @@ interface ProviderSnapshot {
 | POST | `/api/refresh` | 手动刷新，body 可带 `{ "providers": ["qoder"] }` 只刷指定平台 |
 | GET | `/api/providers` | 已注册的适配器清单及各自需要的凭证 |
 | GET | `/api/config` | 当前配置概览（**仅凭证 key 名，不含值**）+ 告警 + 缺失环境变量 |
+| POST | `/api/reveal` | **按需读取托管密钥明文**（默认仅本机）。body `{ provider, accountId, key }` |
 | GET | `/api/health` | 存活探测 |
+
+### `POST /api/reveal` 的三道闸门
+
+这是全项目唯一会把凭证明文下发到浏览器的接口，因此默认**只允许本机**：
+
+1. **来源必须回环**：请求的 `Host` 与 `Origin` 都必须是 `127.0.0.1` / `localhost` / `::1`。
+   服务本身默认也只监听回环地址；若把 `HOST` 改成 `0.0.0.0`，
+   则必须同时显式设置 `ALLOW_SECRET_REVEAL=1` 才会放行（并在启动时打警告）。
+2. **必须带自定义头** `X-Power-Meter-Intent: reveal`。
+   自定义头会让跨域请求先走 CORS 预检，而本服务从不返回 `Access-Control-Allow-*`，
+   预检必然失败——等于给 CSRF 上了第二把锁。
+3. **必须在白名单里**：只有适配器 `revealableSecrets()` 声明过的 key 才可读，
+   且必须命中 `accounts.json` 里具体某条账号。
+
+返回值带 `Cache-Control: no-store`；服务端日志只记「读了谁」不记值；
+`/api/summary` 里永远只有掩码预览（`secrets[].preview`），绝无明文。
 
 `/api/summary` 返回结构：
 
@@ -338,6 +507,7 @@ interface ProviderSnapshot {
 | `EXPIRY_CRITICAL_DAYS` | `5` | 红色高亮阈值：≤ 该天数到期显示红色 |
 | `EXPIRY_WARNING_DAYS` | `14` | 黄色高亮阈值：`criticalDays`~该天数到期显示黄色，更久显示绿色 |
 | `ACCOUNTS_PATH` | `./accounts.json` | 账号文件路径 |
+| `ALLOW_SECRET_REVEAL` | 未设置 | 设为 `1` 才允许非本机访问 `/api/reveal`（**前方必须已有反代鉴权**）|
 
 另见 `.env.example`；`src/config.ts` 内置了极简 `.env` 解析，无需 `dotenv`。
 
@@ -358,8 +528,23 @@ interface ProviderSnapshot {
   错误信息暴露出来（例如「响应缺少 xxx」），届时更新对应单文件即可。
 - CodeArts 官方另有一套 AK/SK 签名的 API 网关，本项目优先支持网页登录态；
   若要接 AK/SK，可基于 `codearts.ts` 扩展，用 `options.headers` 注入签名头。
+- **D1V 的账号密钥会过期/轮换**：官方要求「以替换方式轮换」而不是原地覆盖，
+  轮换后更新 `.env` 即可（热加载）；卡片里该条会显示 `unauthorized` 与原因。
+- **D1V 用 QUOTA 计**：与其余平台的 CREDITS 都不同，顶部汇总按单位分开计，
+  不做任何跨单位换算（所以「余额从少到多」这类排序在跨单位时没有可比性）。
+- **D1V 完全不显示钱包 USD**：`total_balance_usd` 恒定比 quota 折合值多 \$2.00，
+  且不参与实际消耗，显示它只会误导——看板只用 `quota_remaining`。
+- **D1V 的额度永不过期**（卡片头部标「永不过期」），所以它没有「最快到期」：
+  不进到期时间线、不触发顶部告警、没有进度条
+  （没有分母就不编分母；真实数据里套餐目录 `package_info[].quota` 全为 `0`，
+  真正表示额度的是 `credit_cents`，与 `use_quota` 量纲不同，硬凑分母只会显示错的进度条）。
+- **D1V 卡片在默认排序里排最后**：默认是「最快到期优先」，而它永远不会到期，
+  这是刻意的口径而不是 bug。想让「quota 快用完」也浮上来，
+  需要给条目加一个额度阈值；目前只对 `quota = 0` 标红
+  （那是事实判断，不需要拍一个阈值）。
 - 服务默认只监听 `127.0.0.1`，且不含鉴权。若要暴露到局域网，
-  请自行加反向代理鉴权——因为该服务持有你所有平台的登录态。
+  请自行加反向代理鉴权——因为该服务持有你所有平台的登录态
+  （并且 `/api/reveal` 能读出托管密钥明文）。
 
 ---
 
@@ -397,6 +582,53 @@ export const yourPlatformAdapter: ProviderAdapter = {
 3. 在 `accounts.json` 里加一条该平台的账号。
 
 如果用 `custom` 的声明式映射就能满足需求，则**完全不用写代码**。
+
+如果这个平台的**密钥值得在看板上直接复制**（例如它是模型调用凭证，
+需要经常贴到别处），再补一个 `revealableSecrets`：
+
+```ts
+export const yourPlatformAdapter: ProviderAdapter = {
+  // ...
+  revealableSecrets: (account) => [
+    { key: 'paiApiKey', label: 'YOUR_API_KEY', hint: '用于模型调用' },
+  ],
+};
+```
+
+声明之后，快照里的 `secrets[].preview` 会出现掩码预览，卡片自动带出「显示 / 复制」按钮，
+`/api/reveal` 也只放行这里声明过的 key——**没声明 = 整条链路关闭**，
+这是刻意的默认值（见 `base.ts` 的 `describeSecrets`）。
+
+如果这个平台的**多个账号本质上是「同一种东西的多份」**
+（一个账号 = 一份额度 + 一把密钥，摆成多张卡片反而看不清谁快用完了），
+再加一个 `groupAccounts`：
+
+```ts
+export const yourPlatformAdapter: ProviderAdapter = {
+  // ...
+  groupAccounts: true,
+};
+```
+
+聚合层（`aggregate.ts` 的 `groupSnapshots`）会把该平台的所有账号快照合并成
+**一张卡片**：每个账号成为 `entries[]` 里的一条，按额度升序排列，
+卡片顶部显示合计。适配器侧不用做任何事——每个账号照常各探各的，
+合并只发生在聚合层，`/api/reveal` 靠 `entries[].id`（即该账号的 `displayName`）
+定位到唯一账号。
+
+如果这个平台的额度**永不过期**，再加上：
+
+```ts
+export const yourPlatformAdapter: ProviderAdapter = {
+  // ...
+  neverExpires: true,
+};
+```
+
+卡片头部会打一个「永不过期」的绿色标签，替代原本的到期倒计时。
+必须显式声明而不是靠「没有批次/没有到期时间」推断——
+「确认不会过期」和「上游没给过期信息」是两件事，后者应该保持沉默
+（CodeArts 取不到套餐信息时就是后者，它不会被贴上这个标签）。
 
 ---
 

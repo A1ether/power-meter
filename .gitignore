@@ -12,3 +12,6 @@ accounts.json
 start.command
 start.sh
 .run/
+
+/.workbuddy
+/out

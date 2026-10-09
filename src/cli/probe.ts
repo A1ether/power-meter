@@ -69,8 +69,10 @@ async function main(): Promise<void> {
     });
     snapshots.push(snapshot);
     const elapsed = Date.now() - started;
+    // 探针是「逐账号」的诊断工具，不走聚合层的合并，
+    // 所以标题要用账号自己的名字——否则合并类平台（如 D1V）几行全长一样
     console.log(
-      `${color(snapshot)}\u25cf\u001b[0m ${pad(snapshot.displayName, 26)} ` +
+      `${color(snapshot)}\u25cf\u001b[0m ${pad(account.displayName || snapshot.displayName, 26)} ` +
         `${pad(snapshot.status, 14)} ${String(elapsed).padStart(5)}ms  ${snapshot.message ?? ''}`,
     );
     if (snapshot.balance) {
@@ -90,6 +92,10 @@ async function main(): Promise<void> {
         `  ${pad('', 24)}  · ${pad(lot.label, 24)} ${pad(String(lot.amount), 10)} ` +
           `过期 ${lot.expiresAt ? lot.expiresAt.slice(0, 10) : '—'}`,
       );
+    }
+    // 可托管密钥：这里只回显掩码，明文只在看板上按需读取
+    for (const secret of snapshot.secrets) {
+      console.log(`  ${pad('', 24)}密钥 ${pad(secret.label, 20)} ${secret.preview}`);
     }
   }
 

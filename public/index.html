@@ -75,7 +75,7 @@
 
     <footer class="footer">
       <span id="footer-updated"></span>
-      <span>数据仅在本机内存中缓存，凭证不会被下发到浏览器</span>
+      <span>凭证默认只留在本机；仅在点击「显示 / 复制」时按需读取，且只允许本机访问</span>
     </footer>
 
     <template id="card-template">
@@ -106,6 +106,24 @@
             <span>过期 / 剩余</span>
           </div>
           <ul class="lots__list"></ul>
+        </div>
+
+        <!-- 多账号合并的平台：一条账号一行，托管密钥与它的额度并排 -->
+        <div class="entries" hidden>
+          <div class="entries__head">
+            <span>账号 · 托管密钥</span>
+            <span>可用额度</span>
+          </div>
+          <div class="entries__list"></div>
+        </div>
+
+        <!-- 单账号平台：卡片级托管密钥 -->
+        <div class="secrets" hidden>
+          <div class="secrets__head">
+            <span>托管密钥</span>
+            <span>仅本机可读 · 点击复制</span>
+          </div>
+          <div class="secrets__list"></div>
         </div>
 
         <p class="card__note" hidden></p>

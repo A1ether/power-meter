@@ -10,6 +10,11 @@ const state = {
   autoRefresh: true,
   timer: null,
   loading: false,
+  /**
+   * 已被显式「显示」或「复制」过的托管密钥明文（key = provider#displayName#field）。
+   * 只活在内存里，手动刷新时清空——否则凭证轮换后这页还举着旧值。
+   */
+  revealed: new Map(),
 };
 
 const els = {
@@ -110,6 +115,8 @@ async function load(force = false) {
   state.loading = true;
   els.refreshBtn.disabled = true;
   els.refreshBtn.textContent = '刷新中…';
+  // 手动刷新 = 「重新读一遍配置」，此时把上一轮读出来的明文密钥丢掉
+  if (force) state.revealed.clear();
   try {
     const response = await fetch(`/api/summary${force ? '?force=1' : ''}`, {
       headers: { Accept: 'application/json' },
@@ -303,7 +310,11 @@ function buildCard(provider, thresholds) {
   );
   if (provider.status === 'demo') tags.append(element('span', 'chip chip--demo', '示例数据'));
   if (provider.stale) tags.append(element('span', 'chip chip--warning', '数据可能过期'));
-  if (provider.nextExpiryInDays !== null) {
+  // 有到期概念的走三色分级；明确不过期的（如 D1V 的 quota）直接给绿色标签。
+  // 两者互斥：一旦声明了永不过期，就不该再出现任何到期倒计时
+  if (provider.neverExpires) {
+    tags.append(element('span', 'chip chip--ok', '永不过期'));
+  } else if (provider.nextExpiryInDays !== null) {
     const level = levelFor(provider.nextExpiryInDays, thresholds);
     const label = `${expiryText(provider.nextExpiryInDays)}`;
     tags.append(
@@ -397,6 +408,9 @@ function buildCard(provider, thresholds) {
     note.hidden = true;
   }
 
+  renderEntries(node, provider);
+  renderSecrets(node, provider);
+
   node.querySelector('.card__updated').textContent = `更新于 ${fmtDate(provider.updatedAt)}`;
   const link = node.querySelector('.card__link');
   if (provider.dashboardUrl) {
@@ -406,6 +420,202 @@ function buildCard(provider, thresholds) {
   }
 
   return node;
+}
+
+/**
+ * 多账号合并的平台（provider.entries 非空）：一条账号一行，
+ * 「掩码密钥 + 该账号的可用额度」放在一起，方便横向对比谁快用完了。
+ */
+function renderEntries(node, provider) {
+  const box = node.querySelector('.entries');
+  const list = node.querySelector('.entries__list');
+  const entries = Array.isArray(provider.entries) ? provider.entries : [];
+  list.replaceChildren();
+  box.hidden = entries.length === 0;
+  if (entries.length === 0) return;
+
+  // 合并卡片里额度由条目表达，卡片顶部保留合计；
+  // 而「进度条 / 积分批次（过期·剩余）」是给有到期概念的平台用的，
+  // 对「不过期的 quota」没有意义，整块隐掉
+  node.querySelector('.meter').hidden = true;
+  node.querySelector('.lots').hidden = true;
+
+  for (const entry of entries) list.append(buildEntry(provider, entry));
+}
+
+function buildEntry(provider, entry) {
+  const healthy = entry.status === 'ok' || entry.status === 'demo';
+  // 额度归零是事实判断，不需要阈值：0 就是调不动了
+  const empty = healthy && entry.amount <= 0;
+  const row = element(
+    'div',
+    `entry${healthy ? '' : ' entry--failed'}${empty ? ' entry--empty' : ''}`,
+  );
+
+  const head = element('div', 'entry__head');
+  head.append(element('span', 'entry__name', entry.label || '(未命名账号)'));
+  head.append(
+    element(
+      'span',
+      `entry__amount${healthy && !empty ? '' : ' entry__amount--failed'}`,
+      healthy ? `${fmtNumber(entry.amount)} ${entry.currency}` : entry.status,
+    ),
+  );
+  row.append(head);
+
+  if (empty) row.append(element('p', 'entry__error', 'quota 已用尽，该账号调不动'));
+
+  if (!healthy && entry.message) row.append(element('p', 'entry__error', entry.message));
+
+  const secrets = Array.isArray(entry.secrets) ? entry.secrets : [];
+  if (secrets.length === 0) {
+    row.append(element('p', 'entry__note', '未配置可托管的项目密钥'));
+  } else {
+    for (const secret of secrets) row.append(buildSecretBlock(provider.provider, entry.id, secret));
+  }
+
+  if (healthy && entry.note) row.append(element('p', 'entry__note', entry.note));
+  return row;
+}
+
+/**
+ * 单账号平台的「托管密钥」区块：只展示掩码，明文按需向后端要。
+ * 与卡片健康状态无关——额度查询失败时，密钥通常仍然要能用。
+ */
+function renderSecrets(node, provider) {
+  const box = node.querySelector('.secrets');
+  const list = node.querySelector('.secrets__list');
+  const secrets = Array.isArray(provider.secrets) ? provider.secrets : [];
+  list.replaceChildren();
+
+  // 合并卡片把密钥挪进条目里了，卡片级区块没有内容可放
+  if (secrets.length === 0 || (provider.entries ?? []).length > 0) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  for (const secret of secrets) list.append(buildSecretBlock(provider.provider, provider.accountId, secret));
+}
+
+/** state.revealed 的键：平台 + 账号 + 字段，三者才能唯一确定一把密钥 */
+function secretIdOf(providerId, accountId, field) {
+  return `${providerId}#${accountId ?? ''}#${field}`;
+}
+
+function buildSecretBlock(providerId, accountId, secret) {
+  const id = secretIdOf(providerId, accountId, secret.key);
+  const revealed = state.revealed.get(id);
+
+  const row = element('div', 'secret');
+  const head = element('div', 'secret__head');
+  head.append(element('span', 'secret__label', secret.label));
+
+  const actions = element('div', 'secret__actions');
+  const toggle = element('button', 'secret__btn', revealed ? '隐藏' : '显示');
+  toggle.type = 'button';
+  toggle.title = secret.hint || '查看完整密钥';
+  toggle.addEventListener('click', async () => {
+    if (state.revealed.has(id)) {
+      state.revealed.delete(id);
+      renderGrid(state.data);
+      return;
+    }
+    const value = await requestSecret(providerId, accountId, secret.key, toggle, '读取中…');
+    if (!value) return;
+    state.revealed.set(id, value);
+    renderGrid(state.data);
+  });
+
+  const copy = element('button', 'secret__btn secret__btn--primary', '复制');
+  copy.type = 'button';
+  copy.title = secret.hint || '复制到剪贴板';
+  copy.addEventListener('click', async () => {
+    const value =
+      state.revealed.get(id) ||
+      (await requestSecret(providerId, accountId, secret.key, copy, '读取中…'));
+    if (!value) return;
+    if (!(await copyText(value))) {
+      els.diagnostics.prepend(
+        element('div', 'diag diag--warn', `浏览器拒绝写入剪贴板，请用「显示」后手动复制 ${secret.label}`),
+      );
+      return;
+    }
+    state.revealed.set(id, value);
+    copy.textContent = '已复制';
+    copy.classList.add('secret__btn--done');
+    setTimeout(() => {
+      copy.textContent = '复制';
+      copy.classList.remove('secret__btn--done');
+    }, 1600);
+  });
+
+  actions.append(toggle, copy);
+  head.append(actions);
+
+  row.append(head);
+  const value = element('code', 'secret__value', revealed || secret.preview);
+  if (secret.hint) value.title = secret.hint;
+  row.append(value);
+  return row;
+}
+
+/** 向本机后端要一次明文；失败时把原因写进「诊断」区，不弹窗打断 */
+async function requestSecret(providerId, accountId, field, button, busyText) {
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = busyText;
+  try {
+    const response = await fetch('/api/reveal', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        // 自定义头：跨域请求会因此必须先过 CORS 预检，而后端从不放行预检
+        'X-Power-Meter-Intent': 'reveal',
+      },
+      body: JSON.stringify({ provider: providerId, accountId: accountId ?? '', key: field }),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(payload?.error || `接口返回 ${response.status}`);
+    return payload?.value ?? '';
+  } catch (error) {
+    els.diagnostics.prepend(
+      element('div', 'diag diag--warn', `读取密钥 ${field} 失败：${error.message}`),
+    );
+    return '';
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+/**
+ * 写剪贴板。非安全上下文（例如用局域网 IP 打开页面）下
+ * `navigator.clipboard` 不存在，退回 textarea + execCommand。
+ */
+async function copyText(value) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {
+    // 落到下面的兜底方案
+  }
+  try {
+    const helper = document.createElement('textarea');
+    helper.value = value;
+    helper.setAttribute('readonly', '');
+    helper.style.position = 'fixed';
+    helper.style.top = '-1000px';
+    helper.style.opacity = '0';
+    document.body.append(helper);
+    helper.select();
+    const ok = document.execCommand('copy');
+    helper.remove();
+    return ok;
+  } catch {
+    return false;
+  }
 }
 
 function renderTimeline(data) {

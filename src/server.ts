@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
-import { describeRegistry } from './providers/index.js';
+import { describeRegistry, resolveAdapter } from './providers/index.js';
 import { DashboardService } from './service.js';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
@@ -57,8 +57,120 @@ function describeConfig(): unknown {
       enabled: account.enabled,
       credentialKeys: Object.keys(account.credentials),
       optionKeys: Object.keys(account.options),
+      // 允许被 /api/reveal 读出的凭证 key（仍然只有名字，没有值）
+      revealableKeys: (resolveAdapter(account.provider)?.revealableSecrets?.(account) ?? []).map(
+        (secret) => secret.key,
+      ),
     })),
   };
+}
+
+/**
+ * 密钥读取闸门。
+ *
+ * 这是本项目唯一会把凭证明文下发到浏览器的入口，因此默认**只允许本机**：
+ *   1. 服务自身监听在回环地址（`HOST` 默认 127.0.0.1 就是为此）；
+ *      若改成 0.0.0.0，必须显式设 `ALLOW_SECRET_REVEAL=1` 才放行；
+ *   2. 带 `Origin` 的请求（浏览器发起）必须也来自回环地址，
+ *      否则 `evil.com` 可以用一段 JS 直接 POST 到 127.0.0.1 偷密钥；
+ *   3. 必须有自定义头 `X-Power-Meter-Intent: reveal`。
+ *      自定义头会让跨域请求必须先过 CORS 预检，而本服务不返回任何
+ *      `Access-Control-Allow-*`，预检必然失败——等于给 CSRF 上了双保险。
+ */
+function revealGuard(req: IncomingMessage): { ok: true } | { ok: false; status: number; error: string } {
+  if (process.env.ALLOW_SECRET_REVEAL !== '1' && !isLoopbackHost(hostnameOf(req.headers.host))) {
+    return {
+      ok: false,
+      status: 403,
+      error: '密钥读取仅允许从本机访问。若确需远程使用，请显式设置 ALLOW_SECRET_REVEAL=1 并自行为服务加鉴权。',
+    };
+  }
+  const origin = req.headers.origin;
+  if (typeof origin === 'string' && origin !== '' && origin !== 'null') {
+    if (!isLoopbackHost(hostnameOf(origin))) {
+      return { ok: false, status: 403, error: `拒绝来自 ${origin} 的密钥读取请求。` };
+    }
+  }
+  if (req.headers['x-power-meter-intent'] !== 'reveal') {
+    return { ok: false, status: 400, error: '缺少 X-Power-Meter-Intent: reveal 请求头。' };
+  }
+  return { ok: true };
+}
+
+/** 从 `host` / `origin` 这类值里取主机名，兼容带端口与 IPv6 方括号的写法 */
+function hostnameOf(value: string | undefined): string {
+  if (!value) return '';
+  try {
+    return new URL(value.includes('://') ? value : `http://${value}`).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  return (
+    hostname === '127.0.0.1' ||
+    hostname === 'localhost' ||
+    hostname === '::1' ||
+    hostname === '[::1]'
+  );
+}
+
+/**
+ * 按需读出某条账号的托管密钥明文。
+ *
+ * 三重约束：只能是适配器 `revealableSecrets()` 声明过的 key、
+ * 必须命中 accounts.json 里的具体账号、返回体不缓存不落日志。
+ */
+function revealSecret(
+  body: { provider?: unknown; accountId?: unknown; key?: unknown },
+): { status: number; payload: unknown } {
+  const provider = typeof body.provider === 'string' ? body.provider.trim() : '';
+  const key = typeof body.key === 'string' ? body.key.trim() : '';
+  const accountId = typeof body.accountId === 'string' ? body.accountId : '';
+  if (!provider || !key) {
+    return { status: 400, payload: { error: 'provider 与 key 均为必填。' } };
+  }
+
+  // accountId 就是 accounts.json 里的 displayName（没写则是空串），
+  // 与快照的 accountId / entries[].id 同源，不用再做任何拼接推断
+  const { config } = loadConfig();
+  const candidates = config.accounts.filter((item) => item.provider === provider);
+  const account = candidates.find((item) => (item.displayName ?? '') === accountId);
+  if (!account) {
+    return {
+      status: 404,
+      payload: {
+        error: `accounts.json 里找不到账号 ${provider}${accountId ? ` / ${accountId}` : ''}（共 ${candidates.length} 个同平台账号）。`,
+      },
+    };
+  }
+  if (candidates.filter((item) => (item.displayName ?? '') === accountId).length > 1) {
+    return {
+      status: 409,
+      payload: {
+        error: `平台 ${provider} 下有多个账号的 displayName 都是 "${accountId}"，无法定位。请给它们取不同的 displayName。`,
+      },
+    };
+  }
+
+  const adapter = resolveAdapter(account.provider);
+  const declared = adapter?.revealableSecrets?.(account) ?? [];
+  if (!declared.some((item) => item.key === key)) {
+    return {
+      status: 403,
+      payload: { error: `平台 ${provider} 未声明可读取的凭证 "${key}"。` },
+    };
+  }
+
+  const value = account.credentials[key];
+  if (!value) {
+    return { status: 404, payload: { error: `凭证 ${key} 为空，请在 .env 中补齐后重试。` } };
+  }
+
+  // 日志只记「谁被读了」，绝不记值
+  console.log(`[reveal] ${provider}#${accountId || '(默认账号)'} ← ${key}`);
+  return { status: 200, payload: { key, value } };
 }
 
 async function serveStatic(pathname: string, res: ServerResponse): Promise<boolean> {
@@ -127,6 +239,22 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (pathname === '/api/reveal' && req.method === 'POST') {
+      const guard = revealGuard(req);
+      if (!guard.ok) {
+        sendJson(res, guard.status, { error: guard.error });
+        return;
+      }
+      const body = (await readBody(req)) as {
+        provider?: unknown;
+        displayName?: unknown;
+        key?: unknown;
+      };
+      const outcome = revealSecret(body);
+      sendJson(res, outcome.status, outcome.payload);
+      return;
+    }
+
     if (pathname.startsWith('/api/')) {
       sendJson(res, 404, { error: `未知接口 ${pathname}` });
       return;
@@ -150,6 +278,16 @@ server.listen(bootstrap.server.port, bootstrap.server.host, () => {
   console.log(`  接口: ${origin}/api/summary   配置概览: ${origin}/api/config`);
   console.log(`  账号文件: ${bootstrap.accountsFilePath}`);
   console.log(`  缓存 TTL: ${bootstrap.settings.cacheTtlSeconds}s\n`);
+
+  const exposingSecrets = process.env.ALLOW_SECRET_REVEAL === '1';
+  const reachableFromLan = !isLoopbackHost(bootstrap.server.host);
+  if (exposingSecrets || reachableFromLan) {
+    console.warn(
+      '  ⚠ 密钥读取接口 /api/reveal 已对非本机来源开放' +
+        (exposingSecrets ? '（ALLOW_SECRET_REVEAL=1）' : `（HOST=${bootstrap.server.host}）`) +
+        '，请确保前面有反向代理鉴权。\n',
+    );
+  }
   if (!service.accounts.some((account) => account.enabled && !account.provider.startsWith('demo:'))) {
     console.log('  提示：当前只有示例数据，配置真实凭证请编辑 accounts.json（保存后自动生效）\n');
   }

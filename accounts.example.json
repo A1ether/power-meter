@@ -4,7 +4,14 @@
     "推荐流程：npm run chrome:debug → 在弹出窗口登录 → npm run capture 自动抓取凭证。",
     "credentials 用 ${ENV_VAR} 引用 .env，避免把凭证明文写进文件。",
     "保存后服务会自动热加载，无需重启。",
-    "provider 支持：qoder / trae / codebuddy / codearts / custom / demo:*"
+    "provider 支持：qoder / trae / codebuddy / codearts / d1v / custom / demo:*",
+    "D1V 推荐用 `npm run d1v:add -- <账号密钥> <项目密钥>` 添加，不用手工改本文件。",
+    "D1V 可有多个账号：靠 credentials.apiKey 查额度，",
+    "         并把 credentials.paiApiKey（D1V_PAI_API_KEY）交给看板托管、一键复制。",
+    "     displayName 现在是账号的稳定标识（/api/reveal 靠它定位），界面显示的是邮箱。",
+    "D1V 的额度单位是 QUOTA 且永不过期：钱包 USD 不显示（1 USD = 500,000 quota，",
+    "     但钱包恒定虚高），也不参与「最快到期」。",
+    "整个 D1V 只占一张卡片：所有 d1v 账号会被合并成一张卡，一条条列出密钥与额度。"
   ],
   "accounts": [
     {
@@ -44,6 +51,28 @@
         "cookie": "${CODEARTS_COOKIE}"
       },
       "options": {}
+    },
+    {
+      "provider": "d1v",
+      "displayName": "D1V · 账号 A",
+      "enabled": false,
+      "credentials": {
+        "apiKey": "${D1V_A_API_KEY}",
+        "paiApiKey": "${D1V_A_PAI_API_KEY}"
+      },
+      "options": {}
+    },
+    {
+      "provider": "d1v",
+      "displayName": "D1V · 账号 B",
+      "enabled": false,
+      "credentials": {
+        "apiKey": "${D1V_B_API_KEY}",
+        "paiApiKey": "${D1V_B_PAI_API_KEY}"
+      },
+      "options": {
+        "revealApiKey": false
+      }
     },
     {
       "provider": "custom",

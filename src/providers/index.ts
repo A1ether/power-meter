@@ -2,6 +2,7 @@ import type { AccountConfig } from '../config.js';
 import type { ProviderAdapter } from './base.js';
 import { codeartsAdapter } from './codearts.js';
 import { codebuddyAdapter } from './codebuddy.js';
+import { d1vAdapter } from './d1v.js';
 import { demoAdapters } from './demo.js';
 import { sessionApiAdapters } from './presets.js';
 import { qoderAdapter } from './qoder.js';
@@ -18,6 +19,7 @@ for (const adapter of [
   traeAdapter,
   codebuddyAdapter,
   codeartsAdapter,
+  d1vAdapter,
   ...sessionApiAdapters,
   ...demoAdapters,
 ]) {
@@ -60,6 +62,11 @@ const ALIASES: Record<string, string> = {
   'codearts.huaweicloud.com': 'codearts',
   'huaweicloud': 'codearts',
   'devcloud': 'codearts',
+  'd1v.ai': 'd1v',
+  'www.d1v.ai': 'd1v',
+  'api.d1v.ai': 'd1v',
+  'pai.d1v.ai': 'd1v',
+  'd1v-ai': 'd1v',
 };
 
 export function describeRegistry(): Array<{

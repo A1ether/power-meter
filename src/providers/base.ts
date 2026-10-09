@@ -8,6 +8,7 @@ import type {
   ProviderSnapshot,
   ProviderStatus,
   QuotaWindow,
+  SecretRef,
   WindowKind,
 } from '../types.js';
 
@@ -29,7 +30,36 @@ export interface ProviderAdapter {
   /** 需要哪些凭证 key，缺失即 notConfigured */
   requiredCredentialKeys: string[];
   credentialHint: string;
+  /**
+   * 把这个平台的所有账号并进**一张卡片**（每个账号成为卡片里的一条 entry）。
+   *
+   * 适用于「同一个东西的多份」：D1V 的每个账号都是一把项目密钥 + 一份 quota，
+   * 拆成多张卡片会让额度对比被冲散。默认 false = 一个账号一张卡片。
+   */
+  groupAccounts?: boolean;
+  /**
+   * 该平台的额度**永不过期**。
+   *
+   * 必须由适配器显式声明，不能靠「没有批次/没有到期时间」推断——
+   * 「确认不会过期」和「上游没给过期信息」是两件事，
+   * 后者在界面上应该什么标签都不给，而不是标一个「永不过期」骗人。
+   */
+  neverExpires?: boolean;
+  /**
+   * 声明哪些凭证允许在看板上「显示 / 复制」。不声明即整条链路关闭：
+   * 快照不带 secrets，`/api/reveal` 也会拒绝该 key。
+   *
+   * 之所以做成函数而不是静态对象：是否暴露要看账号的具体配置
+   * （例如 D1V 默认只暴露项目密钥，账号密钥要显式开启 options.revealApiKey）。
+   */
+  revealableSecrets?: (account: AccountConfig) => SecretDescriptor[];
   probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot>;
+}
+
+export interface SecretDescriptor {
+  key: string;
+  label: string;
+  hint?: string;
 }
 
 export interface WindowInput {
@@ -167,9 +197,19 @@ export function buildSnapshot(input: SnapshotInput): ProviderSnapshot {
     if (future) nextExpiryAt = future;
   }
 
+  // 合并成一张卡片的平台，标题用适配器名（账号身份下移到 entries[].id），
+  // 否则多张卡片会顶着各自的账号名、看起来像不同平台
+  const displayName = input.adapter.groupAccounts
+    ? input.adapter.displayName
+    : input.account.displayName || input.adapter.displayName;
+
   return {
     provider: input.adapter.id,
-    displayName: input.account.displayName || input.adapter.displayName,
+    displayName,
+    accountId: input.account.displayName ?? '',
+    groupAccounts: input.adapter.groupAccounts === true,
+    neverExpires: input.adapter.neverExpires === true,
+    entries: [],
     region: input.adapter.region,
     status: input.status,
     source: input.source ?? 'api',
@@ -183,8 +223,43 @@ export function buildSnapshot(input: SnapshotInput): ProviderSnapshot {
     dashboardUrl: input.adapter.dashboardUrl,
     message: input.message ?? null,
     note: input.note ?? null,
+    secrets: describeSecrets(input.adapter, input.account),
     stale: false,
   };
+}
+
+/**
+ * 密钥掩码。保留前后缀是为了让「多个账号」场景下能一眼分辨是哪把钥匙，
+ * 这与各家控制台存 `key_prefix` 的做法一致；短到没法安全截断时整体打码。
+ */
+export function maskSecret(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (trimmed.length <= 12) return '•'.repeat(trimmed.length);
+  return `${trimmed.slice(0, 6)}…${trimmed.slice(-4)}`;
+}
+
+/**
+ * 把适配器声明的可托管凭证转成快照里的 secrets。
+ * 只输出**是否存在 + 掩码预览**，明文永远不进快照、不进 API 响应。
+ */
+export function describeSecrets(
+  adapter: ProviderAdapter,
+  account: AccountConfig,
+): SecretRef[] {
+  const declared = adapter.revealableSecrets?.(account) ?? [];
+  const out: SecretRef[] = [];
+  for (const item of declared) {
+    const value = account.credentials[item.key];
+    if (!value) continue;
+    out.push({
+      key: item.key,
+      label: item.label,
+      preview: maskSecret(value),
+      hint: item.hint ?? '',
+    });
+  }
+  return out;
 }
 
 export function notConfigured(
@@ -240,6 +315,15 @@ export function optNumber(account: AccountConfig, key: string): number | null {
   const value = account.options[key];
   const parsed = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** options 里的布尔开关，兼容 true / "true" / 1 / "1" */
+export function optBool(account: AccountConfig, key: string, fallback = false): boolean {
+  const value = account.options[key];
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  return /^(1|true|yes|on)$/i.test(String(value).trim());
 }
 
 /**

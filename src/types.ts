@@ -31,7 +31,12 @@ export type WindowKind = 'session' | 'daily' | 'weekly' | 'billing';
  */
 export type BoundaryKind = 'reset' | 'expiry' | 'mixed';
 
-export type Currency = 'CREDITS' | 'POINTS' | 'USD' | 'CNY';
+/**
+ * 额度单位。各平台口径不同，不做换算，在界面与汇总里按单位分开计。
+ * `QUOTA` 是 D1V 的模型调用计量单位（1 USD = 500,000 quota，实测恒定），
+ * 它与同平台的 USD 钱包余额是同一笔钱的两套计量，因此不能相加。
+ */
+export type Currency = 'CREDITS' | 'POINTS' | 'QUOTA' | 'USD' | 'CNY';
 
 export interface QuotaWindow {
   kind: WindowKind;
@@ -71,9 +76,62 @@ export interface MoneyBalance {
   currency: Currency;
 }
 
+/**
+ * 「托管密钥」引用：值本身**不进快照**，只下发展示用的掩码预览。
+ * 前端按 key 调 `/api/reveal` 按需取明文（见 server.ts 的 reveal 路由）。
+ */
+export interface SecretRef {
+  /** 凭证 key，作为 /api/reveal 的入参 */
+  key: string;
+  /** 展示名，如 `D1V_PAI_API_KEY` */
+  label: string;
+  /** 掩码预览，如 `sk-abc…9f2c` */
+  preview: string;
+  /** 说明这句话在界面上给谁看（如「用于模型调用」） */
+  hint: string;
+}
+
+/**
+ * 卡片里的一个账号条目。
+ *
+ * 有些平台的账号是「同一个东西的多份」（D1V 就是：每个账号一把项目密钥 +
+ * 一份 quota），摆成一屏卡片会把真正要看的对比信息冲散。
+ * 这类平台的适配器声明 `groupAccounts`，聚合层把它的多个账号快照合并成
+ * 一张卡片，每个账号变成这里的一条 entry。
+ */
+export interface ProviderEntry {
+  /**
+   * 稳定标识：账号在 accounts.json 里的 displayName（没写就是空串）。
+   * 前端把它回传给 `/api/reveal`，服务端据此定位到唯一账号。
+   */
+  id: string;
+  /** 展示用名称，优先取账号邮箱之类的身份信息 */
+  label: string;
+  /** 这条账号的可用额度 */
+  amount: number;
+  currency: Currency;
+  status: ProviderStatus;
+  message: string | null;
+  /** 补充说明，如「已用 17,888 quota · 4 次请求」 */
+  note: string | null;
+  secrets: SecretRef[];
+}
+
 export interface ProviderSnapshot {
   provider: string;
   displayName: string;
+  /**
+   * 账号在 accounts.json 里的 displayName（没写就是空串）。
+   * 一个账号一张卡片时它就是这张卡的身份；合并成一张卡片后，
+   * 身份下移到 entries[].id，这里置空。
+   */
+  accountId: string;
+  /** 该适配器是否要求把所有账号并进一张卡片（见 ProviderEntry） */
+  groupAccounts: boolean;
+  /** 额度永不过期（由适配器显式声明，见 ProviderAdapter.neverExpires） */
+  neverExpires: boolean;
+  /** 合并后的账号条目；非合并平台为空数组 */
+  entries: ProviderEntry[];
   region: 'cn' | 'global';
   status: ProviderStatus;
   source: 'api' | 'web' | 'local';
@@ -89,6 +147,11 @@ export interface ProviderSnapshot {
   dashboardUrl: string;
   message: string | null;
   note: string | null;
+  /**
+   * 可托管的密钥（目前只有 D1V 用）。与探测结果解耦：
+   * 即使余额查询失败，只要凭证在，仍能复制密钥。
+   */
+  secrets: SecretRef[];
   /** true 表示本次刷新失败，展示的是上一次成功的数据 */
   stale: boolean;
 }

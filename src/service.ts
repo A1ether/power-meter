@@ -7,6 +7,7 @@ import {
   type LoadConfigResult,
 } from './config.js';
 import { TtlCache } from './lib/cache.js';
+import { describeSecrets } from './providers/base.js';
 import { resolveAdapter } from './providers/index.js';
 import type { ProviderSnapshot } from './types.js';
 import { OK_STATUSES } from './types.js';
@@ -126,6 +127,10 @@ export class DashboardService {
       return {
         provider: account.provider,
         displayName: account.displayName || account.provider,
+        accountId: account.displayName ?? '',
+        groupAccounts: false,
+        neverExpires: false,
+        entries: [],
         region: 'global',
         status: 'notConfigured',
         source: 'api',
@@ -139,6 +144,7 @@ export class DashboardService {
         dashboardUrl: '',
         message: `未知平台 "${account.provider}"，请在 src/providers/index.ts 注册适配器，或改用 custom。`,
         note: null,
+        secrets: [],
         stale: false,
       };
     }
@@ -175,7 +181,13 @@ export class DashboardService {
       }
       return {
         provider: account.provider,
-        displayName: account.displayName || adapter.displayName,
+        displayName: adapter.groupAccounts
+          ? adapter.displayName
+          : account.displayName || adapter.displayName,
+        accountId: account.displayName ?? '',
+        groupAccounts: adapter.groupAccounts === true,
+        neverExpires: adapter.neverExpires === true,
+        entries: [],
         region: adapter.region,
         status: 'error',
         source: 'api',
@@ -189,6 +201,8 @@ export class DashboardService {
         dashboardUrl: adapter.dashboardUrl,
         message,
         note: null,
+        // 探测抛异常时仍要能复制密钥：secrets 与取数结果解耦
+        secrets: describeSecrets(adapter, account),
         stale: false,
       };
     }
