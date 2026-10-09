@@ -3,6 +3,9 @@ const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 /** 每张卡片默认展示的积分数，其余折叠 */
 const VISIBLE_LOTS = 3;
 
+/** 合并卡片里默认展示的账号数，其余折叠 */
+const VISIBLE_ENTRIES = 2;
+
 const state = {
   data: null,
   sort: 'expiry',
@@ -11,10 +14,18 @@ const state = {
   timer: null,
   loading: false,
   /**
-   * 已被显式「显示」或「复制」过的托管密钥明文（key = provider#displayName#field）。
+   * 已被显式「显示」或「复制」过的托管密钥明文（key = provider#accountId#field）。
    * 只活在内存里，手动刷新时清空——否则凭证轮换后这页还举着旧值。
    */
   revealed: new Map(),
+  /**
+   * 增删账号的结果提示（key = provider id）。
+   * 存到 state 而不是直接写 DOM：操作完会重新拉一次数据、整张卡片重建，
+   * 直接写 DOM 的话提示会跟着一起没掉。
+   */
+  manageMessages: new Map(),
+  /** GET /api/d1v/accounts 的缓存（含已停用、取数失败的账号） */
+  configuredAccounts: null,
 };
 
 const els = {
@@ -115,8 +126,11 @@ async function load(force = false) {
   state.loading = true;
   els.refreshBtn.disabled = true;
   els.refreshBtn.textContent = '刷新中…';
-  // 手动刷新 = 「重新读一遍配置」，此时把上一轮读出来的明文密钥丢掉
-  if (force) state.revealed.clear();
+  // 手动刷新 = 「重新读一遍配置」，此时把上一轮读出来的明文密钥与配置清单都丢掉
+  if (force) {
+    state.revealed.clear();
+    state.configuredAccounts = null;
+  }
   try {
     const response = await fetch(`/api/summary${force ? '?force=1' : ''}`, {
       headers: { Accept: 'application/json' },
@@ -154,11 +168,9 @@ function renderSummary(data) {
   const { totals, expiryThresholds, expiryTimeline } = data;
   els.summary.replaceChildren();
 
-  const available =
-    Object.entries(totals.availableByCurrency ?? {})
-      .filter(([, amount]) => amount > 0)
-      .map(([currency, amount]) => `${fmtNumber(amount)} ${currency}`)
-      .join(' · ') || '–';
+  const availableRows = Object.entries(totals.availableByCurrency ?? {})
+    .filter(([, amount]) => amount > 0)
+    .map(([currency, amount]) => ({ unit: currency, amount: fmtNumber(amount) }));
 
   const critical = expiryTimeline.filter(
     (hit) => hit.inDays <= expiryThresholds.criticalDays,
@@ -170,7 +182,11 @@ function renderSummary(data) {
 
   const stats = [
     { label: '平台总数', value: String(totals.providers), hint: `${totals.ok} 正常 / ${totals.failed} 异常` },
-    { label: '可用额度合计', value: available, hint: '各平台账户余额汇总，按币种' },
+    {
+      label: '可用额度合计',
+      rows: availableRows.length > 0 ? availableRows : [{ unit: '', amount: '–' }],
+      hint: '各币种余额独立汇总，数值之间互不换算',
+    },
     {
       label: `≤${expiryThresholds.criticalDays} 天到期`,
       value: String(critical),
@@ -186,11 +202,22 @@ function renderSummary(data) {
 
   for (const stat of stats) {
     const card = element('div', `stat${stat.accent ? ' stat--accent' : ''}`);
-    card.append(
-      element('span', 'stat__label', stat.label),
-      element('span', 'stat__value', stat.value),
-      element('span', 'stat__hint', stat.hint),
-    );
+    card.append(element('span', 'stat__label', stat.label));
+    if (stat.rows) {
+      const rows = element('div', 'stat__rows');
+      for (const row of stat.rows) {
+        const rowEl = element('div', 'stat__row');
+        rowEl.append(
+          row.unit ? element('span', 'stat__row-unit', row.unit) : element('span'),
+          element('span', 'stat__row-amount', row.amount),
+        );
+        rows.append(rowEl);
+      }
+      card.append(rows);
+    } else {
+      card.append(element('span', 'stat__value', stat.value));
+    }
+    card.append(element('span', 'stat__hint', stat.hint));
     els.summary.append(card);
   }
 }
@@ -410,6 +437,7 @@ function buildCard(provider, thresholds) {
 
   renderEntries(node, provider);
   renderSecrets(node, provider);
+  renderManage(node, provider);
 
   node.querySelector('.card__updated').textContent = `更新于 ${fmtDate(provider.updatedAt)}`;
   const link = node.querySelector('.card__link');
@@ -440,7 +468,26 @@ function renderEntries(node, provider) {
   node.querySelector('.meter').hidden = true;
   node.querySelector('.lots').hidden = true;
 
-  for (const entry of entries) list.append(buildEntry(provider, entry));
+  entries.forEach((entry, index) => {
+    const row = buildEntry(provider, entry);
+    if (index >= VISIBLE_ENTRIES) row.classList.add('entry--collapsed');
+    list.append(row);
+  });
+
+  // 超出 VISIBLE_ENTRIES 的折叠起来，避免账号一多就把卡片撑爆
+  // （与「可用积分批次」是同一套交互，连按钮样式都一样）
+  const hiddenCount = entries.length - VISIBLE_ENTRIES;
+  if (hiddenCount > 0) {
+    const toggle = element('button', 'entries__toggle', `展开其余 ${hiddenCount} 个 ⌄`);
+    toggle.type = 'button';
+    toggle.setAttribute('aria-expanded', 'false');
+    toggle.addEventListener('click', () => {
+      const expanded = list.classList.toggle('entries__list--expanded');
+      toggle.textContent = expanded ? '收起 ⌃' : `展开其余 ${hiddenCount} 个 ⌄`;
+      toggle.setAttribute('aria-expanded', String(expanded));
+    });
+    box.append(toggle);
+  }
 }
 
 function buildEntry(provider, entry) {
@@ -468,14 +515,204 @@ function buildEntry(provider, entry) {
   if (!healthy && entry.message) row.append(element('p', 'entry__error', entry.message));
 
   const secrets = Array.isArray(entry.secrets) ? entry.secrets : [];
+  const removeButton = provider.manageAccounts ? buildRemoveButton(provider, entry) : null;
+
   if (secrets.length === 0) {
     row.append(element('p', 'entry__note', '未配置可托管的项目密钥'));
+    // 没有密钥块可以挂靠时，「删除」得自己占一行，否则这个账号在界面上就删不掉了
+    if (removeButton) {
+      const actions = element('div', 'entry__actions');
+      actions.append(removeButton);
+      row.append(actions);
+    }
   } else {
-    for (const secret of secrets) row.append(buildSecretBlock(provider.provider, entry.id, secret));
+    secrets.forEach((secret, index) => {
+      // 「删除」跟「显示 / 复制」排在同一行的动作容器里（挂到第一个密钥块上）
+      row.append(
+        buildSecretBlock(provider.provider, entry.id, secret, index === 0 ? removeButton : null),
+      );
+    });
   }
 
   if (healthy && entry.note) row.append(element('p', 'entry__note', entry.note));
   return row;
+}
+
+/* ---------------------------- 增删账号 ---------------------------- */
+
+function buildRemoveButton(provider, entry) {
+  // 复用「显示 / 复制」那套按钮样式，只换配色，保证形式一致
+  const button = element('button', 'secret__btn secret__btn--danger', '删除');
+  button.type = 'button';
+  button.title = `删除账号「${entry.label || entry.id || '未命名'}」`;
+  button.setAttribute('aria-label', `删除账号 ${entry.label || entry.id || '未命名'}`);
+  button.addEventListener('click', () => removeAccount(provider, entry));
+  return button;
+}
+
+/** 所有增删操作都带自定义头：跨域请求会因此必须先过 CORS 预检，而后端从不放行预检 */
+async function manageRequest(path, body) {
+  const response = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Power-Meter-Intent': 'write' },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(payload?.error || `接口返回 ${response.status}`);
+  return payload ?? {};
+}
+
+function setManageMessage(providerId, kind, text) {
+  state.manageMessages.set(providerId, { kind, text });
+}
+
+async function removeAccount(provider, entry) {
+  const label = entry.label || entry.id || '未命名';
+  const confirmed = window.confirm(
+    `删除 D1V 账号「${label}」？\n\n` +
+      '会同时清掉 .env 里不再被其它账号引用的密钥变量，改动前自动备份到 .run/。',
+  );
+  if (!confirmed) return;
+  try {
+    const result = await manageRequest('/api/d1v/accounts/remove', { accountId: entry.id });
+    const cleaned = result.removedEnvLines?.length
+      ? `，并移除了 ${result.removedEnvLines.join(' / ')}`
+      : '';
+    setManageMessage(provider.provider, 'ok', `已删除「${label}」${cleaned}`);
+    state.configuredAccounts = null;
+    await load(true);
+  } catch (error) {
+    setManageMessage(provider.provider, 'err', `删除「${label}」失败：${error.message}`);
+    renderGrid(state.data);
+  }
+}
+
+/** 配置清单（含已停用 / 取数失败、因而不在卡片条目里的账号）。懒加载 + 缓存 */
+async function loadConfiguredAccounts(force = false) {
+  if (state.configuredAccounts && !force) return state.configuredAccounts;
+  try {
+    const response = await fetch('/api/d1v/accounts', {
+      headers: { Accept: 'application/json', 'X-Power-Meter-Intent': 'read' },
+    });
+    if (!response.ok) throw new Error(`接口返回 ${response.status}`);
+    state.configuredAccounts = (await response.json()).accounts ?? [];
+  } catch (error) {
+    els.diagnostics.prepend(
+      element('div', 'diag diag--warn', `读取 D1V 账号清单失败：${error.message}`),
+    );
+    state.configuredAccounts = [];
+  }
+  return state.configuredAccounts;
+}
+
+/**
+ * 管理区。entries 只列「启用的、能取数的」账号，
+ * 而停用或缺凭证的账号也需要能删——所以这里用配置清单兜住那部分。
+ */
+function renderManage(node, provider) {
+  const box = node.querySelector('.manage');
+  // 按钮住在额度行里（.card__balance），表单在下面，两处显隐得一起管
+  const toggle = node.querySelector('.manage__toggle');
+  toggle.hidden = !provider.manageAccounts;
+
+  if (!provider.manageAccounts) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+
+  const form = box.querySelector('.manage__form');
+  const status = box.querySelector('.manage__result');
+  const hiddenBox = box.querySelector('.manage__hidden');
+
+  const message = state.manageMessages.get(provider.provider);
+  status.hidden = !message;
+  if (message) {
+    status.className = `manage__result manage__result--${message.kind}`;
+    status.textContent = message.text;
+  }
+
+  const collapse = () => {
+    form.hidden = true;
+    toggle.textContent = '＋ 添加账号';
+    toggle.setAttribute('aria-expanded', 'false');
+  };
+
+  toggle.onclick = async () => {
+    if (!form.hidden) {
+      collapse();
+      return;
+    }
+    form.hidden = false;
+    toggle.textContent = '收起';
+    toggle.setAttribute('aria-expanded', 'true');
+    await loadConfiguredAccounts();
+    renderHiddenAccounts(hiddenBox, provider);
+    form.elements.apiKey?.focus();
+  };
+
+  box.querySelector('.manage__cancel').onclick = () => {
+    form.reset();
+    collapse();
+  };
+
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    const apiKey = form.elements.apiKey.value.trim();
+    const paiKey = form.elements.paiKey.value.trim();
+    if (!apiKey || !paiKey) {
+      setManageMessage(provider.provider, 'err', '个人 apikey 与项目 apikey 都要填。');
+      status.hidden = false;
+      status.className = 'manage__result manage__result--err';
+      status.textContent = '个人 apikey 与项目 apikey 都要填。';
+      return;
+    }
+
+    const submit = box.querySelector('.manage__submit');
+    submit.disabled = true;
+    submit.textContent = '验证中…';
+    try {
+      const result = await manageRequest('/api/d1v/accounts', { apiKey, paiKey });
+      const added = result.account ?? {};
+      setManageMessage(
+        provider.provider,
+        'ok',
+        `已添加「${added.label || result.name}」：${fmtNumber(added.amount ?? 0)} ${added.currency ?? ''}` +
+          ` · 项目密钥可用（${result.modelCount} 个模型）`,
+      );
+      form.reset();
+      collapse();
+      state.configuredAccounts = null;
+      await load(true);
+    } catch (error) {
+      setManageMessage(provider.provider, 'err', `添加失败：${error.message}`);
+      renderGrid(state.data);
+    } finally {
+      submit.disabled = false;
+      submit.textContent = '验证并添加';
+    }
+  };
+}
+
+function renderHiddenAccounts(box, provider) {
+  const configured = state.configuredAccounts ?? [];
+  const shown = new Set((provider.entries ?? []).map((entry) => entry.id));
+  const hidden = configured.filter((account) => !shown.has(account.id));
+
+  box.hidden = hidden.length === 0;
+  const list = box.querySelector('.manage__hidden-list');
+  list.replaceChildren();
+
+  for (const account of hidden) {
+    const row = element('div', 'hidden-account');
+    row.append(element('span', 'hidden-account__name', account.label));
+    const flags = [];
+    if (!account.enabled) flags.push('已停用');
+    if (!account.complete) flags.push('缺项目密钥');
+    if (flags.length > 0) row.append(element('span', 'hidden-account__flag', flags.join(' · ')));
+    row.append(buildRemoveButton(provider, { id: account.id, label: account.label }));
+    list.append(row);
+  }
 }
 
 /**
@@ -502,7 +739,12 @@ function secretIdOf(providerId, accountId, field) {
   return `${providerId}#${accountId ?? ''}#${field}`;
 }
 
-function buildSecretBlock(providerId, accountId, secret) {
+/**
+ * 一个「托管密钥」块：标签 + 显示/复制 + 掩码值。
+ * `trailingAction` 用于把外部的按钮（如账号的「删除」）并进同一行动作里，
+ * 让三个按钮落在同一条水平线上。
+ */
+function buildSecretBlock(providerId, accountId, secret, trailingAction = null) {
   const id = secretIdOf(providerId, accountId, secret.key);
   const revealed = state.revealed.get(id);
 
@@ -550,6 +792,7 @@ function buildSecretBlock(providerId, accountId, secret) {
   });
 
   actions.append(toggle, copy);
+  if (trailingAction) actions.append(trailingAction);
   head.append(actions);
 
   row.append(head);

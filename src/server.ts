@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
+import { addD1vAccount, listD1vAccounts, parseKeyPairText, removeD1vAccount } from './d1v-store.js';
 import { describeRegistry, resolveAdapter } from './providers/index.js';
 import { DashboardService } from './service.js';
 
@@ -66,33 +67,37 @@ function describeConfig(): unknown {
 }
 
 /**
- * 密钥读取闸门。
+ * 本机特权操作的闸门：读密钥明文（/api/reveal）、增删账号（/api/d1v/accounts）。
  *
- * 这是本项目唯一会把凭证明文下发到浏览器的入口，因此默认**只允许本机**：
+ * 这几个接口能读出凭证、也能改本机配置文件，所以默认**只允许本机**：
  *   1. 服务自身监听在回环地址（`HOST` 默认 127.0.0.1 就是为此）；
  *      若改成 0.0.0.0，必须显式设 `ALLOW_SECRET_REVEAL=1` 才放行；
  *   2. 带 `Origin` 的请求（浏览器发起）必须也来自回环地址，
- *      否则 `evil.com` 可以用一段 JS 直接 POST 到 127.0.0.1 偷密钥；
- *   3. 必须有自定义头 `X-Power-Meter-Intent: reveal`。
+ *      否则 `evil.com` 可以用一段 JS 直接 POST 到 127.0.0.1 读密钥 / 删账号；
+ *   3. 必须带自定义头 `X-Power-Meter-Intent`（值不限）。
  *      自定义头会让跨域请求必须先过 CORS 预检，而本服务不返回任何
  *      `Access-Control-Allow-*`，预检必然失败——等于给 CSRF 上了双保险。
  */
-function revealGuard(req: IncomingMessage): { ok: true } | { ok: false; status: number; error: string } {
+function privilegedGuard(
+  req: IncomingMessage,
+): { ok: true } | { ok: false; status: number; error: string } {
   if (process.env.ALLOW_SECRET_REVEAL !== '1' && !isLoopbackHost(hostnameOf(req.headers.host))) {
     return {
       ok: false,
       status: 403,
-      error: '密钥读取仅允许从本机访问。若确需远程使用，请显式设置 ALLOW_SECRET_REVEAL=1 并自行为服务加鉴权。',
+      error:
+        '该操作仅允许从本机发起。若确需远程使用，请显式设置 ALLOW_SECRET_REVEAL=1 并自行为服务加鉴权。',
     };
   }
   const origin = req.headers.origin;
   if (typeof origin === 'string' && origin !== '' && origin !== 'null') {
     if (!isLoopbackHost(hostnameOf(origin))) {
-      return { ok: false, status: 403, error: `拒绝来自 ${origin} 的密钥读取请求。` };
+      return { ok: false, status: 403, error: `拒绝来自 ${origin} 的本机特权请求。` };
     }
   }
-  if (req.headers['x-power-meter-intent'] !== 'reveal') {
-    return { ok: false, status: 400, error: '缺少 X-Power-Meter-Intent: reveal 请求头。' };
+  const intent = req.headers['x-power-meter-intent'];
+  if (typeof intent !== 'string' || intent.trim() === '') {
+    return { ok: false, status: 400, error: '缺少 X-Power-Meter-Intent 请求头。' };
   }
   return { ok: true };
 }
@@ -240,18 +245,101 @@ const server = createServer(async (req, res) => {
     }
 
     if (pathname === '/api/reveal' && req.method === 'POST') {
-      const guard = revealGuard(req);
+      const guard = privilegedGuard(req);
       if (!guard.ok) {
         sendJson(res, guard.status, { error: guard.error });
         return;
       }
       const body = (await readBody(req)) as {
         provider?: unknown;
-        displayName?: unknown;
+        accountId?: unknown;
         key?: unknown;
       };
       const outcome = revealSecret(body);
       sendJson(res, outcome.status, outcome.payload);
+      return;
+    }
+
+    // D1V 账号管理：前置校验都在 d1v-store 里，与 npm run d1v:add 完全同一份实现
+    if (pathname === '/api/d1v/accounts' && req.method === 'GET') {
+      const guard = privilegedGuard(req);
+      if (!guard.ok) {
+        sendJson(res, guard.status, { error: guard.error });
+        return;
+      }
+      const { accounts, missingEnvVars } = listD1vAccounts();
+      sendJson(res, 200, { accounts, missingEnvVars });
+      return;
+    }
+
+    if (pathname === '/api/d1v/accounts' && req.method === 'POST') {
+      const guard = privilegedGuard(req);
+      if (!guard.ok) {
+        sendJson(res, guard.status, { error: guard.error });
+        return;
+      }
+      const body = (await readBody(req)) as {
+        apiKey?: unknown;
+        paiKey?: unknown;
+        name?: unknown;
+        text?: unknown;
+        force?: unknown;
+      };
+      // 整段粘贴时由 store 解析「个人 / 项目」两把密钥
+      const pasted = typeof body.text === 'string' ? parseKeyPairText(body.text) : null;
+      const apiKey = (typeof body.apiKey === 'string' && body.apiKey) || pasted?.apiKey || '';
+      const paiKey = (typeof body.paiKey === 'string' && body.paiKey) || pasted?.paiKey || '';
+
+      const outcome = await addD1vAccount({
+        apiKey,
+        paiKey,
+        name: typeof body.name === 'string' ? body.name : undefined,
+        force: body.force === true,
+        timeoutMs: bootstrap.settings.requestTimeoutMs + 6_000,
+      });
+      if (!outcome.ok) {
+        sendJson(res, outcome.status, { error: outcome.error, stage: outcome.stage });
+        return;
+      }
+      const secrets = outcome.snapshot.secrets;
+      sendJson(res, 200, {
+        ok: true,
+        name: outcome.name,
+        suffix: outcome.suffix,
+        reused: outcome.reused,
+        backupDir: outcome.backupDir,
+        modelCount: outcome.modelCount,
+        // 回显这次加进去的账号长什么样（仍然只有掩码）
+        account: {
+          label: outcome.snapshot.plan ?? outcome.name,
+          amount: outcome.snapshot.balance?.amount ?? 0,
+          currency: outcome.snapshot.balance?.currency ?? 'QUOTA',
+          note: outcome.snapshot.note,
+          secrets,
+        },
+      });
+      return;
+    }
+
+    if (pathname === '/api/d1v/accounts/remove' && req.method === 'POST') {
+      const guard = privilegedGuard(req);
+      if (!guard.ok) {
+        sendJson(res, guard.status, { error: guard.error });
+        return;
+      }
+      const body = (await readBody(req)) as { accountId?: unknown };
+      const accountId = typeof body.accountId === 'string' ? body.accountId : '';
+      const outcome = removeD1vAccount(accountId);
+      if (!outcome.ok) {
+        sendJson(res, outcome.status, { error: outcome.error });
+        return;
+      }
+      sendJson(res, 200, {
+        ok: true,
+        name: outcome.name,
+        removedEnvLines: outcome.removedEnvLines,
+        backupDir: outcome.backupDir,
+      });
       return;
     }
 

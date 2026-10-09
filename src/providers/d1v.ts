@@ -73,6 +73,8 @@ export const d1vAdapter: ProviderAdapter = {
   groupAccounts: true,
   // quota 永不过期：卡片上会打一个「永不过期」标签，也不参与「最快到期」
   neverExpires: true,
+  // 卡片上直接提供「添加 / 删除账号」的入口
+  manageAccounts: true,
   credentialHint:
     '在 https://www.d1v.ai/settings?tab=api-key 创建一把具名密钥（只在创建时完整显示一次），' +
     '填入 credentials.apiKey；' +
@@ -117,7 +119,6 @@ export const d1vAdapter: ProviderAdapter = {
       }
 
       const count = (value: number): string => value.toLocaleString('en-US');
-      const projectNames = quota.projects.map((project) => project.name).join(' / ');
 
       return buildSnapshot({
         adapter: d1vAdapter,
@@ -129,8 +130,9 @@ export const d1vAdapter: ProviderAdapter = {
         balance: { amount: quota.quotaRemaining, currency: 'QUOTA' },
         credits: [],
         windows: [],
+        // 只写用量，不写项目名：项目名是「哪把密钥属于哪个环境」的细节，
+        // 在一条账号一行的布局里重复出现只会占地方
         note: joinNotes(
-          projectNames ? `项目：${projectNames}` : null,
           quota.totalRequests > 0
             ? `已用 ${count(quota.quotaConsumed)} quota（${quota.totalRequests} 次请求）`
             : '尚未产生调用',

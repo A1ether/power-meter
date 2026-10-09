@@ -46,6 +46,13 @@ export interface ProviderAdapter {
    */
   neverExpires?: boolean;
   /**
+   * 允许在看板上直接增删该平台的账号（D1V 的「添加 / 删除」按钮）。
+   *
+   * 前端只认这个开关，不认平台名——以后别的平台想接同样的管理界面，
+   * 声明开关 + 提供对应接口即可。
+   */
+  manageAccounts?: boolean;
+  /**
    * 声明哪些凭证允许在看板上「显示 / 复制」。不声明即整条链路关闭：
    * 快照不带 secrets，`/api/reveal` 也会拒绝该 key。
    *
@@ -209,6 +216,7 @@ export function buildSnapshot(input: SnapshotInput): ProviderSnapshot {
     accountId: input.account.displayName ?? '',
     groupAccounts: input.adapter.groupAccounts === true,
     neverExpires: input.adapter.neverExpires === true,
+    manageAccounts: input.adapter.manageAccounts === true,
     entries: [],
     region: input.adapter.region,
     status: input.status,

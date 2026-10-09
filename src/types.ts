@@ -130,6 +130,8 @@ export interface ProviderSnapshot {
   groupAccounts: boolean;
   /** 额度永不过期（由适配器显式声明，见 ProviderAdapter.neverExpires） */
   neverExpires: boolean;
+  /** 是否允许在看板上增删该平台的账号（见 ProviderAdapter.manageAccounts） */
+  manageAccounts: boolean;
   /** 合并后的账号条目；非合并平台为空数组 */
   entries: ProviderEntry[];
   region: 'cn' | 'global';

@@ -58,7 +58,8 @@ JWT，由适配器用 Cookie 自动续签，不需要手工维护。
 | `npm run probe` | **命令行探测取数是否正常**（改配置后先跑这个最快）|
 | `npm run probe -- qoder trae` | 只探测指定平台 |
 | `npm run probe -- --json` | 输出机器可读结果 |
-| `npm run d1v:add -- <账号密钥> <项目密钥>` | **一条命令添加 D1V 账号**（先验证再写入，自动备份）|
+| `npm run d1v:add -- <账号密钥> <项目密钥>` | **命令行添加 D1V 账号**（先验证再写入，自动备份）；看板上也有按钮 |
+| `npm run d1v:add -- --remove "D1V · xxx"` | 删除 D1V 账号（同时清理无用的 `.env` 变量）|
 | `npm run d1v:add -- --list` | 列出已配置的 D1V 账号 |
 | `npm run typecheck` | 类型检查 |
 | `npm run build && npm run serve` | 编译到 `dist/` 后以纯 JS 运行 |
@@ -103,6 +104,7 @@ power-meter/
 │   └── app.js                       # 拉数、排序、筛选、倒计时渲染
 └── src/
     ├── server.ts                    # HTTP 服务 + 路由 + 静态资源（Node 内置 http）
+    ├── d1v-store.ts                 # D1V 账号增删的共用实现（CLI 与看板接口同一份）
     ├── service.ts                   # 编排层：并发探测、TTL 缓存、失败回退、配置热加载
     ├── aggregate.ts                 # 聚合：多账号合并成一张卡片 + 汇总统计 + 到期时间线
     ├── config.ts                    # 配置加载：.env 解析、${VAR} 展开、mtime 监控
@@ -218,7 +220,9 @@ interface ProviderSnapshot {
   `npm run capture` 刷新 Cookie 后**不需要重启服务**，页面点「立即刷新」即为新凭证的取数结果。
 - **凭证默认不外泄**：`/api/config` 只返回**存在哪些凭证 key**，不返回值；
   只有适配器显式声明 `revealableSecrets()` 的密钥（目前仅 D1V 的项目密钥）
-  才会以掩码形式出现在快照里，明文要靠 `/api/reveal` 按需读取，且默认仅限本机；
+  才会以掩码形式出现在快照里，明文要靠 `/api/reveal` 按需读取；
+  而 `/api/reveal` 与 `/api/d1v/accounts*` 都属于本机特权接口，默认只允许回环来源
+  （见上文「三道闸门」）；
   `accounts.json` 已加入 `.gitignore`，推荐用 `${ENV_VAR}` 引用 `.env`。
 
 ### 5. 前端零构建
@@ -320,42 +324,56 @@ D1V 是目前唯一**不用 Cookie、纯 API 密钥**的平台，且天然分两
 因为账号密钥不能反查项目密钥（列表接口只有 `key_prefix`，没有明文），
 看板的定位就是一个**托管面板**：账号密钥用来取数，项目密钥存下来给你随时复制。
 
-#### 加账号：一条命令
+#### 加 / 删账号：看板上直接点
 
-不用手工改两个文件——密钥成对出现，手抄一次就多一次抄错的机会：
+D1V 卡片上就有入口：
+
+- **添加**：点额度右侧的「＋ 添加账号」→ 填「个人 apikey」「对应的项目 apikey」→「验证并添加」；
+- **删除**：每条账号的「显示 / 复制」右边有个同款红色按钮「删除」，确认后即删
+  （同时清掉 `.env` 里不再被引用的变量）。
+
+两者都**先验证再落盘**：任何一步失败都原样退出，还会先把两个文件备份到 `.run/`。
+写完后服务监听文件变化自动热加载，不用重启。
+
+卡片上只列「启用的、能取数的」账号，而停用或缺凭证的账号同样要能删——
+所以展开管理区时会额外拉一次 `/api/d1v/accounts`，把这类账号列在下方兜底区里。
+
+#### 或者用命令行
+
+不想开浏览器时，终端里是同一份实现（`src/d1v-store.ts`）：
 
 ```bash
 npm run d1v:add -- <账号密钥> <项目密钥>
-```
-
-或者直接把整段粘贴进去（会按「项目 / 个人」关键词自动认哪把是哪把）：
-
-```bash
-npm run d1v:add -- --text "个人apikey：sk-...
-对应的项目apikey：..."
+npm run d1v:add -- --text "个人apikey：sk-xxx
+对应的项目apikey：yyy"
+npm run d1v:add -- --remove "D1V · jwig5h"
+npm run d1v:add -- --list
 ```
 
 它会依次做四件事：
 
 1. **验证账号密钥**：调 `pai-project-usage/overview` 拿真实 quota 与邮箱，
-   顺手把额度、到期时间、`quota` 与钱包的差额打出来给你确认；
+   顺手把额度、已用量打出来给你确认；
 2. **验证项目密钥**：打 `GET https://pai.d1v.ai/v1/models`，
    返回模型列表才算通过（这个端点只读、不花钱）；
-3. **备份** `.env` 与 `accounts.json` 到 `.run/d1v-add-<时间戳>/`
-   （`.run/` 已 gitignore，不会把凭证明文带进 git）；
+3. **备份** `.env` 与 `accounts.json` 到 `.run/d1v-<op>-<时间戳>/`
+   （`.run/` 已 gitignore：备份不能放 `.env.bak` 这种同目录文件，
+   因为 `.env` 被忽略而 `.env.bak` 不会，那等于把凭证明文摆进 git 工作区）；
 4. 写入 `.env` 的 `D1V_<X>_API_KEY` / `D1V_<X>_PAI_API_KEY`
    （自动挑下一个空闲字母，或复用 `.env` 里已有的空槽位），
    并在 `accounts.json` 追加一条 `provider: "d1v"`。
 
 **两把密钥都验证通过才会写文件**，任何一步失败都原样退出、不留半截配置。
-账号名默认取邮箱前缀（如 `D1V · sb4hnm`），可用 `--name` 覆盖；
+账号名默认取邮箱前缀（如 `D1V · sb4hnm`），撞名会自动补 `-2`；
 `--dry-run` 只验证不写入；重复添加同一把账号密钥会被拒绝（除非 `--force`）。
 
-服务监听这两个文件的 mtime，**写完即热加载，不用重启**。
-想临时停用就把该条目的 `enabled` 改成 `false`；想删除就连同 `.env` 里那两行一起删。
+删除时只清理**不再被任何账号引用**的 `.env` 变量——槽位是按字母复用的，
+按名字无脑删有可能把别的账号还在用的那把钥匙一起删掉。
 
+服务监听这两个文件的 mtime，**写完即热加载，不用重启**。
 写完之后 `accounts.json` 里就是普通条目，也可以手工维护——多个账号就是多条
-`provider: "d1v"`，靠 `displayName` 区分：
+`provider: "d1v"`，靠 `displayName` 区分（它同时是 `/api/reveal` 与删除操作的定位键，
+所以不能重名）：
 
 ```jsonc
 {
@@ -405,29 +423,30 @@ D1V 有两套计量，但**只有 quota 有意义**：
 
 ```
 ● D1V                                        [国际] [永不过期]
-8,892,423 QUOTA
-3 个账号
+12,292,423 QUOTA                            [＋ 添加账号]
+4 个账号
 账号 · 托管密钥                                     可用额度
 ┌───────────────────────────────────────────────────────────┐
 │ jwig5h@qabq.com                          2,110,311 QUOTA  │
-│ D1V_PAI_API_KEY            [显示] [复制]                   │
+│ D1V_PAI_API_KEY      [显示] [复制] [删除]                  │
 │ ftWJ0G…B7tK                                               │
-│ 项目：项目环境；已用 1,274,966 quota（279 次请求）           │
+│ 已用 1,274,966 quota（279 次请求）                          │
 ├───────────────────────────────────────────────────────────┤
 │ mehopo8168@meinvr.com                    3,382,112 QUOTA  │
-│ D1V_PAI_API_KEY            [显示] [复制]                   │
-│ wITpPj…XCO7                                               │
-├───────────────────────────────────────────────────────────┤
-│ sb4hnm@qabq.com                          3,400,000 QUOTA  │
-│ D1V_PAI_API_KEY            [显示] [复制]                   │
-│ 07aHCH…1fM4                                               │
+│ D1V_PAI_API_KEY      [显示] [复制] [删除]                  │
+│ wITpPj…XCO7                                                │
 └───────────────────────────────────────────────────────────┘
+                展开其余 2 个 ⌄
 ```
 
 - 条目按**额度升序**：最少的最靠前，也就是最该关注的排最前；
 - 某条 quota 归零时该条标红并提示「quota 已用尽，该账号调不动」——
   这是事实判断，不需要任何阈值；
 - 账号名取 `email`（比 displayName 更能认出是谁），`plan` 一行显示「N 个账号」；
+- **默认只列 2 个账号，其余折叠**，点「展开其余 N 个」展开——
+  与「可用积分批次」是同一套交互，免得账号一多就把卡片撑爆；
+- 「显示 / 复制 / 删除」**同一条水平线**，都是同款药丸按钮（删除常驻红色）；
+- 「＋ 添加账号」贴在**额度右侧**（额度行最右），表单展开在下面；
 - **quota 不过期，所以不参与「最快到期」**：无批次、无进度条、
   也不进到期时间线，不会去跟真正要作废的额度抢注意力。
 
@@ -435,7 +454,8 @@ D1V 有两套计量，但**只有 quota 有意义**：
 > 排序里会排在最后。想让它靠前，用工具栏的排序下拉切到「按名称」，
 > 或参考「已知限制」里关于低额度告警的说明。
 
-新增账号仍然是一条命令：`npm run d1v:add -- <账号密钥> <项目密钥>`。
+新增账号点额度右侧的「＋ 添加账号」即可（也可用 `npm run d1v:add`），
+每条账号的红色「删除」按钮与「显示 / 复制」同一行。
 
 D1V 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>），只用到两个接口：
 
@@ -460,23 +480,28 @@ D1V 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>），只用�
 | GET | `/api/providers` | 已注册的适配器清单及各自需要的凭证 |
 | GET | `/api/config` | 当前配置概览（**仅凭证 key 名，不含值**）+ 告警 + 缺失环境变量 |
 | POST | `/api/reveal` | **按需读取托管密钥明文**（默认仅本机）。body `{ provider, accountId, key }` |
+| GET | `/api/d1v/accounts` | D1V 账号清单（含已停用 / 缺凭证的，仍只回显掩码）|
+| POST | `/api/d1v/accounts` | **添加 D1V 账号**：先验证两把密钥，通过才写盘。body `{ apiKey, paiKey, name?, force? }` |
+| POST | `/api/d1v/accounts/remove` | **删除 D1V 账号**：body `{ accountId }`，顺带清掉不再被引用的 `.env` 变量 |
 | GET | `/api/health` | 存活探测 |
 
-### `POST /api/reveal` 的三道闸门
+### 本机特权接口的三道闸门
 
-这是全项目唯一会把凭证明文下发到浏览器的接口，因此默认**只允许本机**：
+`/api/reveal` 能读出凭证明文，`/api/d1v/accounts*` 能改动本机配置文件，
+所以这几个接口共用同一道闸门，默认**只允许本机**：
 
 1. **来源必须回环**：请求的 `Host` 与 `Origin` 都必须是 `127.0.0.1` / `localhost` / `::1`。
    服务本身默认也只监听回环地址；若把 `HOST` 改成 `0.0.0.0`，
    则必须同时显式设置 `ALLOW_SECRET_REVEAL=1` 才会放行（并在启动时打警告）。
-2. **必须带自定义头** `X-Power-Meter-Intent: reveal`。
+2. **必须带自定义头** `X-Power-Meter-Intent`（值不限）。
    自定义头会让跨域请求先走 CORS 预检，而本服务从不返回 `Access-Control-Allow-*`，
    预检必然失败——等于给 CSRF 上了第二把锁。
-3. **必须在白名单里**：只有适配器 `revealableSecrets()` 声明过的 key 才可读，
+   否则 `evil.com` 只要一段 JS 就能 POST 到 `127.0.0.1` 读走密钥或删掉账号。
+3. **读密钥还要在白名单里**：只有适配器 `revealableSecrets()` 声明过的 key 才可读，
    且必须命中 `accounts.json` 里具体某条账号。
 
-返回值带 `Cache-Control: no-store`；服务端日志只记「读了谁」不记值；
-`/api/summary` 里永远只有掩码预览（`secrets[].preview`），绝无明文。
+返回值带 `Cache-Control: no-store`；服务端日志只记「读了谁 / 改了谁」不记值；
+`/api/summary` 里永远只有掩码预览（`secrets[].preview`、`entries[].secrets[].preview`），绝无明文。
 
 `/api/summary` 返回结构：
 
@@ -507,7 +532,7 @@ D1V 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>），只用�
 | `EXPIRY_CRITICAL_DAYS` | `5` | 红色高亮阈值：≤ 该天数到期显示红色 |
 | `EXPIRY_WARNING_DAYS` | `14` | 黄色高亮阈值：`criticalDays`~该天数到期显示黄色，更久显示绿色 |
 | `ACCOUNTS_PATH` | `./accounts.json` | 账号文件路径 |
-| `ALLOW_SECRET_REVEAL` | 未设置 | 设为 `1` 才允许非本机访问 `/api/reveal`（**前方必须已有反代鉴权**）|
+| `ALLOW_SECRET_REVEAL` | 未设置 | 设为 `1` 才允许非本机访问本机特权接口（读密钥 `/api/reveal`、增删账号 `/api/d1v/accounts*`）（**前方必须已有反代鉴权**）|
 
 另见 `.env.example`；`src/config.ts` 内置了极简 `.env` 解析，无需 `dotenv`。
 

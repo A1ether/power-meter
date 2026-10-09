@@ -92,8 +92,38 @@
         <div class="card__balance">
           <span class="card__amount">–</span>
           <span class="card__currency"></span>
+          <!-- 增删账号的入口贴着额度右侧；表单展开在下面（见适配器的 manageAccounts） -->
+          <button class="secret__btn secret__btn--primary manage__toggle" type="button"
+                  aria-expanded="false" hidden>＋ 添加账号</button>
         </div>
         <p class="card__plan muted"></p>
+
+        <div class="manage" hidden>
+          <form class="manage__form" hidden>
+            <label class="manage__field">
+              <span>个人 apikey</span>
+              <input type="password" name="apiKey" autocomplete="off" spellcheck="false"
+                     placeholder="sk-…（Settings → API Key 创建）" />
+            </label>
+            <label class="manage__field">
+              <span>对应的项目 apikey</span>
+              <input type="password" name="paiKey" autocomplete="off" spellcheck="false"
+                     placeholder="项目 Dashboard → Create Project Environment" />
+            </label>
+            <div class="manage__actions">
+              <button class="manage__submit" type="submit">验证并添加</button>
+              <button class="manage__cancel" type="button">取消</button>
+            </div>
+            <p class="manage__hint">两把密钥都会先验证，通过了才写入本机配置；写入前会自动备份。</p>
+          </form>
+
+          <p class="manage__result" hidden></p>
+
+          <div class="manage__hidden" hidden>
+            <p class="manage__hidden-title">以下账号已配置但未显示在卡片上（已停用或缺凭证）：</p>
+            <div class="manage__hidden-list"></div>
+          </div>
+        </div>
 
         <div class="meter" hidden>
           <div class="meter__bar"><span class="meter__fill"></span></div>
