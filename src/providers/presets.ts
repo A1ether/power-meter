@@ -15,6 +15,7 @@ export const customPreset: SessionApiPreset = {
   displayName: '自定义平台',
   region: 'global',
   dashboardUrl: '',
+  usageUrl: '',
   requiredCredentialKeys: [],
   credentialHint: '按需在 options.headers 中提供鉴权头。',
   defaultEndpoint: '',

@@ -28,6 +28,8 @@ export interface ProviderAdapter {
   displayName: string;
   region: 'cn' | 'global';
   dashboardUrl: string;
+  /** 平台用量页地址：卡片「每日用量」区点击跳转目标（见 src/types.ts 的 usageUrl），没有写空串 */
+  usageUrl: string;
   /** 需要哪些凭证 key，缺失即 notConfigured */
   requiredCredentialKeys: string[];
   credentialHint: string;
@@ -238,6 +240,7 @@ export function buildSnapshot(input: SnapshotInput): ProviderSnapshot {
     nextExpiryAt,
     nextExpiryInDays: nextExpiryAt ? daysBetween(input.now, nextExpiryAt) : null,
     dashboardUrl: input.adapter.dashboardUrl,
+    usageUrl: input.adapter.usageUrl,
     message: input.message ?? null,
     note: input.note ?? null,
     secrets: describeSecrets(input.adapter, input.account),

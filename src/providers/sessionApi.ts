@@ -60,6 +60,8 @@ export interface SessionApiPreset {
   displayName: string;
   region: 'cn' | 'global';
   dashboardUrl: string;
+  /** 平台用量页地址（无则空串，见 base.ts 的 ProviderAdapter.usageUrl） */
+  usageUrl: string;
   requiredCredentialKeys: string[];
   credentialHint: string;
   defaultEndpoint: string;
@@ -96,6 +98,7 @@ export function createSessionApiAdapter(preset: SessionApiPreset): ProviderAdapt
     displayName: preset.displayName,
     region: preset.region,
     dashboardUrl: preset.dashboardUrl,
+    usageUrl: preset.usageUrl,
     requiredCredentialKeys: preset.requiredCredentialKeys,
     credentialHint: preset.credentialHint,
     probe: async (account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> => {

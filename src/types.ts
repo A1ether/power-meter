@@ -174,6 +174,12 @@ export interface ProviderSnapshot {
   /** 距离过期还有多少天（含小数，负数表示已过期） */
   nextExpiryInDays: number | null;
   dashboardUrl: string;
+  /**
+   * 平台「用量页」地址：卡片「每日用量」区整块作为外链跳转的目标（新窗口打开）。
+   * 与 dashboardUrl 分开：dashboardUrl 是「面板入口」（D1V 指向 api-key 设置页），
+   * 不一定是用量页；空串表示没有可跳转的用量页（用量区保持纯展示）。
+   */
+  usageUrl: string;
   message: string | null;
   note: string | null;
   /**

@@ -227,6 +227,7 @@ export const traeAdapter: ProviderAdapter = {
   displayName: 'Trae',
   region: 'cn',
   dashboardUrl: 'https://www.trae.cn/dashboard#usage',
+  usageUrl: 'https://www.trae.cn/dashboard#usage',
   requiredCredentialKeys: ['cookie'],
   credentialHint:
     '登录 trae.cn 后从 DevTools 复制任意 api.trae.cn 请求的 Cookie 头，填入 credentials.cookie。' +

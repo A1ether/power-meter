@@ -515,11 +515,37 @@ body {
 }
 
 /* 日级用量 / 增量：四字段 2×2 网格（字段与配色见 app.js 的 USAGE_FIELDS）。
-   minmax(0, 1fr) + nowrap/ellipsis：窄卡片下只截断数值，不溢出、不重叠 */
+   minmax(0, 1fr) + nowrap/ellipsis：窄卡片下只截断数值，不溢出、不重叠。
+   元素可能是 <a>（平台声明了用量页时整块是外链，见 app.js 的 renderUsage） */
 .usage {
+  display: block;
   padding: 10px 11px;
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--text) 5%, transparent);
+  color: inherit;
+  text-decoration: none;
+}
+
+/* .usage 现在可能是 <a>：类选择器的 display:block 会盖掉 UA 的 [hidden] 规则，需显式收口 */
+.usage[hidden] {
+  display: none;
+}
+
+/* 有用量页的平台（usageUrl 非空）：整块可点，hover / 键盘聚焦时给出反馈 */
+.usage--link {
+  cursor: pointer;
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.usage--link:hover,
+.usage--link:focus-visible {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.usage--link:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 2px;
 }
 
 .usage__grid {

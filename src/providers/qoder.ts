@@ -223,6 +223,7 @@ export const qoderAdapter: ProviderAdapter = {
   displayName: 'Qoder',
   region: 'cn',
   dashboardUrl: 'https://qoder.com.cn/account/usage',
+  usageUrl: 'https://qoder.cn/account/usage?client=qoder&sourceType=IDE',
   requiredCredentialKeys: ['cookie'],
   credentialHint:
     '登录 qoder.com.cn 后，从 DevTools 的 Network 里复制任意 /api/ 请求的 Cookie 头，' +

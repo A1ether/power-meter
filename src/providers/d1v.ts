@@ -69,6 +69,8 @@ export const d1vAdapter: ProviderAdapter = {
   displayName: 'D1V',
   region: 'global',
   dashboardUrl: 'https://www.d1v.ai/settings?tab=api-key',
+  // D1V 没有公开的用量页，用量区保持纯展示
+  usageUrl: '',
   requiredCredentialKeys: ['apiKey'],
   groupAccounts: true,
   // quota 永不过期：卡片上会打一个「永不过期」标签，也不参与「最快到期」

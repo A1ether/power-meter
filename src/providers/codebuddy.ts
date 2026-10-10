@@ -159,6 +159,7 @@ export const codebuddyAdapter: ProviderAdapter = {
   displayName: 'CodeBuddy',
   region: 'cn',
   dashboardUrl: 'https://www.codebuddy.cn/profile/plans-usage',
+  usageUrl: 'https://www.codebuddy.cn/profile/plans-usage',
   requiredCredentialKeys: ['cookie'],
   credentialHint:
     '登录 www.codebuddy.cn 后，在 DevTools 里复制任意 www.codebuddy.cn 请求的 Cookie 头' +

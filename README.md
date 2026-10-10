@@ -583,6 +583,7 @@ export const yourPlatformAdapter: ProviderAdapter = {
   displayName: 'Your Platform',
   region: 'cn',
   dashboardUrl: 'https://...',
+  usageUrl: 'https://.../usage',
   requiredCredentialKeys: ['cookie'],
   credentialHint: '从哪里取到凭证',
   async probe(account, ctx) {

@@ -160,6 +160,7 @@ export class DashboardService {
         nextExpiryAt: null,
         nextExpiryInDays: null,
         dashboardUrl: '',
+        usageUrl: '',
         message: `未知平台 "${account.provider}"，请在 src/providers/index.ts 注册适配器，或改用 custom。`,
         note: null,
         secrets: [],
@@ -224,6 +225,7 @@ export class DashboardService {
         nextExpiryAt: null,
         nextExpiryInDays: null,
         dashboardUrl: adapter.dashboardUrl,
+        usageUrl: adapter.usageUrl,
         message,
         note: null,
         // 探测抛异常时仍要能复制密钥：secrets 与取数结果解耦

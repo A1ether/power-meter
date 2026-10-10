@@ -30,6 +30,8 @@ interface DemoDefinition {
   displayName: string;
   region: 'cn' | 'global';
   dashboardUrl: string;
+  /** 示例平台的用量页地址；空串表示不可跳转（见 base.ts 的 ProviderAdapter.usageUrl） */
+  usageUrl: string;
   plan: string;
   currency: Currency;
   balance: number;
@@ -45,6 +47,7 @@ const DEFINITIONS: DemoDefinition[] = [
     displayName: 'Qoder（示例）',
     region: 'global',
     dashboardUrl: 'https://qoder.com/account/usage',
+    usageUrl: 'https://qoder.com/account/usage',
     plan: 'Ultra',
     currency: 'CREDITS',
     balance: 1_860,
@@ -61,6 +64,7 @@ const DEFINITIONS: DemoDefinition[] = [
     displayName: 'Trae（示例）',
     region: 'cn',
     dashboardUrl: 'https://www.trae.cn/ide/account',
+    usageUrl: 'https://www.trae.cn/dashboard#usage',
     plan: 'Pro',
     currency: 'CREDITS',
     balance: 730,
@@ -77,6 +81,7 @@ const DEFINITIONS: DemoDefinition[] = [
     displayName: 'CodeBuddy（示例）',
     region: 'cn',
     dashboardUrl: 'https://www.codebuddy.cn',
+    usageUrl: 'https://www.codebuddy.cn/profile/plans-usage',
     plan: '团队版',
     currency: 'CREDITS',
     balance: 12_400,
@@ -93,6 +98,7 @@ const DEFINITIONS: DemoDefinition[] = [
     displayName: 'CodeArts 华为云（示例）',
     region: 'cn',
     dashboardUrl: 'https://codearts.huaweicloud.com',
+    usageUrl: 'https://codearts.huaweicloud.com/portal/settings/personal-usage?locale=zh-cn',
     plan: '专业版',
     currency: 'CNY',
     balance: 268.5,
@@ -106,6 +112,7 @@ const DEFINITIONS: DemoDefinition[] = [
     displayName: '示例 · 无过期时间',
     region: 'global',
     dashboardUrl: 'https://example.com/usage',
+    usageUrl: '',
     plan: 'Free',
     currency: 'CREDITS',
     balance: 90,
@@ -122,6 +129,7 @@ function createDemoAdapter(definition: DemoDefinition): ProviderAdapter {
     displayName: definition.displayName,
     region: definition.region,
     dashboardUrl: definition.dashboardUrl,
+    usageUrl: definition.usageUrl,
     requiredCredentialKeys: [],
     credentialHint: '示例数据无需凭证，把 accounts.json 里的这条 enabled 改为 false 即可关闭。',
     probe: async (account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> => {

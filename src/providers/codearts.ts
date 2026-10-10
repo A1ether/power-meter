@@ -225,6 +225,7 @@ export const codeartsAdapter: ProviderAdapter = {
   displayName: 'CodeArts 华为云',
   region: 'cn',
   dashboardUrl: 'https://codearts.huaweicloud.com/portal/settings/personal-usage',
+  usageUrl: 'https://codearts.huaweicloud.com/portal/settings/personal-usage?locale=zh-cn',
   requiredCredentialKeys: ['cookie'],
   credentialHint:
     '登录 codearts.huaweicloud.com 后，从 DevTools 复制任意 codearts.huaweicloud.com 请求的 Cookie 头' +

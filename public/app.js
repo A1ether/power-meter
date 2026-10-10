@@ -505,6 +505,9 @@ function buildCard(provider, thresholds) {
 /**
  * 日级用量 / 增量区块（四字段，2×2 网格）。
  *
+ * 平台声明了 usageUrl 时，整块是跳转到平台用量页的外链（新窗口打开）；
+ * 没有用量页的平台保持纯展示（见 src/types.ts 的 usageUrl）。
+ *
  * 取值严格对应后端 provider.dailyUsage 的同名键；字段整体缺失（旧后端）
  * 或该日为 null 时显示「–」——新装首日看不到「昨日」属正常，不当作错误。
  * 增量按正负着色（正=绿、零=灰；现口径为「增加量之和」，负值分支防御性保留）；
@@ -517,6 +520,13 @@ function renderUsage(node, provider, healthy) {
     return;
   }
   box.hidden = false;
+
+  // 用量区整块可点：透明地复用平台声明的用量页，前端不硬编码任何平台地址
+  if (provider.usageUrl) {
+    box.href = provider.usageUrl;
+    box.classList.add('usage--link');
+    box.setAttribute('aria-label', `打开 ${provider.displayName} 用量页（新窗口）`);
+  }
 
   const usage = provider.dailyUsage ?? {};
   const currency = usage.currency ?? currencyFor(provider);

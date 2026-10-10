@@ -98,10 +98,10 @@
         </div>
         <p class="card__plan muted"></p>
 
-        <!-- 日级用量 / 增量：来自后端 dailyUsage（本地采样历史推算），无数据显示「–」 -->
-        <div class="usage" hidden>
+        <!-- 日级用量 / 增量：来自后端 dailyUsage；平台声明了 usageUrl 时整块是跳转到用量页的外链 -->
+        <a class="usage" hidden target="_blank" rel="noreferrer noopener">
           <div class="usage__grid"></div>
-        </div>
+        </a>
 
         <div class="manage" hidden>
           <form class="manage__form" hidden>
