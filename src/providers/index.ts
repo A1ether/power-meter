@@ -4,6 +4,7 @@ import { codeartsAdapter } from './codearts.js';
 import { codebuddyAdapter } from './codebuddy.js';
 import { d1vAdapter } from './d1v.js';
 import { demoAdapters } from './demo.js';
+import { minimaxAdapter } from './minimax.js';
 import { sessionApiAdapters } from './presets.js';
 import { qoderAdapter } from './qoder.js';
 import { traeAdapter } from './trae.js';
@@ -20,6 +21,7 @@ for (const adapter of [
   codebuddyAdapter,
   codeartsAdapter,
   d1vAdapter,
+  minimaxAdapter,
   ...sessionApiAdapters,
   ...demoAdapters,
 ]) {
@@ -67,6 +69,11 @@ const ALIASES: Record<string, string> = {
   'api.d1v.ai': 'd1v',
   'pai.d1v.ai': 'd1v',
   'd1v-ai': 'd1v',
+  'minimax-code': 'minimax',
+  'minimax.cn': 'minimax',
+  'minimax.io': 'minimax',
+  'agent.minimax.cn': 'minimax',
+  'agent.minimax.io': 'minimax',
 };
 
 export function describeRegistry(): Array<{

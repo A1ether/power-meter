@@ -33,15 +33,15 @@ npm start
 
 ```bash
 npm run chrome:debug     # ① 弹出一个调试专用 Chrome 窗口
-                         #   ② 在里面登录 Qoder / Trae / CodeBuddy / CodeArts
-                         #      并各自打开「用量 / 账单」页面
-npm run capture          # ③ 自动抓取四个平台的登录态，写入 .env
+                         #   ② 在里面登录 Qoder / Trae / CodeBuddy / CodeArts / MiniMax Code
+                         #      并各自打开「用量 / 账单」页面（MiniMax Code 停在 agent.minimax.cn）
+npm run capture          # ③ 自动抓取各平台的登录态，写入 .env
 npm run probe            # ④ 验证取数是否正常
 # 刷新 http://127.0.0.1:8787
 ```
 
-四个平台都只需要**一个 Cookie**，其余全部自动完成 —— 包括 Trae 那个只有 1 天有效期的
-JWT，由适配器用 Cookie 自动续签，不需要手工维护。
+除 D1V（API 密钥）与 MiniMax Code（网页端登录态 token + Cookie）外，其余平台都只需要**一个 Cookie**，
+其余全部自动完成 —— 包括 Trae 那个只有 1 天有效期的 JWT，由适配器用 Cookie 自动续签，不需要手工维护。
 
 > 调试窗口用的是独立 profile（`~/.power-meter/chrome-profile`），与你日常的 Chrome 完全隔离。
 > 原因：Chrome 136+ 禁止对默认资料目录开启远程调试端口。
@@ -53,7 +53,7 @@ JWT，由适配器用 Cookie 自动续签，不需要手工维护。
 | `npm start` | 启动看板服务 |
 | `npm run dev` | 带文件监听的热重载开发模式 |
 | `npm run chrome:debug` | 启动带调试端口的独立 Chrome（抓取凭证用）|
-| `npm run capture` | **自动抓取四个平台的登录态并写入 `.env`** |
+| `npm run capture` | **自动抓取各平台的登录态并写入 `.env`** |
 | `npm run capture -- --dry-run` | 只预览，不写文件 |
 | `npm run probe` | **命令行探测取数是否正常**（改配置后先跑这个最快）|
 | `npm run probe -- qoder trae` | 只探测指定平台 |
@@ -255,7 +255,7 @@ interface ProviderSnapshot {
 
 ### 各平台配置
 
-除 D1V 外，其余平台的凭证都只需要 **一个 Cookie**：
+除 D1V（API 密钥）与 MiniMax Code（网页端登录态 token）外，其余平台的凭证都只需要 **一个 Cookie**：
 
 | 平台 | `provider` | 需要的凭证 | 关键 `options` |
 | --- | --- | --- | --- |
@@ -263,6 +263,7 @@ interface ProviderSnapshot {
 | Trae | `trae` / `trae.cn` | `cookie` | JWT 由 Cookie 自动续签；可选 `accessToken` 覆盖 |
 | CodeBuddy | `codebuddy` | `cookie`（**必须含 `www` 子域**）| — |
 | CodeArts | `codearts` | `cookie`（含 `devclouddevuibjtcftk`）| 可选 `resourceType`、`region` |
+| MiniMax Code | `minimax` / `minimax-code` / `agent.minimax.cn` | `token`（`_token`）+ `cookie`（SSO）+ 真实身份 `userId`/`opTicket`/`uuid`（capture 一并抓取，缺一不可）| `site: "cn"`（默认）或 `"global"` |
 | D1V | `d1v` / `d1v.ai` | `apiKey`（查余额）<br>`paiApiKey`（托管复制） | `baseUrl`、`revealApiKey` |
 | 任意平台 | `custom` | 按需 `headers` | `providerId`、`endpoint`、`mapping` |
 | 示例数据 | `demo:qoder` / `demo:trae` / `demo:codebuddy` / `demo:codearts` / `demo:no-expiry` | 无 | — |
@@ -543,9 +544,15 @@ D1V 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>），只用�
 - **所有平台都依赖浏览器登录态**，Cookie 会过期。过期后卡片会显示 `unauthorized`
   并保留上次数据（标记"数据可能过期"），重新登录 + `npm run capture` 即可。
 - **Trae 的 JWT 只有 1 天有效**，但适配器会用 Cookie 自动续签，因此你只需保证 Cookie 有效。
+- **MiniMax Code 取的是客户端内部云接口**（官方未公开 API，对应 App 里的「积分明细」）：
+  签到积分自到账起 30 天有效，过期批次会移出列表；平台控制台 `console/plan` 上的「积分」
+  是已购积分口径，与签到积分不是同一笔账，显示 0 属正常。凭证 = 请求头 token + SSO Cookie +
+  真实身份参数（user_id/op_ticket/uuid，服务端会与 token 交叉校验，不能用 0 顶替），
+  `npm run capture -- minimax` 会一次性全部抓取；登录态失效后卡片显示 `unauthorized`，
+  重新抓取即可。
 - **只展示还能用的批次**：已用尽（剩余 ≤ 0）的积分包会被丢弃，已过期的会被移出列表，
   只汇总成一句提示（如「已隐藏 5 个已用尽的积分包」）。所以卡片上的批次都是当下可用的额度。
-- **批次与余额是同一份钱**：批次是余额的拆分，四个平台的批次之和都等于各自账户余额，
+- **批次与余额是同一份钱**：批次是余额的拆分，各平台的批次之和都等于各自账户余额，
   因此顶部汇总只显示一个「可用额度合计」，不做二次相加。
 - **CodeBuddy 对请求很敏感**：WAF 校验 `User-Agent`，且会话 Cookie 挂在 `www` 子域下。
   请通过 `npm run capture` 抓取；手工配置时注意 `HTTP_USER_AGENT` 与子域 Cookie。

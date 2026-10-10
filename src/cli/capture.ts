@@ -110,6 +110,26 @@ interface Target {
   usageUrl: string;
   /** 适配器实际要请求的 API 主机，优先取浏览器对该主机的真实 Cookie 头 */
   apiHost: string;
+  /**
+   * 从页面 localStorage 读取登录态 token 的键名（MiniMax Code 用 `_token`）。
+   * 这类平台的接口要请求头 `token`，但**同样要带 Cookie**（SSO 会话），
+   * 因此 token 与 Cookie 一起抓，只是写入的变量名不同（见 tokenEnvKey）。
+   */
+  tokenStorageKey?: string;
+  /** token 写进 .env 的变量名（配合 tokenStorageKey 使用；envKey 留给 Cookie） */
+  tokenEnvKey?: string;
+  /**
+   * 登录身份参数来源（MiniMax Code）：公共查询参数里的 user_id/op_ticket/uuid
+   * 必须与真实登录身份一致，写死 0 或臆造值会被服务端 401 拒绝。
+   */
+  identityStorage?: {
+    /** 含 realUserID / op_ticket / token 的 JSON 存储键 */
+    profileKey: string;
+    /** 存放设备 uuid 的存储键 */
+    deviceKey: string;
+    /** 各字段写入 .env 的变量名 */
+    envKeys: { userId: string; opTicket: string; paramToken: string; uuid: string };
+  };
 }
 
 const TARGETS: Target[] = [
@@ -144,6 +164,26 @@ const TARGETS: Target[] = [
     cookieSites: ['codearts.huaweicloud.com', 'huaweicloud.com'],
     usageUrl: 'https://codearts.huaweicloud.com/portal/settings/personal-usage?locale=zh-cn',
     apiHost: 'codearts.huaweicloud.com',
+  },
+  {
+    id: 'minimax',
+    label: 'MiniMax Code',
+    envKey: 'MINIMAX_COOKIE',
+    tokenEnvKey: 'MINIMAX_CODE_TOKEN',
+    cookieSites: ['agent.minimax.cn', 'minimax.cn'],
+    usageUrl: 'https://agent.minimax.cn',
+    apiHost: 'agent.minimax.cn',
+    tokenStorageKey: '_token',
+    identityStorage: {
+      profileKey: 'user_detail_agent',
+      deviceKey: 'UNIQUE_USER_ID',
+      envKeys: {
+        userId: 'MINIMAX_USER_ID',
+        opTicket: 'MINIMAX_OP_TICKET',
+        paramToken: 'MINIMAX_PARAM_TOKEN',
+        uuid: 'MINIMAX_UUID',
+      },
+    },
   },
 ];
 
@@ -276,6 +316,8 @@ interface Result {
   message: string;
   cookieCount: number;
   value?: string;
+  /** 同一目标需要写入的额外变量（如 MiniMax 的 token 与 Cookie 并存） */
+  extraEnv?: Array<{ key: string; value: string }>;
   candidates?: Candidate[];
 }
 
@@ -356,6 +398,46 @@ function captureUserAgent(): string {
   return output.replace(/^"|"$/g, '');
 }
 
+/**
+ * 从当前页面 localStorage 读取值。
+ * 兼容两种存法：裸字符串（MiniMax Code 的 `_token`）与 JSON 编码的字符串。
+ */
+function readLocalStorageValue(key: string): string {
+  const expression =
+    `(() => { const raw = localStorage.getItem(${JSON.stringify(key)}); if (!raw) return ''; ` +
+    `try { const parsed = JSON.parse(raw); return typeof parsed === 'string' ? parsed : raw; } ` +
+    `catch (error) { return raw; } })()`;
+  const output = pw(['--raw', 'eval', expression], true).trim();
+  try {
+    const parsed: unknown = JSON.parse(output);
+    if (typeof parsed === 'string') return parsed.trim();
+  } catch {
+    // 非 JSON 输出，按裸字符串处理
+  }
+  return output.replace(/^"|"$/g, '').trim();
+}
+
+/** 读取 localStorage 里的 JSON 对象（如 user_detail_agent），失败返回 null */
+function readLocalStorageObject(key: string): Record<string, unknown> | null {
+  const raw = readLocalStorageValue(key);
+  if (!raw) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** --discover 模式下的候选接口打印（Cookie 与 token 两条路径共用） */
+function reportCandidates(candidates: Candidate[] | undefined): void {
+  if (!candidates) return;
+  for (const candidate of candidates) {
+    console.log(`  \u001b[36m候选\u001b[0m score=${candidate.score} ${candidate.method} ${candidate.url}`);
+  }
+  if (candidates.length === 0) console.log('  没有找到像余额接口的响应');
+}
+
 function captureRealCookieHeaders(): Record<string, string> {
   const output = pw(['run-code', HOOK_SCRIPT], true);
   const inner = extractRunCodeResult(output);
@@ -378,12 +460,51 @@ function captureTarget(target: Target, pool: BrowserCookie[]): Result {
   pw(['goto', target.usageUrl], true);
   settle(2500);
 
-  // ① 首选：浏览器对该 API 主机真实发送的 Cookie 头
+  // ① localStorage token 型平台（MiniMax Code）：`_token` 是请求头 token 的来源
+  let token = '';
+  if (target.tokenStorageKey) {
+    token = readLocalStorageValue(target.tokenStorageKey);
+    if (token) {
+      console.log(`  token: ${token.length} 字节 ← localStorage.${target.tokenStorageKey}`);
+      console.log(`  值：${mask(token)}`);
+    } else {
+      console.log(`  token: 未找到（localStorage.${target.tokenStorageKey} 为空）`);
+    }
+  }
+
+  // ①-b 登录身份参数（MiniMax Code）：公共参数 user_id/op_ticket/uuid 必须来自真实身份，
+  //      写死 0 或臆造值会被服务端 401 拒绝
+  let identityUserId = '';
+  let identityOpTicket = '';
+  let identityParamToken = '';
+  let identityUuid = '';
+  if (target.identityStorage) {
+    const profile = readLocalStorageObject(target.identityStorage.profileKey);
+    if (profile) {
+      const rawUserId = profile.realUserID ?? profile.real_user_id ?? profile.userId;
+      if (typeof rawUserId === 'number' && Number.isFinite(rawUserId)) {
+        identityUserId = String(rawUserId);
+      } else if (typeof rawUserId === 'string' && /^\d+$/.test(rawUserId.trim())) {
+        identityUserId = rawUserId.trim();
+      }
+      if (typeof profile.op_ticket === 'string') identityOpTicket = profile.op_ticket.trim();
+      if (typeof profile.token === 'string') identityParamToken = profile.token.trim();
+    }
+    identityUuid = readLocalStorageValue(target.identityStorage.deviceKey);
+    console.log(
+      `  身份参数: user_id=${identityUserId || '未找到'} · ` +
+        `op_ticket=${identityOpTicket ? mask(identityOpTicket) : '无'} · ` +
+        `uuid=${identityUuid ? mask(identityUuid) : '未找到'}`,
+    );
+  }
+
+  // ② 首选：浏览器对该 API 主机真实发送的 Cookie 头
+  //    （token 型平台同样要带 Cookie：服务端把它当 SSO 会话一起校验，缺了会 401）
   const realHosts = captureRealCookieHeaders();
   let header = realHosts[target.apiHost] ?? '';
   let source = `来自浏览器对 ${target.apiHost} 的真实请求`;
 
-  // ② 退而求其次：同一 Cookie 域下其它主机的真实头
+  // ③ 退而求其次：同一 Cookie 域下其它主机的真实头
   if (!header) {
     for (const [host, value] of Object.entries(realHosts)) {
       if (target.cookieSites.some((site) => cookieAppliesTo(host, site))) {
@@ -394,39 +515,59 @@ function captureTarget(target: Target, pool: BrowserCookie[]): Result {
     }
   }
 
-  // ③ 最后兜底：按域从 cookie jar 拼装
+  // ④ 最后兜底：按域从 cookie jar 拼装
   const cookies = collectCookies(target.cookieSites, pool);
   if (!header && cookies.length > 0) {
     header = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
     source = `由 cookie jar 拼装（${cookies.length} 个）`;
   }
 
-  if (!header) {
+  if (!header && !token) {
     console.log('  Cookie: 未找到（可能还没登录）');
     return {
       target,
       status: 'skipped',
-      message: '没有可用 Cookie，请确认已在该窗口登录并打开用量页',
+      message: '没有可用 Cookie/token，请确认已在该窗口登录并打开用量页',
       cookieCount: 0,
     };
   }
 
-  const count = header.split('; ').length;
-  console.log(`  Cookie: ${count} 个，${header.length} 字节 ← ${source}`);
-  console.log(`  值：${mask(header)}`);
-  if (header.length > 8000) {
-    console.log('  \u001b[33m提示：Cookie 较大，可能超过服务端 header 上限\u001b[0m');
-  }
-
-  const candidates = DISCOVER ? discoverEndpoints(target) : undefined;
-  if (candidates) {
-    for (const candidate of candidates) {
-      console.log(`  \u001b[36m候选\u001b[0m score=${candidate.score} ${candidate.method} ${candidate.url}`);
+  let count = 0;
+  if (header) {
+    count = header.split('; ').length;
+    console.log(`  Cookie: ${count} 个，${header.length} 字节 ← ${source}`);
+    console.log(`  值：${mask(header)}`);
+    if (header.length > 8000) {
+      console.log('  \u001b[33m提示：Cookie 较大，可能超过服务端 header 上限\u001b[0m');
     }
-    if (candidates.length === 0) console.log('  没有找到像余额接口的响应');
+  } else {
+    console.log('  Cookie: 未找到（仅抓到 token）');
   }
 
-  return { target, status: 'ok', message: '已抓取', cookieCount: count, value: header, candidates };
+  const extraEnv: Array<{ key: string; value: string }> = [];
+  if (token && target.tokenEnvKey) extraEnv.push({ key: target.tokenEnvKey, value: token });
+  if (target.identityStorage) {
+    const keys = target.identityStorage.envKeys;
+    if (identityUserId) extraEnv.push({ key: keys.userId, value: identityUserId });
+    if (identityOpTicket) extraEnv.push({ key: keys.opTicket, value: identityOpTicket });
+    if (identityParamToken) extraEnv.push({ key: keys.paramToken, value: identityParamToken });
+    if (identityUuid) extraEnv.push({ key: keys.uuid, value: identityUuid });
+  }
+
+  const message =
+    header && token ? '已抓取（Cookie + token）' : header ? '已抓取（Cookie）' : '已抓取（token）';
+  const candidates = DISCOVER ? discoverEndpoints(target) : undefined;
+  reportCandidates(candidates);
+
+  return {
+    target,
+    status: 'ok',
+    message,
+    cookieCount: count,
+    value: header || undefined,
+    extraEnv,
+    candidates,
+  };
 }
 
 function main(): void {
@@ -469,7 +610,10 @@ function main(): void {
     try {
       const result = captureTarget(target, pool);
       results.push(result);
-      if (result.status === 'ok' && result.value) envEntries.set(target.envKey, result.value);
+      if (result.status === 'ok') {
+        if (result.value) envEntries.set(target.envKey, result.value);
+        for (const extra of result.extraEnv ?? []) envEntries.set(extra.key, extra.value);
+      }
     } catch (error) {
       console.log(`  \u001b[31m失败\u001b[0m ${(error as Error).message}`);
       results.push({

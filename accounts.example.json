@@ -4,7 +4,12 @@
     "推荐流程：npm run chrome:debug → 在弹出窗口登录 → npm run capture 自动抓取凭证。",
     "credentials 用 ${ENV_VAR} 引用 .env，避免把凭证明文写进文件。",
     "保存后服务会自动热加载，无需重启。",
-    "provider 支持：qoder / trae / codebuddy / codearts / d1v / custom / demo:*",
+    "provider 支持：qoder / trae / codebuddy / codearts / d1v / minimax / custom / demo:*",
+    "MiniMax Code（minimax）凭证较特殊：请求头 token（localStorage `_token`）+ SSO 会话 Cookie +",
+    "     真实身份 userId/uuid（公共参数，服务端会与 token 交叉校验），缺一不可；",
+    "     opTicket 仅当 capture 抓到了 op_ticket 时才需要在 credentials 里加 \"opTicket\"。",
+    "     推荐 npm run capture -- minimax 一次性抓取（写入 .env 的 MINIMAX_* 变量）。",
+    "     看板上的积分 = MiniMax Code 的签到积分 + 购买积分（按批次带 30 天到期时间）。",
     "D1V 的增删都在看板卡片上直接做（「＋ 添加账号」/ 每条右侧的 ✕），",
     "     或命令行 `npm run d1v:add`，两者是同一份实现，都不用手工改本文件。",
     "D1V 可有多个账号：靠 credentials.apiKey 查额度，",
@@ -52,6 +57,21 @@
         "cookie": "${CODEARTS_COOKIE}"
       },
       "options": {}
+    },
+    {
+      "provider": "minimax",
+      "displayName": "MiniMax Code",
+      "enabled": true,
+      "credentials": {
+        "token": "${MINIMAX_CODE_TOKEN}",
+        "cookie": "${MINIMAX_COOKIE}",
+        "userId": "${MINIMAX_USER_ID}",
+        "paramToken": "${MINIMAX_PARAM_TOKEN}",
+        "uuid": "${MINIMAX_UUID}"
+      },
+      "options": {
+        "site": "cn"
+      }
     },
     {
       "provider": "d1v",
