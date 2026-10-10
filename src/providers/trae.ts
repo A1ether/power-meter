@@ -1,5 +1,6 @@
 import { fetchJson, HttpError } from '../lib/http.js';
 import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
+import { startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
 import type { AccountConfig } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
 import {
@@ -230,6 +231,102 @@ export const traeAdapter: ProviderAdapter = {
   credentialHint:
     '登录 trae.cn 后从 DevTools 复制任意 api.trae.cn 请求的 Cookie 头，填入 credentials.cookie。' +
     'Token 会自动续签，无需手工维护（也可用 npm run capture 自动抓取）。',
+  /**
+   * 用量 + 获取明细（v2）：
+   *   - 用量：`query_user_usage_group_by_session` 逐笔（`usage_time` + `credits_float`），
+   *     与页面「使用记录」同源；
+   *   - 获取：权益包列表逐笔（`start_time` 发放时间 + `quota.credits_limit` 发放额度），
+   *     与页面「奖励积分 / 查看详情」同源——每日签到、每月登录赠送、套餐发放各成一笔。
+   */
+  async fetchUsageLedger(account: AccountConfig, ctx: ProbeContext): Promise<UsageLedger | null> {
+    const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+    const hasExplicitToken = Boolean(cred(account, ctx, ['accessToken', 'token', 'authorization']));
+    if (!cookie && !hasExplicitToken) return null;
+
+    const token = await resolveToken(cookie, account, ctx);
+    // 与页面请求同源同参：usage_type=[7] 对应页面「使用记录」列表；
+    // page_size 实测上限 20（再大会返回 400 code 9004），因此按 20 分页、上限 10 页
+    const origin = new URL(optString(account, 'usageUrl') || TRAE_USAGE_URL).origin;
+    const recordsUrl = `${origin}/trae/api/v1/pay/query_user_usage_group_by_session`;
+    const startSec = Math.floor((startOfDay(ctx.now) - 86_400_000) / 1000);
+    const endSec = Math.ceil(ctx.now / 1000);
+    const pageSize = 20;
+    const records: UsageRecord[] = [];
+
+    for (let pageNum = 1; pageNum <= 10; pageNum += 1) {
+      const { body } = await fetchJson(recordsUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Cloud-IDE-JWT ${token}`,
+          'X-User-Region': 'CN',
+          'Content-Type': 'application/json',
+          Origin: 'https://www.trae.cn',
+          Referer: 'https://www.trae.cn/',
+        },
+        body: JSON.stringify({
+          start_time: startSec,
+          end_time: endSec,
+          page_size: pageSize,
+          page_num: pageNum,
+          usage_type: [7],
+        }),
+        timeoutMs: ctx.timeoutMs || TRAE_TIMEOUT_FALLBACK,
+      });
+      const list = isRecord(body)
+        ? pick(body, 'user_usage_group_by_sessions', 'userUsageGroupBySessions')
+        : undefined;
+      if (!Array.isArray(list) || list.length === 0) break;
+      for (const raw of list) {
+        if (!isRecord(raw)) continue;
+        const at = firstNumber(pick(raw, 'usage_time', 'usageTime'));
+        const amount = firstNumber(pick(raw, 'credits_float', 'creditsFloat', 'credits'));
+        if (at === null || amount === null || amount <= 0) continue;
+        records.push({ at: at * 1000, kind: 'use', amount });
+      }
+      const total = firstNumber(isRecord(body) ? pick(body, 'total') : undefined);
+      if (list.length < pageSize || (total !== null && pageNum * pageSize >= total)) break;
+    }
+
+    // 获取明细：权益包即「发放」逐笔——每个包带 start_time（发放时间）与
+    // quota.credits_limit（发放额度），每日签到 / 每月登录赠送 / 套餐发放都会各成一笔
+    let grantCovered = false;
+    try {
+      const { body } = await fetchJson(optString(account, 'usageUrl') || TRAE_USAGE_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Cloud-IDE-JWT ${token}`,
+          'X-User-Region': 'CN',
+          'Content-Type': 'application/json',
+          Origin: 'https://www.trae.cn',
+          Referer: 'https://www.trae.cn/',
+        },
+        body: '{}',
+        timeoutMs: ctx.timeoutMs || TRAE_TIMEOUT_FALLBACK,
+      });
+      const packs = isRecord(body)
+        ? pick(body, 'user_entitlement_pack_list', 'userEntitlementPackList')
+        : undefined;
+      if (Array.isArray(packs)) {
+        for (const raw of packs) {
+          if (!isRecord(raw)) continue;
+          const base = pick(raw, 'entitlement_base_info', 'entitlementBaseInfo');
+          if (!isRecord(base)) continue;
+          const start = firstNumber(pick(base, 'start_time', 'startTime'));
+          const quota = pick(base, 'quota');
+          const limit = isRecord(quota)
+            ? firstNumber(pick(quota, 'credits_limit', 'creditsLimit'))
+            : null;
+          if (start === null || limit === null || limit <= 0) continue;
+          records.push({ at: start * 1000, kind: 'grant', amount: limit });
+        }
+        grantCovered = true;
+      }
+    } catch (error) {
+      ctx.log(`Trae 权益包发放明细获取失败（增量退回本地采样）：${(error as Error).message}`);
+    }
+    return { records, covers: { use: true, grant: grantCovered } };
+  },
+
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
     const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
     const hasExplicitToken = Boolean(cred(account, ctx, ['accessToken', 'token', 'authorization']));

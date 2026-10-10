@@ -1,5 +1,6 @@
 import { assertBusinessOk, fetchJson, HttpError } from '../lib/http.js';
 import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
+import { localDateKey, localNoonOf, startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
 import type { AccountConfig } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
 import {
@@ -45,6 +46,11 @@ import {
  */
 
 const CA_BASE = 'https://codearts.huaweicloud.com';
+
+/** 给 GET 路径追加时间戳参数（避免浏览器/网关缓存，与页面行为一致） */
+function withStamp(path: string): string {
+  return `${CA_BASE}${path}${path.includes('?') ? '&' : '?'}_=${Date.now()}`;
+}
 const CA_TIMEOUT_FALLBACK = 12_000;
 const CFTK_COOKIE_NAME = 'devclouddevuibjtcftk';
 const DEFAULT_RESOURCE_TYPE = 'hws.resource.type.codearts.snap';
@@ -174,6 +180,21 @@ export function parseCampaignBenefits(body: unknown): CampaignBenefit[] {
   return out;
 }
 
+/** ⑤ 活动奖励的「获取」记录：claimedAmount（本次领取总量）+ claimedAt，用于日级增量 */
+export function parseCampaignClaims(body: unknown): Array<{ amount: number; claimedAt: string | null }> {
+  const data = pick(body, 'data');
+  const benefits = isRecord(data) ? pick(data, 'benefits') : undefined;
+  if (!Array.isArray(benefits)) return [];
+  const out: Array<{ amount: number; claimedAt: string | null }> = [];
+  for (const raw of benefits) {
+    if (!isRecord(raw)) continue;
+    const amount = firstNumber(pick(raw, 'claimedAmount', 'claimed_amount')) ?? 0;
+    if (amount <= 0) continue;
+    out.push({ amount, claimedAt: toIso(pick(raw, 'claimedAt', 'claimed_at')) });
+  }
+  return out;
+}
+
 /** countdown 接口把详情塞在 JSON 字符串里 */
 export function parseCountdownExpiry(body: unknown): string | null {
   const list = pick(body, 'cloudServiceCountDowns', 'cloudServiceCountdowns');
@@ -209,6 +230,97 @@ export const codeartsAdapter: ProviderAdapter = {
     '登录 codearts.huaweicloud.com 后，从 DevTools 复制任意 codearts.huaweicloud.com 请求的 Cookie 头' +
     '（需包含 devclouddevuibjJ_SESSION_ID 与 devclouddevuibjtcftk），填入 credentials.cookie' +
     '（也可用 npm run capture 自动抓取）。',
+  /**
+   * 用量 + 获取明细（v2）：
+   *   - 用量：按天图表（`xDimension=DATE_DAY` + `TOTAL_CREDITS`，取昨日/今日两天），
+   *     与页面「使用明细」同一数据源，缺天视为 0；
+   *   - 获取：活动福利逐笔（`credit/overview` + `campaign/{id}` 的 claimedAmount/claimedAt），
+   *     即页面「获取明细」页签的数据源。
+   */
+  async fetchUsageLedger(account: AccountConfig, ctx: ProbeContext): Promise<UsageLedger | null> {
+    const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+    if (!cookie) return null;
+    const timeoutMs = ctx.timeoutMs || CA_TIMEOUT_FALLBACK;
+    const cftk = optString(account, 'cftk') || cookieValue(cookie, CFTK_COOKIE_NAME);
+    const headers: Record<string, string> = {
+      Cookie: cookie,
+      Accept: 'application/json, text/plain, */*',
+      'Content-Type': 'application/json',
+      'x-requested-with': 'XMLHttpRequest',
+      'x-language': 'zh-cn',
+      'Accept-Language': 'zh-CN,zh;q=0.9',
+      Referer: `${CA_BASE}/portal/settings/personal-usage?locale=zh-cn`,
+      ...(cftk ? { cftk } : {}),
+    };
+    const records: UsageRecord[] = [];
+
+    // ① 用量：按天图表
+    let useCovered = false;
+    try {
+      const { body } = await fetchJson(
+        withStamp('/portal/dataflywheel/datapreprocess/v1/analytics/usage/personal/charts'),
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            startDate: localDateKey(startOfDay(ctx.now) - 86_400_000),
+            endDate: localDateKey(ctx.now),
+            metrics: ['TOTAL_CREDITS'],
+            xDimension: 'DATE_DAY',
+          }),
+          timeoutMs,
+        },
+      );
+      const data = pick(body, 'data');
+      const series = isRecord(data) ? pick(data, 'series') : undefined;
+      const creditsSeries = Array.isArray(series)
+        ? series.find((item) => isRecord(item) && /credit/i.test(String(pick(item, 'name') ?? '')))
+        : undefined;
+      if (isRecord(creditsSeries)) {
+        const cells = pick(creditsSeries, 'cells');
+        if (Array.isArray(cells)) {
+          for (const cell of cells) {
+            if (!isRecord(cell)) continue;
+            const at = localNoonOf(String(pick(cell, 'xLabel', 'x_label') ?? ''));
+            const amount = firstNumber(pick(cell, 'value'));
+            if (at === null || amount === null || amount <= 0) continue;
+            records.push({ at, kind: 'use', amount });
+          }
+          useCovered = true;
+        }
+      }
+    } catch (error) {
+      ctx.log(`CodeArts 按天用量获取失败（退回本地采样）：${(error as Error).message}`);
+    }
+
+    // ② 获取：活动福利逐笔（与页面「获取明细」页签同源）
+    let grantCovered = false;
+    try {
+      const { body } = await fetchJson(withStamp('/portal/promptcenter/v1/ops/credit/overview'), {
+        headers,
+        timeoutMs,
+      });
+      assertBusinessOk(body);
+      for (const campaign of parseCampaignList(body).slice(0, MAX_CAMPAIGNS)) {
+        const detail = await fetchJson(
+          withStamp(`/portal/promptcenter/v1/ops/credit/campaign/${campaign.id}`),
+          { headers, timeoutMs: Math.min(timeoutMs, 8_000) },
+        );
+        assertBusinessOk(detail.body);
+        for (const claim of parseCampaignClaims(detail.body)) {
+          const at = claim.claimedAt ? Date.parse(claim.claimedAt) : Number.NaN;
+          if (!Number.isFinite(at)) continue;
+          records.push({ at, kind: 'grant', amount: claim.amount });
+        }
+      }
+      grantCovered = true;
+    } catch (error) {
+      ctx.log(`CodeArts 获取明细获取失败（退回本地采样）：${(error as Error).message}`);
+    }
+
+    return { records, covers: { use: useCovered, grant: grantCovered } };
+  },
+
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
     const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
     if (!cookie) return notConfigured(codeartsAdapter, account, ctx, ['cookie']);

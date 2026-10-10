@@ -1,6 +1,8 @@
 import { daysBetween } from './lib/json.js';
+import { mergeSources } from './usage-ledger.js';
 import type {
   Currency,
+  DailyUsage,
   DashboardPayload,
   DashboardTotals,
   ExpiryHit,
@@ -33,7 +35,10 @@ function round(value: number): number {
  */
 export function groupSnapshots(snapshots: ProviderSnapshot[]): ProviderSnapshot[] {
   const out: ProviderSnapshot[] = [];
-  const grouped = new Map<string, { card: ProviderSnapshot; entries: ProviderEntry[] }>();
+  const grouped = new Map<
+    string,
+    { card: ProviderSnapshot; entries: ProviderEntry[]; usages: Array<DailyUsage | null> }
+  >();
 
   for (const snapshot of snapshots) {
     if (!snapshot.groupAccounts) {
@@ -41,11 +46,19 @@ export function groupSnapshots(snapshots: ProviderSnapshot[]): ProviderSnapshot[
       continue;
     }
     const bucket = grouped.get(snapshot.provider);
-    if (bucket) bucket.entries.push(toEntry(snapshot));
-    else grouped.set(snapshot.provider, { card: snapshot, entries: [toEntry(snapshot)] });
+    if (bucket) {
+      bucket.entries.push(toEntry(snapshot));
+      bucket.usages.push(snapshot.dailyUsage);
+    } else {
+      grouped.set(snapshot.provider, {
+        card: snapshot,
+        entries: [toEntry(snapshot)],
+        usages: [snapshot.dailyUsage],
+      });
+    }
   }
 
-  for (const { card, entries } of grouped.values()) out.push(finalizeCard(card, entries));
+  for (const { card, entries, usages } of grouped.values()) out.push(finalizeCard(card, entries, usages));
   return out;
 }
 
@@ -63,7 +76,11 @@ function toEntry(snapshot: ProviderSnapshot): ProviderEntry {
   };
 }
 
-function finalizeCard(card: ProviderSnapshot, input: ProviderEntry[]): ProviderSnapshot {
+function finalizeCard(
+  card: ProviderSnapshot,
+  input: ProviderEntry[],
+  usages: Array<DailyUsage | null>,
+): ProviderSnapshot {
   // 额度升序：最少的排最前，也就是最该关注的排最前
   const entries = [...input].sort((a, b) => a.amount - b.amount);
   const healthy = entries.filter((entry) => OK_STATUSES.has(entry.status));
@@ -92,11 +109,46 @@ function finalizeCard(card: ProviderSnapshot, input: ProviderEntry[]): ProviderS
     nextExpiryAt: null,
     nextExpiryInDays: null,
     secrets: [],
+    // 日级用量按账号求和（只汇总与卡片主币种一致的账号，避免不同单位相加）
+    dailyUsage: sumDailyUsage(usages, (dominant?.[0] as Currency | undefined) ?? null),
     message:
       failed.length > 0
         ? failed.map((entry) => `${entry.label}：${entry.message ?? '取数失败'}`).join('；')
         : null,
     note: totals.size > 1 ? '各账号额度单位不一致，卡片总额只取了其中一种' : null,
+  };
+}
+
+/**
+ * 合并卡片的日级用量：各账号同币种指标求和。
+ * 与卡片余额同口径——混币种时只汇总主币种，且四个字段各自独立判空
+ * （某账号今天有数据、昨天没有，昨天仍计入其余账号的值）。
+ */
+function sumDailyUsage(
+  usages: Array<DailyUsage | null>,
+  currency: Currency | null,
+): DailyUsage | null {
+  if (!currency) return null;
+  const picked = usages.filter(
+    (usage): usage is DailyUsage => usage !== null && usage.currency === currency,
+  );
+  if (picked.length === 0) return null;
+
+  const sum = (pick: (usage: DailyUsage) => number | null): number | null => {
+    const values = picked.map(pick).filter((value): value is number => value !== null);
+    return values.length > 0 ? round(values.reduce((total, value) => total + value, 0)) : null;
+  };
+  return {
+    todayUsed: sum((usage) => usage.todayUsed),
+    yesterdayUsed: sum((usage) => usage.yesterdayUsed),
+    todayAdded: sum((usage) => usage.todayAdded),
+    yesterdayAdded: sum((usage) => usage.yesterdayAdded),
+    currency,
+    // 来源归并：只要有一个账号是本地兜底，就不冒充「全平台明细」
+    sources: {
+      used: mergeSources(picked.map((usage) => usage.sources.used)),
+      added: mergeSources(picked.map((usage) => usage.sources.added)),
+    },
   };
 }
 

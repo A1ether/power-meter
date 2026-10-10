@@ -514,6 +514,57 @@ body {
   font-size: 12.5px;
 }
 
+/* 日级用量 / 增量：四字段 2×2 网格（字段与配色见 app.js 的 USAGE_FIELDS）。
+   minmax(0, 1fr) + nowrap/ellipsis：窄卡片下只截断数值，不溢出、不重叠 */
+.usage {
+  padding: 10px 11px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+.usage__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+
+.usage__item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.usage__label {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.usage__value {
+  font-size: 13.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 增量按正负着色：正=绿、零=灰（现口径为「增加量之和」，非负；
+   负值分支为防御性保留）；用量为消耗口径（非负）保持正文色 */
+.usage__value--up {
+  color: var(--ok);
+}
+
+.usage__value--down {
+  color: var(--danger);
+}
+
+.usage__value--zero,
+.usage__value--none {
+  color: var(--text-muted);
+}
+
 .meter__bar {
   height: 8px;
   border-radius: 999px;

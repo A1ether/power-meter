@@ -1,5 +1,6 @@
 import type { AccountConfig } from '../config.js';
 import { clamp, daysBetween, firstString, toIso } from '../lib/json.js';
+import type { UsageLedger } from '../usage-ledger.js';
 import type {
   BoundaryKind,
   CreditLot,
@@ -60,6 +61,14 @@ export interface ProviderAdapter {
    * （例如 D1V 默认只暴露项目密钥，账号密钥要显式开启 options.revealApiKey）。
    */
   revealableSecrets?: (account: AccountConfig) => SecretDescriptor[];
+  /**
+   * 拉取「逐笔用量 / 获取明细」（可选）。返回值里的 `covers` 声明该平台能完整覆盖
+   * 的维度：覆盖的维度用上游值（缺记录 = 0），未覆盖的维度回退本地采样兜底
+   * （见 src/usage-ledger.ts 与 docs/plans/供应商卡片-用量与增量字段-开发设计方案.md v2）。
+   *
+   * 未实现此方法 = 该平台四个字段全部走本地采样，行为与 v1 一致。
+   */
+  fetchUsageLedger?: (account: AccountConfig, ctx: ProbeContext) => Promise<UsageLedger | null>;
   probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot>;
 }
 
@@ -233,6 +242,8 @@ export function buildSnapshot(input: SnapshotInput): ProviderSnapshot {
     note: input.note ?? null,
     secrets: describeSecrets(input.adapter, input.account),
     stale: false,
+    // 日级用量由编排层用本地采样历史填充，适配器不感知
+    dailyUsage: null,
   };
 }
 

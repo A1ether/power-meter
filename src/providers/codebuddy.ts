@@ -1,5 +1,6 @@
 import { assertBusinessOk, fetchJson, HttpError } from '../lib/http.js';
 import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
+import { localDateKey, startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
 import type { AccountConfig } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
 import {
@@ -40,7 +41,31 @@ import {
 
 const CB_SUMMARY_URL = 'https://www.codebuddy.cn/billing/meter/get-user-resource-summary';
 const CB_PACKAGES_URL = 'https://www.codebuddy.cn/billing/meter/get-user-resource-free-packages';
+const CB_PAID_PACKAGES_URL = 'https://www.codebuddy.cn/billing/meter/get-user-resource-paid-packages';
+const CB_REQUEST_USAGE_URL = 'https://www.codebuddy.cn/billing/meter/get-user-request-usage';
+const CB_GIFT_URL = 'https://www.codebuddy.cn/billing/meter/check-gift-claimed';
 const CB_TIMEOUT_FALLBACK = 12_000;
+
+/**
+ * 资源包列表 → 「获取」记录：每个包的当前周期发放时间（CycleStartTime）
+ * 与周期额度（CycleCapacitySizePrecise），即页面资源包列表里的发放口径。
+ */
+function parsePackageGrants(body: unknown): UsageRecord[] {
+  const data = pick(body, 'data');
+  const accounts = isRecord(data) ? pick(data, 'Accounts', 'accounts') : undefined;
+  if (!Array.isArray(accounts)) return [];
+  const out: UsageRecord[] = [];
+  for (const raw of accounts) {
+    if (!isRecord(raw)) continue;
+    const at = toIso(pick(raw, 'CycleStartTime', 'cycleStartTime', 'CreateTime', 'createTime'));
+    const amount = firstNumber(
+      pick(raw, 'CycleCapacitySizePrecise', 'cycleCapacitySizePrecise', 'CycleCapacitySize'),
+    );
+    if (!at || amount === null || amount <= 0) continue;
+    out.push({ at: Date.parse(at), kind: 'grant', amount });
+  }
+  return out;
+}
 
 export interface CodeBuddySummary {
   limit: number;
@@ -138,6 +163,106 @@ export const codebuddyAdapter: ProviderAdapter = {
   credentialHint:
     '登录 www.codebuddy.cn 后，在 DevTools 里复制任意 www.codebuddy.cn 请求的 Cookie 头' +
     '（务必包含 www 子域下的会话 Cookie），填入 credentials.cookie（也可用 npm run capture 自动抓取）。',
+  /**
+   * 用量 + 获取明细（v2）：
+   *   - 用量：`get-user-request-usage` 逐笔（`requestTime` + `credit`，支持日期区间与翻页），
+   *     与页面「使用明细」同源；
+   *   - 获取：资源包当前周期发放（`CycleStartTime` + `CycleCapacitySizePrecise`）+
+   *     礼包（`claimed_at` + `credit_num`，只回最近一次领取）。任一获取来源失败即整体
+   *     退回本地采样（不标 upstream），避免「只统计了一半还说完整」。
+   */
+  async fetchUsageLedger(account: AccountConfig, ctx: ProbeContext): Promise<UsageLedger | null> {
+    const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+    if (!cookie) return null;
+    const timeoutMs = ctx.timeoutMs || CB_TIMEOUT_FALLBACK;
+    const headers: Record<string, string> = {
+      Cookie: cookie,
+      'Content-Type': 'application/json',
+      Origin: 'https://www.codebuddy.cn',
+      Referer: 'https://www.codebuddy.cn/profile/plans-usage',
+      'x-client-platform': 'web',
+    };
+    const records: UsageRecord[] = [];
+
+    // ① 逐笔用量：本地日区间，按页拉取（上限 10 页 × 100）
+    const startDay = localDateKey(startOfDay(ctx.now) - 86_400_000);
+    const endDay = localDateKey(ctx.now);
+    const pageSize = 100;
+    for (let pageNum = 1; pageNum <= 10; pageNum += 1) {
+      const { body } = await fetchJson(CB_REQUEST_USAGE_URL, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          startTime: `${startDay} 00:00:00`,
+          endTime: `${endDay} 23:59:59`,
+          pageNum,
+          pageSize,
+        }),
+        timeoutMs,
+      });
+      assertBusinessOk(body);
+      const data = isRecord(body) ? pick(body, 'data') : undefined;
+      const list = isRecord(data) ? pick(data, 'data') : undefined;
+      if (!Array.isArray(list) || list.length === 0) break;
+      for (const raw of list) {
+        if (!isRecord(raw)) continue;
+        const at = toIso(pick(raw, 'requestTime', 'request_time'));
+        const amount = firstNumber(pick(raw, 'credit', 'credits'));
+        if (!at || amount === null || amount <= 0) continue;
+        records.push({ at: Date.parse(at), kind: 'use', amount });
+      }
+      if (list.length < pageSize) break;
+    }
+
+    // ②③ 获取记录：任一步失败即放弃覆盖声明（grant 回退本地采样）
+    let grantCovered = true;
+    try {
+      const summaryResponse = await fetchJson(optString(account, 'endpoint') || CB_SUMMARY_URL, {
+        method: 'POST',
+        headers,
+        body: '{}',
+        timeoutMs,
+      });
+      assertBusinessOk(summaryResponse.body);
+      const summary = parseCodeBuddySummary(summaryResponse.body);
+      const packageBody = JSON.stringify({
+        PageNumber: 1,
+        PageSize: 200,
+        Status: [0],
+        PackageCodes: summary.packageCodes,
+        NeedInUsage: true,
+      });
+      for (const url of [CB_PACKAGES_URL, CB_PAID_PACKAGES_URL]) {
+        try {
+          const { body } = await fetchJson(url, { method: 'POST', headers, body: packageBody, timeoutMs });
+          records.push(...parsePackageGrants(body));
+        } catch (error) {
+          grantCovered = false;
+          ctx.log(`CodeBuddy 资源包发放明细获取失败（退回本地采样）：${(error as Error).message}`);
+        }
+      }
+    } catch (error) {
+      grantCovered = false;
+      ctx.log(`CodeBuddy 资源包清单获取失败（退回本地采样）：${(error as Error).message}`);
+    }
+    try {
+      const { body } = await fetchJson(CB_GIFT_URL, { method: 'POST', headers, body: '{}', timeoutMs });
+      const data = isRecord(body) ? pick(body, 'data') : undefined;
+      if (isRecord(data) && pick(data, 'claimed') === true) {
+        const at = toIso(pick(data, 'claimed_at', 'claimedAt'));
+        const amount = firstNumber(pick(data, 'credit_num', 'creditNum'));
+        if (at && amount !== null && amount > 0) {
+          records.push({ at: Date.parse(at), kind: 'grant', amount });
+        }
+      }
+    } catch (error) {
+      grantCovered = false;
+      ctx.log(`CodeBuddy 礼包明细获取失败（退回本地采样）：${(error as Error).message}`);
+    }
+
+    return { records, covers: { use: true, grant: grantCovered } };
+  },
+
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
     const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
     if (!cookie) return notConfigured(codebuddyAdapter, account, ctx, ['cookie']);

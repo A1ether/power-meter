@@ -6,6 +6,56 @@ const VISIBLE_LOTS = 3;
 /** 合并卡片里默认展示的账号数，其余折叠 */
 const VISIBLE_ENTRIES = 2;
 
+/**
+ * 来源文案：upstream = 平台明细接口，local = 本地采样兜底，mixed = 合并卡片里两者混合
+ * （由后端 dailyUsage.sources 下发，见 src/service.ts 的 withDailyUsage）
+ */
+const USAGE_SOURCE_LABELS = {
+  upstream: '来源：平台明细',
+  local: '来源：本地采样兜底（该平台无此明细）',
+  mixed: '来源：平台明细 + 本地采样',
+};
+
+/**
+ * 卡片上的日级用量 / 增量四字段（展示顺序即此顺序）。
+ * 口径（2026-10-10 用户确认）：
+ *   - 用量 = 该日额度**减少量**之和（使用的量）；
+ *   - 增量 = 该日额度**增加量**之和（增加的量，如每日签到、充值）；
+ *   两者互不抵消，按本地时间 00:00–24:00 切日。
+ * 数据优先来自后端 provider.dailyUsage（平台明细接口，见 src/usage-ledger.ts）。
+ * `increase: true` 的字段按正负着色（正=绿、零=灰）并给正数加「+」前缀。
+ */
+const USAGE_FIELDS = [
+  {
+    key: 'yesterdayUsed',
+    label: '昨日用量',
+    increase: false,
+    dimension: 'used',
+    hint: '昨日（本地时间 00:00–24:00）的消耗合计；增加不计入',
+  },
+  {
+    key: 'yesterdayAdded',
+    label: '昨日增量',
+    increase: true,
+    dimension: 'added',
+    hint: '昨日的增加合计（如每日签到、充值）；消耗不计入',
+  },
+  {
+    key: 'todayUsed',
+    label: '今日用量',
+    increase: false,
+    dimension: 'used',
+    hint: '今日（本地时间 00:00 起）的消耗合计；增加不计入',
+  },
+  {
+    key: 'todayAdded',
+    label: '今日增量',
+    increase: true,
+    dimension: 'added',
+    hint: '今日的增加合计（如每日签到、充值）；消耗不计入',
+  },
+];
+
 const state = {
   data: null,
   sort: 'expiry',
@@ -365,6 +415,8 @@ function buildCard(provider, thresholds) {
   // 没有套餐名时整行隐藏，避免空 <p> 带着负 margin 参与排版，让各卡片高度不一致
   planNode.hidden = planText === '';
 
+  renderUsage(node, provider, healthy);
+
   const meter = node.querySelector('.meter');
   const primaryWindow = provider.windows.find((window) => window.showMeter);
   if (healthy && primaryWindow) {
@@ -448,6 +500,54 @@ function buildCard(provider, thresholds) {
   }
 
   return node;
+}
+
+/**
+ * 日级用量 / 增量区块（四字段，2×2 网格）。
+ *
+ * 取值严格对应后端 provider.dailyUsage 的同名键；字段整体缺失（旧后端）
+ * 或该日为 null 时显示「–」——新装首日看不到「昨日」属正常，不当作错误。
+ * 增量按正负着色（正=绿、零=灰；现口径为「增加量之和」，负值分支防御性保留）；
+ * 用量为消耗口径（非负）不着色。
+ */
+function renderUsage(node, provider, healthy) {
+  const box = node.querySelector('.usage');
+  if (!healthy) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+
+  const usage = provider.dailyUsage ?? {};
+  const currency = usage.currency ?? currencyFor(provider);
+  const grid = node.querySelector('.usage__grid');
+  grid.replaceChildren();
+
+  for (const field of USAGE_FIELDS) {
+    const value = usage[field.key];
+    const item = element('div', 'usage__item');
+    const label = element('span', 'usage__label', field.label);
+    const valueNode = element('span', 'usage__value');
+    const source = USAGE_SOURCE_LABELS[usage.sources?.[field.dimension]] ?? USAGE_SOURCE_LABELS.local;
+
+    if (value === null || value === undefined || Number.isNaN(value)) {
+      valueNode.textContent = '–';
+      valueNode.classList.add('usage__value--none');
+      item.title = `${field.label}：暂无数据（${source}；看板被打开并采样后自动出现）`;
+    } else {
+      // 增加量显式带「+」，与「用量」在视觉上区分开
+      valueNode.textContent = `${field.increase && value > 0 ? '+' : ''}${fmtNumber(value)} ${currency}`;
+      if (field.increase) {
+        valueNode.classList.add(
+          value > 0 ? 'usage__value--up' : value < 0 ? 'usage__value--down' : 'usage__value--zero',
+        );
+      }
+      // 数值过长被省略号截断时，悬停仍能看到完整值、口径与来源
+      item.title = `${field.label}：${valueNode.textContent}（${field.hint}；${source}）`;
+    }
+    item.append(label, valueNode);
+    grid.append(item);
+  }
 }
 
 /**

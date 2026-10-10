@@ -7,10 +7,12 @@ import {
   type LoadConfigResult,
 } from './config.js';
 import { TtlCache } from './lib/cache.js';
-import { describeSecrets } from './providers/base.js';
+import { describeSecrets, type ProbeContext, type ProviderAdapter } from './providers/base.js';
 import { resolveAdapter } from './providers/index.js';
 import type { ProviderSnapshot } from './types.js';
 import { OK_STATUSES } from './types.js';
+import { UsageHistory } from './usage-history.js';
+import { summarizeLedger, type UsageLedger } from './usage-ledger.js';
 
 export interface RefreshOutcome {
   payload: ReturnType<typeof buildPayload>;
@@ -19,6 +21,12 @@ export interface RefreshOutcome {
 }
 
 const MAX_CONCURRENCY = 6;
+
+/** 卡片上展示的额度：优先账户余额，无余额时退回剩余批次之和（与前端 balanceFor() 同口径） */
+function displayedAmount(snapshot: ProviderSnapshot): number {
+  if (snapshot.balance) return snapshot.balance.amount;
+  return snapshot.credits.reduce((sum, lot) => sum + lot.amount, 0);
+}
 
 /**
  * 看板编排层：
@@ -31,12 +39,19 @@ export class DashboardService {
   private configResult: LoadConfigResult;
   private cache: TtlCache<ProviderSnapshot>;
   private readonly lastGood = new Map<string, ProviderSnapshot>();
+  /** 本地用量采样历史（.run/usage-history.json），用于日级用量/增量的兜底 */
+  private readonly usage = new UsageHistory();
+  /** 平台明细接口的缓存（v2）：与探测同样走 TTL，避免每次刷新都多打上游 */
+  private ledgerCache: TtlCache<UsageLedger | null>;
   private accountsMtimeMs = 0;
   private dotEnvMtimeMs = 0;
 
   constructor() {
     this.configResult = loadConfig();
     this.cache = new TtlCache<ProviderSnapshot>(
+      this.configResult.config.settings.cacheTtlSeconds * 1_000,
+    );
+    this.ledgerCache = new TtlCache<UsageLedger | null>(
       this.configResult.config.settings.cacheTtlSeconds * 1_000,
     );
     this.accountsMtimeMs = this.readMtime();
@@ -114,6 +129,8 @@ export class DashboardService {
       },
     );
     await Promise.all(workers);
+    // 一批采样结束统一落盘一次，避免每个平台各写一遍
+    this.usage.flush();
     return results;
   }
 
@@ -147,6 +164,7 @@ export class DashboardService {
         note: null,
         secrets: [],
         stale: false,
+        dailyUsage: null,
       };
     }
 
@@ -163,22 +181,27 @@ export class DashboardService {
       const snapshot = await this.cache.resolve(key, () => adapter.probe(account, ctx), { force });
       if (OK_STATUSES.has(snapshot.status)) {
         this.lastGood.set(key, snapshot);
-        return snapshot;
+        // 本地采样兜底：采样的就是「页面即将展示的数值」，保证时间序列与卡片口径一致
+        this.usage.observe(key, displayedAmount(snapshot), now);
+        const ledger = await this.fetchLedger(adapter, account, key, ctx, force);
+        return this.withDailyUsage(snapshot, key, now, ledger);
       }
       const previous = this.lastGood.get(key);
-      if (!previous) return snapshot;
+      if (!previous) return { ...snapshot, dailyUsage: null };
       // 保留上次成功数值，但把失败状态透出，让界面能提示「数据可能已过期」
       return {
         ...previous,
         status: snapshot.status,
         message: snapshot.message,
         stale: true,
+        // 失败卡片不展示日级用量（与界面「失败卡片只显示原因」的现状一致）
+        dailyUsage: null,
       };
     } catch (error) {
       const previous = this.lastGood.get(key);
       const message = (error as Error).message;
       if (previous) {
-        return { ...previous, status: 'error', message, stale: true };
+        return { ...previous, status: 'error', message, stale: true, dailyUsage: null };
       }
       return {
         provider: account.provider,
@@ -206,8 +229,70 @@ export class DashboardService {
         // 探测抛异常时仍要能复制密钥：secrets 与取数结果解耦
         secrets: describeSecrets(adapter, account),
         stale: false,
+        dailyUsage: null,
       };
     }
+  }
+
+  /**
+   * 拉取平台明细（v2）：走与探测同 TTL 的缓存，避免每次刷新都多打上游。
+   * 未实现 / 失败一律返回 null，由 withDailyUsage 逐维度回退本地采样，不阻塞卡片。
+   */
+  private async fetchLedger(
+    adapter: ProviderAdapter,
+    account: AccountConfig,
+    key: string,
+    ctx: ProbeContext,
+    force: boolean,
+  ): Promise<UsageLedger | null> {
+    const fetch = adapter.fetchUsageLedger;
+    if (!fetch) return null;
+    try {
+      return await this.ledgerCache.resolve(
+        key,
+        async () => {
+          try {
+            return await fetch(account, ctx);
+          } catch (error) {
+            ctx.log(`用量明细获取失败，已回退本地采样：${(error as Error).message}`);
+            return null;
+          }
+        },
+        { force },
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 组装日级四字段（v2）：明细接口覆盖的维度用上游值（该日缺记录 = 0），
+   * 未覆盖 / 明细失败的维度回退本地采样，并在 sources 里如实标注来源。
+   */
+  private withDailyUsage(
+    snapshot: ProviderSnapshot,
+    key: string,
+    now: number,
+    ledger: UsageLedger | null,
+  ): ProviderSnapshot {
+    const local = this.usage.metricsFor(key, now);
+    const summary = ledger ? summarizeLedger(ledger, now) : {};
+    const usedUpstream = ledger?.covers.use === true;
+    const addedUpstream = ledger?.covers.grant === true;
+    return {
+      ...snapshot,
+      dailyUsage: {
+        todayUsed: usedUpstream ? summary.usedToday ?? 0 : local.todayUsed,
+        yesterdayUsed: usedUpstream ? summary.usedYesterday ?? 0 : local.yesterdayUsed,
+        todayAdded: addedUpstream ? summary.addedToday ?? 0 : local.todayAdded,
+        yesterdayAdded: addedUpstream ? summary.addedYesterday ?? 0 : local.yesterdayAdded,
+        currency: snapshot.balance?.currency ?? snapshot.credits[0]?.currency ?? 'CREDITS',
+        sources: {
+          used: usedUpstream ? 'upstream' : 'local',
+          added: addedUpstream ? 'upstream' : 'local',
+        },
+      },
+    };
   }
 
   private static mtimeOf(path: string): number {
@@ -246,6 +331,9 @@ export class DashboardService {
 
     this.configResult = loadConfig();
     this.cache = new TtlCache<ProviderSnapshot>(
+      this.configResult.config.settings.cacheTtlSeconds * 1_000,
+    );
+    this.ledgerCache = new TtlCache<UsageLedger | null>(
       this.configResult.config.settings.cacheTtlSeconds * 1_000,
     );
     // 配置变了说明用户期待新数据：清掉兜底值，避免用旧数字掩盖新凭证的失败

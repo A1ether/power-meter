@@ -76,6 +76,33 @@ export interface MoneyBalance {
   currency: Currency;
 }
 
+/** 日级指标的来源：平台明细接口 / 本地采样兜底 / 合并卡片里两者混合 */
+export type UsageSource = 'upstream' | 'local' | 'mixed';
+
+/**
+ * 卡片的日级用量 / 增量。
+ *
+ * 数据来源（v2，见 docs/plans/供应商卡片-用量与增量字段-开发设计方案.md）：
+ *   - 优先取各平台用量页背后的明细接口（`ProviderAdapter.fetchUsageLedger`），
+ *     按本地时区 00:00–24:00 归集，精确到笔；
+ *   - 平台没有对应明细能力的维度，退回本地采样（src/usage-history.ts）兜底，
+ *     并在 `sources` 里如实标注，界面 tooltip 可见。
+ *
+ * 口径（2026-10-10 由用户确认）：
+ * - 「用量」= 该日**减少量之和**（使用的量，非负；增加不抵消）；
+ * - 「增量」= 该日**增加量之和**（增加的量，如每日签到、充值，非负；减少不抵消）；
+ * - 明细来源下「该日无记录 = 0」（有完整记录集）；本地采样下「该日无样本 = null」。
+ */
+export interface DailyUsage {
+  todayUsed: number | null;
+  yesterdayUsed: number | null;
+  todayAdded: number | null;
+  yesterdayAdded: number | null;
+  currency: Currency;
+  /** 各维度的数据来源，用于界面标注（upstream / local / mixed） */
+  sources: { used: UsageSource; added: UsageSource };
+}
+
 /**
  * 「托管密钥」引用：值本身**不进快照**，只下发展示用的掩码预览。
  * 前端按 key 调 `/api/reveal` 按需取明文（见 server.ts 的 reveal 路由）。
@@ -156,6 +183,11 @@ export interface ProviderSnapshot {
   secrets: SecretRef[];
   /** true 表示本次刷新失败，展示的是上一次成功的数据 */
   stale: boolean;
+  /**
+   * 日级用量 / 增量（本地采样历史推算）。由编排层在取数成功后填充；
+   * 适配器不感知此字段，构建快照时统一置 null（见 base.ts 的 buildSnapshot）。
+   */
+  dailyUsage: DailyUsage | null;
 }
 
 export interface ExpiryHit {

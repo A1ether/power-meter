@@ -1,5 +1,6 @@
 import { assertBusinessOk, fetchJson, HttpError } from '../lib/http.js';
 import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
+import { startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
 import type { AccountConfig } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
 import {
@@ -226,6 +227,81 @@ export const qoderAdapter: ProviderAdapter = {
   credentialHint:
     '登录 qoder.com.cn 后，从 DevTools 的 Network 里复制任意 /api/ 请求的 Cookie 头，' +
     '填入 credentials.cookie（也可用 npm run capture 自动抓取）。',
+  /**
+   * 用量 + 获取明细（v2）：
+   *   - 用量：`/api/v1/me/usages/big_model_credits/histories` 逐笔（`time` + `credits`），
+   *     与页面「使用记录」同源；
+   *   - 获取：`/api/v1/me/quotas/big_model_credits/histories` 额度变更流水
+   *     （`change_amount` + `effective_at`，如资源包激活/发放），与页面「个人资源包 / 获取」同源。
+   */
+  async fetchUsageLedger(account: AccountConfig, ctx: ProbeContext): Promise<UsageLedger | null> {
+    const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+    if (!cookie) return null;
+    const origin = resolveOrigin(account);
+    const timeoutMs = ctx.timeoutMs || QODER_TIMEOUT_FALLBACK;
+    const headers: Record<string, string> = {
+      Cookie: cookie,
+      Origin: origin,
+      Referer: `${origin}/account/usage`,
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'x-requested-with': 'XMLHttpRequest',
+    };
+
+    // 时间窗：昨日 00:00（本地时区）至今；用量数据量大，按页拉取（上限 5 页 × 200）
+    const startMs = startOfDay(ctx.now) - 86_400_000;
+    const records: UsageRecord[] = [];
+    for (let page = 1; page <= 5; page += 1) {
+      const { body } = await fetchJson(
+        `${origin}/api/v1/me/usages/big_model_credits/histories` +
+          `?page=${page}&page_size=200&start_time=${startMs}&end_time=${ctx.now}` +
+          `&order_by=begin_at&order=-1`,
+        { headers, timeoutMs },
+      );
+      assertBusinessOk(body);
+      const list = isRecord(body) ? pick(body, 'data') : undefined;
+      if (!Array.isArray(list) || list.length === 0) break;
+      for (const raw of list) {
+        if (!isRecord(raw)) continue;
+        const at = toIso(pick(raw, 'time', 'begin_at', 'beginAt'));
+        const amount = firstNumber(pick(raw, 'credits', 'original_credits', 'originalCredits'));
+        if (!at || amount === null || amount <= 0) continue;
+        records.push({ at: Date.parse(at), kind: 'use', amount });
+      }
+      const pageResult = isRecord(body) ? pick(body, 'page_result', 'pageResult') : undefined;
+      const lastPage =
+        firstNumber(isRecord(pageResult) ? pick(pageResult, 'last_page', 'lastPage') : undefined) ?? page;
+      if (list.length < 200 || page >= lastPage) break;
+    }
+
+    // 获取明细：quota 变更流水（资源包激活/发放等，页面「获取」页签同源）。
+    // 只取增加方向（DECREMENT/EXPIRE 之类不计），amount 用 change_amount、时间用 effective_at。
+    for (let page = 1; page <= 5; page += 1) {
+      const { body } = await fetchJson(
+        `${origin}/api/v1/me/quotas/big_model_credits/histories` +
+          `?page=${page}&page_size=100&start_time=${startMs}&end_time=${ctx.now}` +
+          `&order_by=begin_at&order=-1`,
+        { headers, timeoutMs },
+      );
+      assertBusinessOk(body);
+      const list = isRecord(body) ? pick(body, 'quota_histories', 'quotaHistories') : undefined;
+      if (!Array.isArray(list) || list.length === 0) break;
+      for (const raw of list) {
+        if (!isRecord(raw)) continue;
+        const changeType = firstString(pick(raw, 'change_type', 'changeType'));
+        if (/DECREMENT|EXPIRE/i.test(changeType)) continue;
+        const at = toIso(pick(raw, 'effective_at', 'effectiveAt', 'created_at', 'createdAt'));
+        const amount = firstNumber(pick(raw, 'change_amount', 'changeAmount'));
+        if (!at || amount === null || amount <= 0) continue;
+        records.push({ at: Date.parse(at), kind: 'grant', amount });
+      }
+      const pageResult = isRecord(body) ? pick(body, 'page_result', 'pageResult') : undefined;
+      const lastPage =
+        firstNumber(isRecord(pageResult) ? pick(pageResult, 'last_page', 'lastPage') : undefined) ?? page;
+      if (list.length < 100 || page >= lastPage) break;
+    }
+    return { records, covers: { use: true, grant: true } };
+  },
+
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
     const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
     if (!cookie) return notConfigured(qoderAdapter, account, ctx, ['cookie']);
