@@ -10,6 +10,10 @@
     "     opTicket 仅当 capture 抓到了 op_ticket 时才需要在 credentials 里加 \"opTicket\"。",
     "     推荐 npm run capture -- minimax 一次性抓取（写入 .env 的 MINIMAX_* 变量）。",
     "     看板上的积分 = MiniMax Code 的签到积分 + 购买积分（按批次带 30 天到期时间）。",
+    "CodeArts 华为云推荐用 AK/SK（credentials.accessKey/secretKey，读 .env 的 CODEARTS_AK/CODEARTS_SK）：",
+    "     走 snap-access 网关、长期有效，不像控制台登录态那样会过期；cookie 可留作兜底，",
+    "     也可用 options.authMode 强制 \"aksk\" 或 \"cookie\"。",
+    "     调试入口：npm run codearts:aksk-probe（只读，输出脱敏）。",
     "D1V 的增删都在看板卡片上直接做（「＋ 添加账号」/ 每条右侧的 ✕），",
     "     或命令行 `npm run d1v:add`，两者是同一份实现，都不用手工改本文件。",
     "D1V 可有多个账号：靠 credentials.apiKey 查额度，",
@@ -54,6 +58,8 @@
       "displayName": "CodeArts 华为云",
       "enabled": true,
       "credentials": {
+        "accessKey": "${CODEARTS_AK}",
+        "secretKey": "${CODEARTS_SK}",
         "cookie": "${CODEARTS_COOKIE}"
       },
       "options": {}

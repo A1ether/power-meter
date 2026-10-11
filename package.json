@@ -13,6 +13,7 @@
     "probe": "tsx src/cli/probe.ts",
     "d1v:add": "tsx src/cli/d1v-add.ts",
     "capture": "tsx src/cli/capture.ts",
+    "codearts:aksk-probe": "tsx src/cli/codearts-aksk-probe.ts",
     "chrome:debug": "tools/chrome-debug.sh",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.json",

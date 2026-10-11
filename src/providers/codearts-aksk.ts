@@ -1,0 +1,216 @@
+import { HttpError } from '../lib/http.js';
+import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
+import { huaweiSignedFetch } from '../lib/huaweicloud.js';
+import type { AccountConfig } from '../config.js';
+import type { CreditLot, ProviderSnapshot } from '../types.js';
+import {
+  buildSnapshot,
+  failure,
+  joinNotes,
+  makeLot,
+  makeWindow,
+  optString,
+  type ProbeContext,
+  type ProviderAdapter,
+} from './base.js';
+
+/**
+ * CodeArts 华为云 · AK/SK 数据源（snap-access 网关）。
+ *
+ * 与 `codearts.ts` 的 Cookie 路径并列，作为**首选凭证**：AK/SK 长期有效，
+ * 不受华为云控制台「会话超时（默认 1 小时）」影响，因此不会出现登录态失效。
+ *
+ * 接口（2026-10-11 实测打通，见 docs/fixes/CodeArts-华为云登录态频繁失效-修复方案.md）：
+ *   GET https://snap-access.cn-north-4.myhuaweicloud.com/snap-manager/v1/statistics/plugin
+ *   签名：SDK-HMAC-SHA256「换行式 + 带日期 + 空 body 哈希」（该组合是唯一被 APIG 接受的，
+ *         其余空格分隔/不带日期/UNSIGNED-PAYLOAD 组合均返回 401 APIG.0301）。
+ *
+ * 响应要点（已实测）：
+ *   metrics[usageTotalPackageCredit]      → package_credit_amount / _used / _remain / _expiring_amount
+ *   metrics[usageBasicPackageCredit]      → 订阅套餐额度（体验版 500）
+ *   metrics[usageBonusPackageCredit]      → 活动福利额度（如邀请活动 20000）
+ *   metrics[usageOnDemandPackageCredit]   → 按需积分包
+ *   start_date ~ end_date                 → 计费周期，即页面显示的到期日（2026-09-25 ~ 2026-10-26）
+ *   package.{status,package_name_cn,...}  → 套餐状态与名称
+ *   metrics/model_metrics 里的 token 字段  → 与积分不是同一计量，本适配器不接入
+ */
+
+const SNAP_ACCESS_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com';
+const STATISTICS_PLUGIN_PATH = '/snap-manager/v1/statistics/plugin';
+const AK_SK_TIMEOUT_FALLBACK = 12_000;
+
+export interface CodeArtsAkSk {
+  accessKey: string;
+  secretKey: string;
+}
+
+/** 积分桶：总额 / 已用 / 剩余 / 临近过期 */
+export interface CodeArtsCreditMetric {
+  amount: number;
+  used: number;
+  remain: number;
+  expiring: number;
+}
+
+export interface CodeArtsSubscription {
+  total: CodeArtsCreditMetric | null;
+  basic: CodeArtsCreditMetric | null;
+  bonus: CodeArtsCreditMetric | null;
+  ondemand: CodeArtsCreditMetric | null;
+  packageName: string;
+  packageStatus: string;
+  periodStart: string | null;
+  periodEnd: string | null;
+}
+
+/**
+ * 读取 AK/SK。优先级：accounts.json 的 credentials.accessKey/secretKey
+ * → options.accessKey/secretKey → 进程环境变量（CODEARTS_AK/CODEARTS_SK，
+ * 兼容 CLI 官方的 CODEARTS_CLI_AK/CODEARTS_CLI_SK）。
+ *
+ * 支持环境变量兜底是为了让「只往 .env 里加两个变量」就能切换到 AK/SK，
+ * 不必再改 accounts.json（凭证明文始终只落在 .env）。
+ */
+export function readCodeArtsAkSk(account: AccountConfig): CodeArtsAkSk | null {
+  const accessKey = (
+    account.credentials.accessKey ||
+    optString(account, 'accessKey') ||
+    process.env.CODEARTS_AK ||
+    process.env.CODEARTS_CLI_AK ||
+    ''
+  ).trim();
+  const secretKey = (
+    account.credentials.secretKey ||
+    optString(account, 'secretKey') ||
+    process.env.CODEARTS_SK ||
+    process.env.CODEARTS_CLI_SK ||
+    ''
+  ).trim();
+  return accessKey && secretKey ? { accessKey, secretKey } : null;
+}
+
+function readCreditMetric(source: unknown): CodeArtsCreditMetric | null {
+  if (!isRecord(source)) return null;
+  const amount = firstNumber(pick(source, 'package_credit_amount', 'packageCreditAmount'));
+  const remain = firstNumber(pick(source, 'package_credit_remain', 'packageCreditRemain'));
+  if (amount === null && remain === null) return null;
+  return {
+    amount: amount ?? 0,
+    used: firstNumber(pick(source, 'package_credit_used', 'packageCreditUsed')) ?? 0,
+    remain: remain ?? 0,
+    expiring:
+      firstNumber(pick(source, 'package_credit_expiring_amount', 'packageCreditExpiringAmount')) ?? 0,
+  };
+}
+
+/** 按指标名取 metrics 里的某一项（名字大小写不敏感） */
+function findMetric(metrics: unknown, name: string): unknown {
+  if (!Array.isArray(metrics)) return undefined;
+  const target = name.toLowerCase();
+  return metrics.find(
+    (item) => isRecord(item) && String(pick(item, 'name') ?? '').toLowerCase() === target,
+  );
+}
+
+export function parseStatisticsPlugin(body: unknown): CodeArtsSubscription {
+  if (!isRecord(body)) throw new Error('响应不是 JSON 对象');
+  const metrics = pick(body, 'metrics');
+  const pkg = pick(body, 'package');
+
+  return {
+    total: readCreditMetric(findMetric(metrics, 'usageTotalPackageCredit')),
+    basic: readCreditMetric(findMetric(metrics, 'usageBasicPackageCredit')),
+    bonus: readCreditMetric(findMetric(metrics, 'usageBonusPackageCredit')),
+    ondemand: readCreditMetric(findMetric(metrics, 'usageOnDemandPackageCredit')),
+    packageName: isRecord(pkg)
+      ? firstString(pick(pkg, 'package_name_cn', 'packageNameCn'), pick(pkg, 'package_name_en'))
+      : '',
+    packageStatus: isRecord(pkg) ? firstString(pick(pkg, 'status')) : '',
+    periodStart: toIso(pick(body, 'start_date', 'startDate')),
+    periodEnd: toIso(pick(body, 'end_date', 'endDate')),
+  };
+}
+
+/** AK/SK 路径取数：签名调用 statistics/plugin 并组装快照（失败时抛错，由调用方决定是否回退 Cookie） */
+export async function probeCodeArtsViaAkSk(
+  adapter: ProviderAdapter,
+  account: AccountConfig,
+  ctx: ProbeContext,
+  aksk: CodeArtsAkSk,
+): Promise<ProviderSnapshot> {
+  const timeoutMs = Math.min(ctx.timeoutMs || AK_SK_TIMEOUT_FALLBACK, AK_SK_TIMEOUT_FALLBACK);
+  const result = await huaweiSignedFetch({
+    accessKey: aksk.accessKey,
+    secretKey: aksk.secretKey,
+    method: 'GET',
+    url: `${SNAP_ACCESS_BASE}${STATISTICS_PLUGIN_PATH}`,
+    // 这两项是实测唯一通过的组合，改动前请先复跑 npm run codearts:aksk-probe
+    signatureStyle: 'newline',
+    unsignedPayload: false,
+    timeoutMs,
+  });
+
+  if (!result.ok) {
+    const detail = result.text.replace(/\s+/g, ' ').trim().slice(0, 160);
+    throw new HttpError(`snap-access 返回 HTTP ${result.status}：${detail}`, result.status);
+  }
+
+  const subscription = parseStatisticsPlugin(result.json);
+  const total = subscription.total;
+  if (!total) throw new Error('响应缺少 usageTotalPackageCredit（检查 AK/SK 权限）');
+
+  const lots: CreditLot[] = [];
+  const pushLot = (
+    id: string,
+    label: string,
+    metric: CodeArtsCreditMetric | null,
+    packageLabel: string,
+  ): void => {
+    if (!metric || metric.remain <= 0) return;
+    lots.push(
+      makeLot({
+        id,
+        label,
+        amount: metric.remain,
+        currency: 'CREDITS',
+        expiresAt: subscription.periodEnd,
+        note: `${packageLabel}额度 ${metric.amount}，已用 ${metric.used}`,
+      }),
+    );
+  };
+  pushLot('codearts-basic', '个人订阅套餐', subscription.basic, '套餐');
+  pushLot('codearts-bonus', '活动福利积分', subscription.bonus, '活动');
+  pushLot('codearts-ondemand', '按需积分包', subscription.ondemand, '按需');
+
+  const window = makeWindow({
+    kind: 'billing',
+    label: '积分额度（套餐 + 活动福利）',
+    used: total.used,
+    limit: total.amount,
+    remaining: total.remain,
+    boundary: subscription.periodEnd ? 'expiry' : 'mixed',
+    expiresAt: subscription.periodEnd,
+  });
+
+  return buildSnapshot({
+    adapter,
+    account,
+    status: 'ok',
+    now: ctx.now,
+    balance: { amount: total.remain, currency: 'CREDITS' },
+    credits: lots,
+    windows: [window],
+    note: joinNotes(
+      subscription.packageName
+        ? `套餐：${subscription.packageName}${subscription.packageStatus ? `（${subscription.packageStatus}）` : ''}`
+        : null,
+      subscription.packageStatus && subscription.packageStatus !== 'normal'
+        ? '套餐状态非 normal，请到码道控制台检查订阅'
+        : null,
+      total.expiring > 0 ? `有 ${total.expiring} 积分临近过期` : null,
+      subscription.periodStart && subscription.periodEnd
+        ? `计费周期 ${subscription.periodStart.slice(0, 10)} ~ ${subscription.periodEnd.slice(0, 10)}（活动福利按聚合口径，逐笔到期需登录态）`
+        : 'AK/SK 口径：活动福利按聚合额度展示',
+    ),
+  });
+}

@@ -3,6 +3,7 @@ import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js'
 import { localDateKey, localNoonOf, startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
 import type { AccountConfig } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
+import { probeCodeArtsViaAkSk, readCodeArtsAkSk } from './codearts-aksk.js';
 import {
   buildSnapshot,
   cred,
@@ -228,9 +229,10 @@ export const codeartsAdapter: ProviderAdapter = {
   usageUrl: 'https://codearts.huaweicloud.com/portal/settings/personal-usage?locale=zh-cn',
   requiredCredentialKeys: ['cookie'],
   credentialHint:
-    '登录 codearts.huaweicloud.com 后，从 DevTools 复制任意 codearts.huaweicloud.com 请求的 Cookie 头' +
-    '（需包含 devclouddevuibjJ_SESSION_ID 与 devclouddevuibjtcftk），填入 credentials.cookie' +
-    '（也可用 npm run capture 自动抓取）。',
+    '两种凭证任选其一：① 推荐 AK/SK（credentials.accessKey/secretKey，或 .env 的 ' +
+    'CODEARTS_AK/CODEARTS_SK）——走 snap-access 网关、长期有效，不会像登录态那样过期；' +
+    '② 兼容旧方式：登录 codearts.huaweicloud.com 后复制 Cookie（需含 devclouddevuibjJ_SESSION_ID ' +
+    '与 devclouddevuibjtcftk，可用 npm run capture 抓取），会话过期后需重新抓取。',
   /**
    * 用量 + 获取明细（v2）：
    *   - 用量：按天图表（`xDimension=DATE_DAY` + `TOTAL_CREDITS`，取昨日/今日两天），
@@ -323,8 +325,30 @@ export const codeartsAdapter: ProviderAdapter = {
   },
 
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
+    // 凭证优先级：AK/SK（长期有效，走 snap-access 网关）→ 控制台 Cookie（会话过期需重抓）
+    // options.authMode: 'auto'（默认）| 'aksk'（只用 AK/SK）| 'cookie'（只用登录态）
+    const authMode = (optString(account, 'authMode') || 'auto').toLowerCase();
+    const aksk = authMode === 'cookie' ? null : readCodeArtsAkSk(account);
+    if (aksk) {
+      try {
+        return await probeCodeArtsViaAkSk(codeartsAdapter, account, ctx, aksk);
+      } catch (error) {
+        const message = (error as Error).message;
+        if (authMode === 'aksk') {
+          return failure(
+            codeartsAdapter,
+            account,
+            ctx,
+            error instanceof HttpError ? error.kind : 'error',
+            `AK/SK 取数失败：${message}`,
+          );
+        }
+        ctx.log(`CodeArts AK/SK 取数失败，回退登录态口径：${message}`);
+      }
+    }
+
     const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
-    if (!cookie) return notConfigured(codeartsAdapter, account, ctx, ['cookie']);
+    if (!cookie) return notConfigured(codeartsAdapter, account, ctx, ['cookie 或 accessKey/secretKey']);
 
     const timeoutMs = ctx.timeoutMs || CA_TIMEOUT_FALLBACK;
     const cftk = optString(account, 'cftk') || cookieValue(cookie, CFTK_COOKIE_NAME);

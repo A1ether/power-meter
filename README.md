@@ -255,14 +255,14 @@ interface ProviderSnapshot {
 
 ### 各平台配置
 
-除 D1V（API 密钥）与 MiniMax Code（网页端登录态 token）外，其余平台的凭证都只需要 **一个 Cookie**：
+除 D1V（API 密钥）、MiniMax Code（网页端登录态 token）与 CodeArts（推荐 AK/SK）外，其余平台的凭证都只需要 **一个 Cookie**：
 
 | 平台 | `provider` | 需要的凭证 | 关键 `options` |
 | --- | --- | --- | --- |
 | Qoder | `qoder` / `qoder.cn` | `cookie` | `site: "cn"`（国内，默认）或 `"global"` |
 | Trae | `trae` / `trae.cn` | `cookie` | JWT 由 Cookie 自动续签；可选 `accessToken` 覆盖 |
 | CodeBuddy | `codebuddy` | `cookie`（**必须含 `www` 子域**）| — |
-| CodeArts | `codearts` | `cookie`（含 `devclouddevuibjtcftk`）| 可选 `resourceType`、`region` |
+| CodeArts | `codearts` | **`accessKey` + `secretKey`（推荐，长期有效）**<br>`cookie`（兼容，会话过期需重抓） | 可选 `authMode: "auto" \| "aksk" \| "cookie"`、`resourceType`、`region` |
 | MiniMax Code | `minimax` / `minimax-code` / `agent.minimax.cn` | `token`（`_token`）+ `cookie`（SSO）+ 真实身份 `userId`/`opTicket`/`uuid`（capture 一并抓取，缺一不可）| `site: "cn"`（默认）或 `"global"` |
 | D1V | `d1v` / `d1v.ai` | `apiKey`（查余额）<br>`paiApiKey`（托管复制） | `baseUrl`、`revealApiKey` |
 | 任意平台 | `custom` | 按需 `headers` | `providerId`、`endpoint`、`mapping` |
