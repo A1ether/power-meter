@@ -11,6 +11,7 @@ import {
   hiddenLotsNote,
   joinNotes,
   makeLot,
+  makeWindow,
   normalizeCookieHeader,
   notConfigured,
   optBool,
@@ -415,9 +416,23 @@ export const minimaxAdapter: ProviderAdapter = {
     try {
       const result = await fetchMinimaxCreditDetails(account, ctx);
 
+      // 卡片的「额度进度条」：由明细推导（平台没有账户级汇总接口）——
+      // 统计仍在有效期内的批次（含已用尽），limit=授予量之和、remaining=剩余之和。
+      // 已过期批次的剩余已作废、消耗属历史，计入只会稀释当前进度，故排除。
+      let windowGranted = 0;
+      let windowRemaining = 0;
+      let windowEarliestExpiry: number | null = null;
       let usedUpCount = 0;
       const entries: Array<{ detail: MinimaxCreditDetail; lot: CreditLot }> = [];
       for (const [index, detail] of result.items.entries()) {
+        if (detail.expiresAt >= ctx.now) {
+          windowGranted += detail.granted;
+          windowRemaining += detail.remaining;
+          windowEarliestExpiry =
+            windowEarliestExpiry === null
+              ? detail.expiresAt
+              : Math.min(windowEarliestExpiry, detail.expiresAt);
+        }
         if (detail.remaining <= 0) {
           usedUpCount += 1;
           continue;
@@ -461,6 +476,20 @@ export const minimaxAdapter: ProviderAdapter = {
           ? `签到积分 ${formatAmount(checkinRemaining)} · 购买积分 ${formatAmount(purchasedRemaining)}`
           : null;
 
+      // 没有有效期内授予量时不伪造窗口：不画进度条，好过画一条无意义的空条
+      const window =
+        windowGranted > 0
+          ? makeWindow({
+              kind: 'billing',
+              label: '积分额度（有效期内）',
+              used: Math.max(0, windowGranted - windowRemaining),
+              limit: windowGranted,
+              remaining: windowRemaining,
+              boundary: 'expiry',
+              expiresAt: toIso(windowEarliestExpiry),
+            })
+          : null;
+
       return buildSnapshot({
         adapter: minimaxAdapter,
         account,
@@ -468,7 +497,7 @@ export const minimaxAdapter: ProviderAdapter = {
         now: ctx.now,
         balance: { amount: balance, currency: 'CREDITS' },
         credits: active,
-        windows: [],
+        windows: window ? [window] : [],
         note: joinNotes(
           splitNote,
           signinNote(signin),
