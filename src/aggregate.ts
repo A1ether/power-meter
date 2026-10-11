@@ -24,7 +24,7 @@ function round(value: number): number {
 /**
  * 把声明了 `groupAccounts` 的平台的多条账号快照合并成一张卡片。
  *
- * 动机：D1V 的一个账号 = 一把项目密钥 + 一份 quota，是多份「同一种东西」。
+ * 动机：A1etherOpenAi 的一个账号 = 一把项目密钥 + 一份 quota，是多份「同一种东西」。
  * 摆成一屏的独立卡片后，真正要看的「谁快用完了」被冲散在滚动里。
  *
  * 合并后：

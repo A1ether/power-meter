@@ -17,13 +17,13 @@ import {
 } from './base.js';
 
 /**
- * D1V（d1v.ai）
+ * A1etherOpenAi（d1v.ai）
  *
  * 纯 API 密钥，不需要浏览器登录态，且分两层密钥：
  *
- *   ① 个人账号 API 密钥（`D1V_API_KEY`，`sk-...`）
+ *   ① 个人账号 API 密钥（`A1etherOpenAi_API_KEY`，`sk-...`）
  *      —— 在 https://www.d1v.ai/settings?tab=api-key 创建，可查额度。
- *   ② 项目环境密钥（`D1V_PAI_API_KEY`）
+ *   ② 项目环境密钥（`A1etherOpenAi_PAI_API_KEY`）
  *      —— 在项目 Dashboard 的 Create Project Environment 后生成，
  *         只用于调模型（`https://pai.d1v.ai/v1`），**不能**查额度。
  *         本适配器不拿它取数，只把它登记为「可托管密钥」。
@@ -46,7 +46,7 @@ import {
  * ============================ 一张卡片 ============================
  *
  * 一个账号 = 一把项目密钥 + 一份 quota，天然是「同一个东西的多份」，
- * 所以声明 `groupAccounts: true`：所有 D1V 账号合并成一张卡片，
+ * 所以声明 `groupAccounts: true`：所有 A1etherOpenAi 账号合并成一张卡片，
  * 卡片里一条条列出「托管密钥 + 它的 quota」，方便横向对比谁快用完了。
  *
  * ============================ 接口 ============================
@@ -57,19 +57,19 @@ import {
  *        / total_requests / platform_project_count
  *   - GET /api/user/info → email / slug，作为卡片里这条账号的标识
  *
- * 鉴权：`Authorization: Bearer <D1V_API_KEY>`；响应信封统一为
+ * 鉴权：`Authorization: Bearer <A1etherOpenAi_API_KEY>`；响应信封统一为
  * `{ code, msg, data }`，`code === 0` 为成功（由 assertBusinessOk 兜底）。
  */
 
-const D1V_API_BASE = 'https://api.d1v.ai';
-const D1V_TIMEOUT_FALLBACK = 12_000;
+const A1etherOpenAi_API_BASE = 'https://api.d1v.ai';
+const A1etherOpenAi_TIMEOUT_FALLBACK = 12_000;
 
-export const d1vAdapter: ProviderAdapter = {
-  id: 'd1v',
-  displayName: 'D1V',
+export const a1etheropenaiAdapter: ProviderAdapter = {
+  id: 'a1etheropenai',
+  displayName: 'A1etherOpenAi',
   region: 'global',
   dashboardUrl: 'https://www.d1v.ai/settings?tab=api-key',
-  // D1V 没有公开的用量页，用量区保持纯展示
+  // A1etherOpenAi 没有公开的用量页，用量区保持纯展示
   usageUrl: '',
   requiredCredentialKeys: ['apiKey'],
   groupAccounts: true,
@@ -80,25 +80,25 @@ export const d1vAdapter: ProviderAdapter = {
   credentialHint:
     '在 https://www.d1v.ai/settings?tab=api-key 创建一把具名密钥（只在创建时完整显示一次），' +
     '填入 credentials.apiKey；' +
-    '项目密钥 D1V_PAI_API_KEY 填进 credentials.paiApiKey 后即可在看板上复制。' +
-    '推荐直接跑 npm run d1v:add，不用手工改配置。',
+    '项目密钥 A1etherOpenAi_PAI_API_KEY 填进 credentials.paiApiKey 后即可在看板上复制。' +
+    '推荐直接跑 npm run a1etheropenai:add，不用手工改配置。',
   revealableSecrets(account: AccountConfig): SecretDescriptor[] {
     // 默认只托管项目密钥（它只能调模型，泄露面小）；
     // 账号密钥能查询账户信息，需要显式开启 options.revealApiKey 才允许复制。
     const declared: SecretDescriptor[] = [
-      { key: 'paiApiKey', label: 'D1V_PAI_API_KEY', hint: '用于模型调用（pai.d1v.ai/v1）' },
+      { key: 'paiApiKey', label: 'A1etherOpenAi_PAI_API_KEY', hint: '用于模型调用（pai.d1v.ai/v1）' },
     ];
     if (optBool(account, 'revealApiKey')) {
-      declared.push({ key: 'apiKey', label: 'D1V_API_KEY', hint: '个人账号密钥，可查额度' });
+      declared.push({ key: 'apiKey', label: 'A1etherOpenAi_API_KEY', hint: '个人账号密钥，可查额度' });
     }
     return declared;
   },
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
     const apiKey = normalizeApiKey(cred(account, ctx, ['apiKey', 'api_token', 'token', 'key']));
-    if (!apiKey) return notConfigured(d1vAdapter, account, ctx, ['apiKey']);
+    if (!apiKey) return notConfigured(a1etheropenaiAdapter, account, ctx, ['apiKey']);
 
-    const baseUrl = (optString(account, 'baseUrl') || D1V_API_BASE).replace(/\/+$/, '');
-    const timeoutMs = ctx.timeoutMs || D1V_TIMEOUT_FALLBACK;
+    const baseUrl = (optString(account, 'baseUrl') || A1etherOpenAi_API_BASE).replace(/\/+$/, '');
+    const timeoutMs = ctx.timeoutMs || A1etherOpenAi_TIMEOUT_FALLBACK;
     const headers: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
     const degraded: string[] = [];
 
@@ -110,12 +110,12 @@ export const d1vAdapter: ProviderAdapter = {
 
     try {
       // quota 是唯一的必取项，取不到就没有可展示的额度，直接算失败
-      const quota = parseD1vQuota(await getData('/api/wallet/pai-project-usage/overview'));
+      const quota = parseA1etherOpenAiQuota(await getData('/api/wallet/pai-project-usage/overview'));
 
       // 账号标识只是让卡片好认，取不到不影响额度
       let profile: string | null = null;
       try {
-        profile = parseD1vProfile(await getData('/api/user/info'));
+        profile = parseA1etherOpenAiProfile(await getData('/api/user/info'));
       } catch (error) {
         degraded.push(`账号信息（${(error as Error).message}）`);
       }
@@ -123,7 +123,7 @@ export const d1vAdapter: ProviderAdapter = {
       const count = (value: number): string => value.toLocaleString('en-US');
 
       return buildSnapshot({
-        adapter: d1vAdapter,
+        adapter: a1etheropenaiAdapter,
         account,
         status: 'ok',
         now: ctx.now,
@@ -145,7 +145,7 @@ export const d1vAdapter: ProviderAdapter = {
       });
     } catch (error) {
       return failure(
-        d1vAdapter,
+        a1etheropenaiAdapter,
         account,
         ctx,
         businessErrorStatus(error),
@@ -178,7 +178,7 @@ function businessErrorStatus(error: unknown): ProviderStatus {
   return 'error';
 }
 
-export interface D1vQuotaSummary {
+export interface A1etherOpenAiQuotaSummary {
   /** 可用 quota —— 唯一决定账号能不能用的数字，永不过期 */
   quotaRemaining: number;
   /** 已消耗的 quota（上游默认窗口内的项目用量累计） */
@@ -189,7 +189,7 @@ export interface D1vQuotaSummary {
   projects: Array<{ id: string; name: string }>;
 }
 
-export function parseD1vQuota(data: unknown): D1vQuotaSummary {
+export function parseA1etherOpenAiQuota(data: unknown): A1etherOpenAiQuotaSummary {
   if (!isRecord(data)) {
     throw new Error('响应缺少 data 字段（API 密钥可能无效或已被撤销）');
   }
@@ -221,7 +221,7 @@ export function parseD1vQuota(data: unknown): D1vQuotaSummary {
 }
 
 /** 多账号托管时，卡片里那条要能看出是哪个账号，所以拿 email / slug 当标识 */
-export function parseD1vProfile(data: unknown): string | null {
+export function parseA1etherOpenAiProfile(data: unknown): string | null {
   if (!isRecord(data)) return null;
   const label = firstString(pick(data, 'email', 'slug', 'company_name', 'sub'));
   return label || null;

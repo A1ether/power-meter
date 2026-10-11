@@ -74,7 +74,7 @@ const state = {
    * 直接写 DOM 的话提示会跟着一起没掉。
    */
   manageMessages: new Map(),
-  /** GET /api/d1v/accounts 的缓存（含已停用、取数失败的账号） */
+  /** GET /api/a1etheropenai/accounts 的缓存（含已停用、取数失败的账号） */
   configuredAccounts: null,
 };
 
@@ -387,7 +387,7 @@ function buildCard(provider, thresholds) {
   );
   if (provider.status === 'demo') tags.append(element('span', 'chip chip--demo', '示例数据'));
   if (provider.stale) tags.append(element('span', 'chip chip--warning', '数据可能过期'));
-  // 有到期概念的走三色分级；明确不过期的（如 D1V 的 quota）直接给绿色标签。
+  // 有到期概念的走三色分级；明确不过期的（如 A1etherOpenAi 的 quota）直接给绿色标签。
   // 两者互斥：一旦声明了永不过期，就不该再出现任何到期倒计时
   if (provider.neverExpires) {
     tags.append(element('span', 'chip chip--ok', '永不过期'));
@@ -679,12 +679,12 @@ function setManageMessage(providerId, kind, text) {
 async function removeAccount(provider, entry) {
   const label = entry.label || entry.id || '未命名';
   const confirmed = window.confirm(
-    `删除 D1V 账号「${label}」？\n\n` +
+    `删除 A1etherOpenAi 账号「${label}」？\n\n` +
       '会同时清掉 .env 里不再被其它账号引用的密钥变量，改动前自动备份到 .run/。',
   );
   if (!confirmed) return;
   try {
-    const result = await manageRequest('/api/d1v/accounts/remove', { accountId: entry.id });
+    const result = await manageRequest('/api/a1etheropenai/accounts/remove', { accountId: entry.id });
     const cleaned = result.removedEnvLines?.length
       ? `，并移除了 ${result.removedEnvLines.join(' / ')}`
       : '';
@@ -701,14 +701,14 @@ async function removeAccount(provider, entry) {
 async function loadConfiguredAccounts(force = false) {
   if (state.configuredAccounts && !force) return state.configuredAccounts;
   try {
-    const response = await fetch('/api/d1v/accounts', {
+    const response = await fetch('/api/a1etheropenai/accounts', {
       headers: { Accept: 'application/json', 'X-Power-Meter-Intent': 'read' },
     });
     if (!response.ok) throw new Error(`接口返回 ${response.status}`);
     state.configuredAccounts = (await response.json()).accounts ?? [];
   } catch (error) {
     els.diagnostics.prepend(
-      element('div', 'diag diag--warn', `读取 D1V 账号清单失败：${error.message}`),
+      element('div', 'diag diag--warn', `读取 A1etherOpenAi 账号清单失败：${error.message}`),
     );
     state.configuredAccounts = [];
   }
@@ -782,7 +782,7 @@ function renderManage(node, provider) {
     submit.disabled = true;
     submit.textContent = '验证中…';
     try {
-      const result = await manageRequest('/api/d1v/accounts', { apiKey, paiKey });
+      const result = await manageRequest('/api/a1etheropenai/accounts', { apiKey, paiKey });
       const added = result.account ?? {};
       setManageMessage(
         provider.provider,

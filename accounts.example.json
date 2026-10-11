@@ -4,7 +4,7 @@
     "推荐流程：npm run chrome:debug → 在弹出窗口登录 → npm run capture 自动抓取凭证。",
     "credentials 用 ${ENV_VAR} 引用 .env，避免把凭证明文写进文件。",
     "保存后服务会自动热加载，无需重启。",
-    "provider 支持：qoder / trae / codebuddy / codearts / d1v / minimax / custom / demo:*",
+    "provider 支持：qoder / trae / codebuddy / codearts / a1etheropenai / minimax / custom / demo:*",
     "MiniMax Code（minimax）凭证较特殊：请求头 token（localStorage `_token`）+ SSO 会话 Cookie +",
     "     真实身份 userId/uuid（公共参数，服务端会与 token 交叉校验），缺一不可；",
     "     opTicket 仅当 capture 抓到了 op_ticket 时才需要在 credentials 里加 \"opTicket\"。",
@@ -14,14 +14,14 @@
     "     走 snap-access 网关、长期有效，不像控制台登录态那样会过期；cookie 可留作兜底，",
     "     也可用 options.authMode 强制 \"aksk\" 或 \"cookie\"。",
     "     调试入口：npm run codearts:aksk-probe（只读，输出脱敏）。",
-    "D1V 的增删都在看板卡片上直接做（「＋ 添加账号」/ 每条右侧的 ✕），",
-    "     或命令行 `npm run d1v:add`，两者是同一份实现，都不用手工改本文件。",
-    "D1V 可有多个账号：靠 credentials.apiKey 查额度，",
-    "         并把 credentials.paiApiKey（D1V_PAI_API_KEY）交给看板托管、一键复制。",
+    "A1etherOpenAi 的增删都在看板卡片上直接做（「＋ 添加账号」/ 每条右侧的 ✕），",
+    "     或命令行 `npm run a1etheropenai:add`，两者是同一份实现，都不用手工改本文件。",
+    "A1etherOpenAi 可有多个账号：靠 credentials.apiKey 查额度，",
+    "         并把 credentials.paiApiKey（A1etherOpenAi_PAI_API_KEY）交给看板托管、一键复制。",
     "     displayName 现在是账号的稳定标识（/api/reveal 靠它定位），界面显示的是邮箱。",
-    "D1V 的额度单位是 QUOTA 且永不过期：钱包 USD 不显示（1 USD = 500,000 quota，",
+    "A1etherOpenAi 的额度单位是 QUOTA 且永不过期：钱包 USD 不显示（1 USD = 500,000 quota，",
     "     但钱包恒定虚高），也不参与「最快到期」。",
-    "整个 D1V 只占一张卡片：所有 d1v 账号会被合并成一张卡，一条条列出密钥与额度。"
+    "整个 A1etherOpenAi 只占一张卡片：所有 a1etheropenai 账号会被合并成一张卡，一条条列出密钥与额度。"
   ],
   "accounts": [
     {
@@ -80,22 +80,22 @@
       }
     },
     {
-      "provider": "d1v",
-      "displayName": "D1V · 账号 A",
+      "provider": "a1etheropenai",
+      "displayName": "A1etherOpenAi · 账号 A",
       "enabled": false,
       "credentials": {
-        "apiKey": "${D1V_A_API_KEY}",
-        "paiApiKey": "${D1V_A_PAI_API_KEY}"
+        "apiKey": "${A1etherOpenAi_A_API_KEY}",
+        "paiApiKey": "${A1etherOpenAi_A_PAI_API_KEY}"
       },
       "options": {}
     },
     {
-      "provider": "d1v",
-      "displayName": "D1V · 账号 B",
+      "provider": "a1etheropenai",
+      "displayName": "A1etherOpenAi · 账号 B",
       "enabled": false,
       "credentials": {
-        "apiKey": "${D1V_B_API_KEY}",
-        "paiApiKey": "${D1V_B_PAI_API_KEY}"
+        "apiKey": "${A1etherOpenAi_B_API_KEY}",
+        "paiApiKey": "${A1etherOpenAi_B_PAI_API_KEY}"
       },
       "options": {
         "revealApiKey": false

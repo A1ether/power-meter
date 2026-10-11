@@ -93,10 +93,10 @@ docs/
 - 统一格式：`<模块名>-<主题>-<文档类型>.md`
 - 使用中文命名，与仓库现有文档风格一致；避免空格，用 `-` 连接。
 - 文件名中不出现日期；日期写在文档正文的元信息区（见 3.1）。
-- 模块名以业务模块为准（如 `平台适配器`、`D1V托管`、`到期时间线`、`凭证抓取`、`缓存策略`）。
+- 模块名以业务模块为准（如 `平台适配器`、`A1etherOpenAi托管`、`到期时间线`、`凭证抓取`、`缓存策略`）。
 - 示例：
   - `docs/plans/平台适配器-接入NewBee平台-开发设计方案.md`
-  - `docs/fixes/D1V托管-quota余额解析错误-修复方案.md`
+  - `docs/fixes/A1etherOpenAi托管-quota余额解析错误-修复方案.md`
   - `docs/modules/到期时间线-模块现状.md`
 
 ### 2.3 与代码的对应关系
@@ -197,7 +197,7 @@ docs/
 | 诊断 | IDE 诊断（lint / 语法 / 类型错误）、`read_lints` | — |
 | 类型检查 | `npm run typecheck`（`tsc --noEmit`，只读不产出） | — |
 | 核对 | 只读检索比对（引用、符号、命名一致性） | — |
-| 命令 | 纯只读命令（如 `git diff`、`git status`） | `npm run build`、`npm start`、`npm run dev`、`npm run probe`、`npm run capture`、`npm run d1v:add`、启动 dev server、真实调用上游平台接口 |
+| 命令 | 纯只读命令（如 `git diff`、`git status`） | `npm run build`、`npm start`、`npm run dev`、`npm run probe`、`npm run capture`、`npm run a1etheropenai:add`、启动 dev server、真实调用上游平台接口 |
 
 **例外**：仅当用户在当轮**明确要求**「编译」「跑 probe」「启服务」「抓凭证」时，才可执行对应命令；执行前须说明将运行什么、预期耗时与影响范围（例如 `npm run probe` 会用真实凭证请求上游平台）。
 
@@ -238,7 +238,7 @@ docs/
 
 1. **不读取、不输出凭证明文**：`accounts.json`、`.env` 含真实 Cookie / API Key，AI 不得在回复、文档、日志摘录中出现明文；排查配置问题时引用变量名或掩码。
 2. **不提交凭证文件**：`accounts.json`、`.env`、`.run/` 已 gitignore，不得建议用户取消忽略，也不得把凭证写入任何会被 git 跟踪的文件（包括 `.env.example` —— 它只放键名占位符）。
-3. **不代改本机特权数据**：`/api/reveal`、`/api/d1v/accounts*` 的等价操作（`npm run d1v:add` 等）会改动真实凭证与账号配置，仅在用户明确要求时执行，执行前说明将写哪些文件。
+3. **不代改本机特权数据**：`/api/reveal`、`/api/a1etheropenai/accounts*` 的等价操作（`npm run a1etheropenai:add` 等）会改动真实凭证与账号配置，仅在用户明确要求时执行，执行前说明将写哪些文件。
 4. **上游请求敏感**：CodeBuddy 等 WAF 会校验 UA、会话 Cookie，AI 编造/拼接的凭证请求可能触发风控——除用户明确要求外，不主动向上游平台发真实请求。
 
 ---

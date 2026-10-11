@@ -36,7 +36,7 @@ export interface ProviderAdapter {
   /**
    * 把这个平台的所有账号并进**一张卡片**（每个账号成为卡片里的一条 entry）。
    *
-   * 适用于「同一个东西的多份」：D1V 的每个账号都是一把项目密钥 + 一份 quota，
+   * 适用于「同一个东西的多份」：A1etherOpenAi 的每个账号都是一把项目密钥 + 一份 quota，
    * 拆成多张卡片会让额度对比被冲散。默认 false = 一个账号一张卡片。
    */
   groupAccounts?: boolean;
@@ -49,7 +49,7 @@ export interface ProviderAdapter {
    */
   neverExpires?: boolean;
   /**
-   * 允许在看板上直接增删该平台的账号（D1V 的「添加 / 删除」按钮）。
+   * 允许在看板上直接增删该平台的账号（A1etherOpenAi 的「添加 / 删除」按钮）。
    *
    * 前端只认这个开关，不认平台名——以后别的平台想接同样的管理界面，
    * 声明开关 + 提供对应接口即可。
@@ -60,7 +60,7 @@ export interface ProviderAdapter {
    * 快照不带 secrets，`/api/reveal` 也会拒绝该 key。
    *
    * 之所以做成函数而不是静态对象：是否暴露要看账号的具体配置
-   * （例如 D1V 默认只暴露项目密钥，账号密钥要显式开启 options.revealApiKey）。
+   * （例如 A1etherOpenAi 默认只暴露项目密钥，账号密钥要显式开启 options.revealApiKey）。
    */
   revealableSecrets?: (account: AccountConfig) => SecretDescriptor[];
   /**

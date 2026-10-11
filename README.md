@@ -40,7 +40,7 @@ npm run probe            # ④ 验证取数是否正常
 # 刷新 http://127.0.0.1:8787
 ```
 
-除 D1V（API 密钥）与 MiniMax Code（网页端登录态 token + Cookie）外，其余平台都只需要**一个 Cookie**，
+除 A1etherOpenAi（API 密钥）与 MiniMax Code（网页端登录态 token + Cookie）外，其余平台都只需要**一个 Cookie**，
 其余全部自动完成 —— 包括 Trae 那个只有 1 天有效期的 JWT，由适配器用 Cookie 自动续签，不需要手工维护。
 
 > 调试窗口用的是独立 profile（`~/.power-meter/chrome-profile`），与你日常的 Chrome 完全隔离。
@@ -58,9 +58,9 @@ npm run probe            # ④ 验证取数是否正常
 | `npm run probe` | **命令行探测取数是否正常**（改配置后先跑这个最快）|
 | `npm run probe -- qoder trae` | 只探测指定平台 |
 | `npm run probe -- --json` | 输出机器可读结果 |
-| `npm run d1v:add -- <账号密钥> <项目密钥>` | **命令行添加 D1V 账号**（先验证再写入，自动备份）；看板上也有按钮 |
-| `npm run d1v:add -- --remove "D1V · xxx"` | 删除 D1V 账号（同时清理无用的 `.env` 变量）|
-| `npm run d1v:add -- --list` | 列出已配置的 D1V 账号 |
+| `npm run a1etheropenai:add -- <账号密钥> <项目密钥>` | **命令行添加 A1etherOpenAi 账号**（先验证再写入，自动备份）；看板上也有按钮 |
+| `npm run a1etheropenai:add -- --remove "A1etherOpenAi · xxx"` | 删除 A1etherOpenAi 账号（同时清理无用的 `.env` 变量）|
+| `npm run a1etheropenai:add -- --list` | 列出已配置的 A1etherOpenAi 账号 |
 | `npm run typecheck` | 类型检查 |
 | `npm run build && npm run serve` | 编译到 `dist/` 后以纯 JS 运行 |
 
@@ -104,13 +104,13 @@ power-meter/
 │   └── app.js                       # 拉数、排序、筛选、倒计时渲染
 └── src/
     ├── server.ts                    # HTTP 服务 + 路由 + 静态资源（Node 内置 http）
-    ├── d1v-store.ts                 # D1V 账号增删的共用实现（CLI 与看板接口同一份）
+    ├── a1etheropenai-store.ts                 # A1etherOpenAi 账号增删的共用实现（CLI 与看板接口同一份）
     ├── service.ts                   # 编排层：并发探测、TTL 缓存、失败回退、配置热加载
     ├── aggregate.ts                 # 聚合：多账号合并成一张卡片 + 汇总统计 + 到期时间线
     ├── config.ts                    # 配置加载：.env 解析、${VAR} 展开、mtime 监控
     ├── types.ts                     # 统一数据契约
     ├── cli/probe.ts                 # 命令行凭证探测工具
-    ├── cli/d1v-add.ts               # 一条命令添加 D1V 账号（先验证再写入）
+    ├── cli/a1etheropenai-add.ts               # 一条命令添加 A1etherOpenAi 账号（先验证再写入）
     ├── lib/
     │   ├── http.ts                  # 带硬超时的 fetch + HTTP/业务错误码映射
     │   ├── cache.ts                 # TTL + in-flight 去重 + last-good 兜底
@@ -122,7 +122,7 @@ power-meter/
         ├── trae.ts                  # trae.cn（权益包按过期时间拆批次）
         ├── codebuddy.ts             # codebuddy.cn（WAF 校验 UA）
         ├── codearts.ts              # codearts.huaweicloud.com（多接口拼批次）
-        ├── d1v.ts                   # d1v.ai（API 密钥取数 + 托管 D1V_PAI_API_KEY）
+        ├── a1etheropenai.ts                   # d1v.ai（API 密钥取数 + 托管 A1etherOpenAi_PAI_API_KEY）
         ├── sessionApi.ts            # 声明式"登录态 + JSON 映射"适配器工厂
         ├── presets.ts               # codebuddy / codearts / custom 预设
         └── demo.ts                  # 示例数据平台（demo:*）
@@ -184,7 +184,7 @@ interface ProviderSnapshot {
 | 策略 | 适用 | 实现 |
 | --- | --- | --- |
 | 内置适配器 | Qoder / Trae 等有稳定接口 | `qoder.ts` / `trae.ts`，含精确字段解析与错误语义 |
-| 内置适配器（API 密钥）| D1V 这类有公开 OpenAPI 的平台 | `d1v.ts`：`Authorization: Bearer <apiKey>`，无需登录态 |
+| 内置适配器（API 密钥）| A1etherOpenAi 这类有公开 OpenAPI 的平台 | `a1etheropenai.ts`：`Authorization: Bearer <apiKey>`，无需登录态 |
 | 声明式映射 | CodeBuddy / CodeArts 等无公开接口 | `sessionApi.ts`：填 `endpoint` + `headers` + `mapping`（JSON 路径）即可接入 |
 | 示例数据 | 首次运行预览界面 | `demo.ts`，确定性 fixture，界面上标注"示例数据" |
 
@@ -219,9 +219,9 @@ interface ProviderSnapshot {
 - **配置热加载**：轮询 `accounts.json` **与 `.env`** 的 mtime，改完保存即生效——
   `npm run capture` 刷新 Cookie 后**不需要重启服务**，页面点「立即刷新」即为新凭证的取数结果。
 - **凭证默认不外泄**：`/api/config` 只返回**存在哪些凭证 key**，不返回值；
-  只有适配器显式声明 `revealableSecrets()` 的密钥（目前仅 D1V 的项目密钥）
+  只有适配器显式声明 `revealableSecrets()` 的密钥（目前仅 A1etherOpenAi 的项目密钥）
   才会以掩码形式出现在快照里，明文要靠 `/api/reveal` 按需读取；
-  而 `/api/reveal` 与 `/api/d1v/accounts*` 都属于本机特权接口，默认只允许回环来源
+  而 `/api/reveal` 与 `/api/a1etheropenai/accounts*` 都属于本机特权接口，默认只允许回环来源
   （见上文「三道闸门」）；
   `accounts.json` 已加入 `.gitignore`，推荐用 `${ENV_VAR}` 引用 `.env`。
 
@@ -255,7 +255,7 @@ interface ProviderSnapshot {
 
 ### 各平台配置
 
-除 D1V（API 密钥）、MiniMax Code（网页端登录态 token）与 CodeArts（推荐 AK/SK）外，其余平台的凭证都只需要 **一个 Cookie**：
+除 A1etherOpenAi（API 密钥）、MiniMax Code（网页端登录态 token）与 CodeArts（推荐 AK/SK）外，其余平台的凭证都只需要 **一个 Cookie**：
 
 | 平台 | `provider` | 需要的凭证 | 关键 `options` |
 | --- | --- | --- | --- |
@@ -264,7 +264,7 @@ interface ProviderSnapshot {
 | CodeBuddy | `codebuddy` | `cookie`（**必须含 `www` 子域**）| — |
 | CodeArts | `codearts` | **`accessKey` + `secretKey`（推荐，长期有效）**<br>`cookie`（兼容，会话过期需重抓） | 可选 `authMode: "auto" \| "aksk" \| "cookie"`、`resourceType`、`region` |
 | MiniMax Code | `minimax` / `minimax-code` / `agent.minimax.cn` | `token`（`_token`）+ `cookie`（SSO）+ 真实身份 `userId`/`opTicket`/`uuid`（capture 一并抓取，缺一不可）| `site: "cn"`（默认）或 `"global"` |
-| D1V | `d1v` / `d1v.ai` | `apiKey`（查余额）<br>`paiApiKey`（托管复制） | `baseUrl`、`revealApiKey` |
+| A1etherOpenAi | `a1etheropenai` / `d1v.ai`（上游服务域名保持不变，也是它的解析别名） | `apiKey`（查余额）<br>`paiApiKey`（托管复制） | `baseUrl`、`revealApiKey` |
 | 任意平台 | `custom` | 按需 `headers` | `providerId`、`endpoint`、`mapping` |
 | 示例数据 | `demo:qoder` / `demo:trae` / `demo:codebuddy` / `demo:codearts` / `demo:no-expiry` | 无 | — |
 
@@ -313,21 +313,21 @@ interface ProviderSnapshot {
 }
 ```
 
-### 示例：托管多个 D1V 账号（余额 + 密钥复制）
+### 示例：托管多个 A1etherOpenAi 账号（余额 + 密钥复制）
 
-D1V 是目前唯一**不用 Cookie、纯 API 密钥**的平台，且天然分两层密钥：
+A1etherOpenAi 是目前唯一**不用 Cookie、纯 API 密钥**的平台，且天然分两层密钥：
 
 | 密钥 | 从哪来 | 能做什么 |
 | --- | --- | --- |
-| `D1V_API_KEY`（账号密钥）| <https://www.d1v.ai/settings?tab=api-key> 创建具名密钥，**只在创建时完整显示一次** | 查询余额、用量（`api.d1v.ai`）|
-| `D1V_PAI_API_KEY`（项目密钥）| 项目 Dashboard → `Create Project Environment` 后复制 | 只能调模型（`pai.d1v.ai/v1`），**不能查余额** |
+| `A1etherOpenAi_API_KEY`（账号密钥）| <https://www.d1v.ai/settings?tab=api-key> 创建具名密钥，**只在创建时完整显示一次** | 查询余额、用量（`api.d1v.ai`）|
+| `A1etherOpenAi_PAI_API_KEY`（项目密钥）| 项目 Dashboard → `Create Project Environment` 后复制 | 只能调模型（`pai.d1v.ai/v1`），**不能查余额** |
 
 因为账号密钥不能反查项目密钥（列表接口只有 `key_prefix`，没有明文），
 看板的定位就是一个**托管面板**：账号密钥用来取数，项目密钥存下来给你随时复制。
 
 #### 加 / 删账号：看板上直接点
 
-D1V 卡片上就有入口：
+A1etherOpenAi 卡片上就有入口：
 
 - **添加**：点额度右侧的「＋ 添加账号」→ 填「个人 apikey」「对应的项目 apikey」→「验证并添加」；
 - **删除**：每条账号的「显示 / 复制」右边有个同款红色按钮「删除」，确认后即删
@@ -337,18 +337,18 @@ D1V 卡片上就有入口：
 写完后服务监听文件变化自动热加载，不用重启。
 
 卡片上只列「启用的、能取数的」账号，而停用或缺凭证的账号同样要能删——
-所以展开管理区时会额外拉一次 `/api/d1v/accounts`，把这类账号列在下方兜底区里。
+所以展开管理区时会额外拉一次 `/api/a1etheropenai/accounts`，把这类账号列在下方兜底区里。
 
 #### 或者用命令行
 
-不想开浏览器时，终端里是同一份实现（`src/d1v-store.ts`）：
+不想开浏览器时，终端里是同一份实现（`src/a1etheropenai-store.ts`）：
 
 ```bash
-npm run d1v:add -- <账号密钥> <项目密钥>
-npm run d1v:add -- --text "个人apikey：sk-xxx
+npm run a1etheropenai:add -- <账号密钥> <项目密钥>
+npm run a1etheropenai:add -- --text "个人apikey：sk-xxx
 对应的项目apikey：yyy"
-npm run d1v:add -- --remove "D1V · jwig5h"
-npm run d1v:add -- --list
+npm run a1etheropenai:add -- --remove "A1etherOpenAi · jwig5h"
+npm run a1etheropenai:add -- --list
 ```
 
 它会依次做四件事：
@@ -357,15 +357,15 @@ npm run d1v:add -- --list
    顺手把额度、已用量打出来给你确认；
 2. **验证项目密钥**：打 `GET https://pai.d1v.ai/v1/models`，
    返回模型列表才算通过（这个端点只读、不花钱）；
-3. **备份** `.env` 与 `accounts.json` 到 `.run/d1v-<op>-<时间戳>/`
+3. **备份** `.env` 与 `accounts.json` 到 `.run/a1etheropenai-<op>-<时间戳>/`
    （`.run/` 已 gitignore：备份不能放 `.env.bak` 这种同目录文件，
    因为 `.env` 被忽略而 `.env.bak` 不会，那等于把凭证明文摆进 git 工作区）；
-4. 写入 `.env` 的 `D1V_<X>_API_KEY` / `D1V_<X>_PAI_API_KEY`
+4. 写入 `.env` 的 `A1etherOpenAi_<X>_API_KEY` / `A1etherOpenAi_<X>_PAI_API_KEY`
    （自动挑下一个空闲字母，或复用 `.env` 里已有的空槽位），
-   并在 `accounts.json` 追加一条 `provider: "d1v"`。
+   并在 `accounts.json` 追加一条 `provider: "a1etheropenai"`。
 
 **两把密钥都验证通过才会写文件**，任何一步失败都原样退出、不留半截配置。
-账号名默认取邮箱前缀（如 `D1V · sb4hnm`），撞名会自动补 `-2`；
+账号名默认取邮箱前缀（如 `A1etherOpenAi · sb4hnm`），撞名会自动补 `-2`；
 `--dry-run` 只验证不写入；重复添加同一把账号密钥会被拒绝（除非 `--force`）。
 
 删除时只清理**不再被任何账号引用**的 `.env` 变量——槽位是按字母复用的，
@@ -373,19 +373,19 @@ npm run d1v:add -- --list
 
 服务监听这两个文件的 mtime，**写完即热加载，不用重启**。
 写完之后 `accounts.json` 里就是普通条目，也可以手工维护——多个账号就是多条
-`provider: "d1v"`，靠 `displayName` 区分（它同时是 `/api/reveal` 与删除操作的定位键，
+`provider: "a1etheropenai"`，靠 `displayName` 区分（它同时是 `/api/reveal` 与删除操作的定位键，
 所以不能重名）：
 
 ```jsonc
 {
   "accounts": [
     {
-      "provider": "d1v",
-      "displayName": "D1V · sb4hnm",       // 多账号靠它区分，也会显示在卡片上
+      "provider": "a1etheropenai",
+      "displayName": "A1etherOpenAi · sb4hnm",       // 多账号靠它区分，也会显示在卡片上
       "enabled": true,
       "credentials": {
-        "apiKey": "${D1V_B_API_KEY}",       // 查余额
-        "paiApiKey": "${D1V_B_PAI_API_KEY}" // 托管，卡片上可一键复制
+        "apiKey": "${A1etherOpenAi_B_API_KEY}",       // 查余额
+        "paiApiKey": "${A1etherOpenAi_B_PAI_API_KEY}" // 托管，卡片上可一键复制
       },
       "options": {
         "revealApiKey": false   // 是否也允许在卡片上复制账号密钥本身（默认 false）
@@ -397,7 +397,7 @@ npm run d1v:add -- --list
 
 #### ⚠ 余额单位是 QUOTA；钱包 USD 直接忽略
 
-D1V 有两套计量，但**只有 quota 有意义**：
+A1etherOpenAi 有两套计量，但**只有 quota 有意义**：
 
 | 计量 | 含义 | 说明 |
 | --- | --- | --- |
@@ -416,25 +416,25 @@ D1V 有两套计量，但**只有 quota 有意义**：
 既然 quota 不过期、USD 又不参与消耗，看板就**完全不显示 USD**——
 摆一个用不上还偏大的数字只会误导人，这正是「余额还有、quota 没了」的来源。
 
-#### 整个 D1V 只占一张卡片
+#### 整个 A1etherOpenAi 只占一张卡片
 
-一个 D1V 账号 = 一把项目密钥 + 一份 quota，天然是「同一种东西的多份」，
-所以适配器声明了 `groupAccounts: true`：聚合层把所有 D1V 账号**合并成一张卡片**，
+一个 A1etherOpenAi 账号 = 一把项目密钥 + 一份 quota，天然是「同一种东西的多份」，
+所以适配器声明了 `groupAccounts: true`：聚合层把所有 A1etherOpenAi 账号**合并成一张卡片**，
 卡片里一条条列出「账号 · 托管密钥 · 可用额度」：
 
 ```
-● D1V                                        [国际] [永不过期]
+● A1etherOpenAi                                        [国际] [永不过期]
 12,292,423 QUOTA                            [＋ 添加账号]
 4 个账号
 账号 · 托管密钥                                     可用额度
 ┌───────────────────────────────────────────────────────────┐
 │ jwig5h@qabq.com                          2,110,311 QUOTA  │
-│ D1V_PAI_API_KEY      [显示] [复制] [删除]                  │
+│ A1etherOpenAi_PAI_API_KEY      [显示] [复制] [删除]                  │
 │ ftWJ0G…B7tK                                               │
 │ 已用 1,274,966 quota（279 次请求）                          │
 ├───────────────────────────────────────────────────────────┤
 │ mehopo8168@meinvr.com                    3,382,112 QUOTA  │
-│ D1V_PAI_API_KEY      [显示] [复制] [删除]                  │
+│ A1etherOpenAi_PAI_API_KEY      [显示] [复制] [删除]                  │
 │ wITpPj…XCO7                                                │
 └───────────────────────────────────────────────────────────┘
                 展开其余 2 个 ⌄
@@ -451,14 +451,14 @@ D1V 有两套计量，但**只有 quota 有意义**：
 - **quota 不过期，所以不参与「最快到期」**：无批次、无进度条、
   也不进到期时间线，不会去跟真正要作废的额度抢注意力。
 
-> 副作用：因为 Quota 永不「到期风险」，D1V 卡片在默认的「最快到期优先」
+> 副作用：因为 Quota 永不「到期风险」，A1etherOpenAi 卡片在默认的「最快到期优先」
 > 排序里会排在最后。想让它靠前，用工具栏的排序下拉切到「按名称」，
 > 或参考「已知限制」里关于低额度告警的说明。
 
-新增账号点额度右侧的「＋ 添加账号」即可（也可用 `npm run d1v:add`），
+新增账号点额度右侧的「＋ 添加账号」即可（也可用 `npm run a1etheropenai:add`），
 每条账号的红色「删除」按钮与「显示 / 复制」同一行。
 
-D1V 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>），只用到两个接口：
+A1etherOpenAi 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>），只用到两个接口：
 
 | 用途 | 接口 |
 | --- | --- |
@@ -481,14 +481,14 @@ D1V 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>），只用�
 | GET | `/api/providers` | 已注册的适配器清单及各自需要的凭证 |
 | GET | `/api/config` | 当前配置概览（**仅凭证 key 名，不含值**）+ 告警 + 缺失环境变量 |
 | POST | `/api/reveal` | **按需读取托管密钥明文**（默认仅本机）。body `{ provider, accountId, key }` |
-| GET | `/api/d1v/accounts` | D1V 账号清单（含已停用 / 缺凭证的，仍只回显掩码）|
-| POST | `/api/d1v/accounts` | **添加 D1V 账号**：先验证两把密钥，通过才写盘。body `{ apiKey, paiKey, name?, force? }` |
-| POST | `/api/d1v/accounts/remove` | **删除 D1V 账号**：body `{ accountId }`，顺带清掉不再被引用的 `.env` 变量 |
+| GET | `/api/a1etheropenai/accounts` | A1etherOpenAi 账号清单（含已停用 / 缺凭证的，仍只回显掩码）|
+| POST | `/api/a1etheropenai/accounts` | **添加 A1etherOpenAi 账号**：先验证两把密钥，通过才写盘。body `{ apiKey, paiKey, name?, force? }` |
+| POST | `/api/a1etheropenai/accounts/remove` | **删除 A1etherOpenAi 账号**：body `{ accountId }`，顺带清掉不再被引用的 `.env` 变量 |
 | GET | `/api/health` | 存活探测 |
 
 ### 本机特权接口的三道闸门
 
-`/api/reveal` 能读出凭证明文，`/api/d1v/accounts*` 能改动本机配置文件，
+`/api/reveal` 能读出凭证明文，`/api/a1etheropenai/accounts*` 能改动本机配置文件，
 所以这几个接口共用同一道闸门，默认**只允许本机**：
 
 1. **来源必须回环**：请求的 `Host` 与 `Origin` 都必须是 `127.0.0.1` / `localhost` / `::1`。
@@ -533,7 +533,7 @@ D1V 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>），只用�
 | `EXPIRY_CRITICAL_DAYS` | `5` | 红色高亮阈值：≤ 该天数到期显示红色 |
 | `EXPIRY_WARNING_DAYS` | `14` | 黄色高亮阈值：`criticalDays`~该天数到期显示黄色，更久显示绿色 |
 | `ACCOUNTS_PATH` | `./accounts.json` | 账号文件路径 |
-| `ALLOW_SECRET_REVEAL` | 未设置 | 设为 `1` 才允许非本机访问本机特权接口（读密钥 `/api/reveal`、增删账号 `/api/d1v/accounts*`）（**前方必须已有反代鉴权**）|
+| `ALLOW_SECRET_REVEAL` | 未设置 | 设为 `1` 才允许非本机访问本机特权接口（读密钥 `/api/reveal`、增删账号 `/api/a1etheropenai/accounts*`）（**前方必须已有反代鉴权**）|
 
 另见 `.env.example`；`src/config.ts` 内置了极简 `.env` 解析，无需 `dotenv`。
 
@@ -560,17 +560,17 @@ D1V 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>），只用�
   错误信息暴露出来（例如「响应缺少 xxx」），届时更新对应单文件即可。
 - CodeArts 官方另有一套 AK/SK 签名的 API 网关，本项目优先支持网页登录态；
   若要接 AK/SK，可基于 `codearts.ts` 扩展，用 `options.headers` 注入签名头。
-- **D1V 的账号密钥会过期/轮换**：官方要求「以替换方式轮换」而不是原地覆盖，
+- **A1etherOpenAi 的账号密钥会过期/轮换**：官方要求「以替换方式轮换」而不是原地覆盖，
   轮换后更新 `.env` 即可（热加载）；卡片里该条会显示 `unauthorized` 与原因。
-- **D1V 用 QUOTA 计**：与其余平台的 CREDITS 都不同，顶部汇总按单位分开计，
+- **A1etherOpenAi 用 QUOTA 计**：与其余平台的 CREDITS 都不同，顶部汇总按单位分开计，
   不做任何跨单位换算（所以「余额从少到多」这类排序在跨单位时没有可比性）。
-- **D1V 完全不显示钱包 USD**：`total_balance_usd` 恒定比 quota 折合值多 \$2.00，
+- **A1etherOpenAi 完全不显示钱包 USD**：`total_balance_usd` 恒定比 quota 折合值多 \$2.00，
   且不参与实际消耗，显示它只会误导——看板只用 `quota_remaining`。
-- **D1V 的额度永不过期**（卡片头部标「永不过期」），所以它没有「最快到期」：
+- **A1etherOpenAi 的额度永不过期**（卡片头部标「永不过期」），所以它没有「最快到期」：
   不进到期时间线、不触发顶部告警、没有进度条
   （没有分母就不编分母；真实数据里套餐目录 `package_info[].quota` 全为 `0`，
   真正表示额度的是 `credit_cents`，与 `use_quota` 量纲不同，硬凑分母只会显示错的进度条）。
-- **D1V 卡片在默认排序里排最后**：默认是「最快到期优先」，而它永远不会到期，
+- **A1etherOpenAi 卡片在默认排序里排最后**：默认是「最快到期优先」，而它永远不会到期，
   这是刻意的口径而不是 bug。想让「quota 快用完」也浮上来，
   需要给条目加一个额度阈值；目前只对 `quota = 0` 标红
   （那是事实判断，不需要拍一个阈值）。

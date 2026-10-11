@@ -70,7 +70,7 @@ async function main(): Promise<void> {
     snapshots.push(snapshot);
     const elapsed = Date.now() - started;
     // 探针是「逐账号」的诊断工具，不走聚合层的合并，
-    // 所以标题要用账号自己的名字——否则合并类平台（如 D1V）几行全长一样
+    // 所以标题要用账号自己的名字——否则合并类平台（如 A1etherOpenAi）几行全长一样
     console.log(
       `${color(snapshot)}\u25cf\u001b[0m ${pad(account.displayName || snapshot.displayName, 26)} ` +
         `${pad(snapshot.status, 14)} ${String(elapsed).padStart(5)}ms  ${snapshot.message ?? ''}`,

@@ -1,7 +1,7 @@
 /**
- * D1V 账号的本地存储层：增 / 删 / 列。
+ * A1etherOpenAi 账号的本地存储层：增 / 删 / 列。
  *
- * 命令行（`src/cli/d1v-add.ts`）和 HTTP 接口（`/api/d1v/accounts`）共用这一份实现，
+ * 命令行（`src/cli/a1etheropenai-add.ts`）和 HTTP 接口（`/api/a1etheropenai/accounts`）共用这一份实现，
  * 因为这些操作是「改 .env + 改 accounts.json」两个文件的原子写，
  * 分散成两份迟早会走样（比如一边备份了、一边没备份）。
  *
@@ -15,7 +15,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from
 import { resolve } from 'node:path';
 import { loadConfig, loadDotEnv } from './config.js';
 import { maskSecret } from './providers/base.js';
-import { d1vAdapter, normalizeApiKey } from './providers/d1v.js';
+import { a1etheropenaiAdapter, normalizeApiKey } from './providers/a1etheropenai.js';
 import type { ProviderSnapshot } from './types.js';
 
 const PAI_DEFAULT_BASE = 'https://pai.d1v.ai/v1';
@@ -36,7 +36,7 @@ function accountsPath(): string {
 
 interface EnvFile {
   text: string;
-  /** 已存在的 D1V_<X>_API_KEY 槽位，行号从 0 开始 */
+  /** 已存在的 A1etherOpenAi_<X>_API_KEY 槽位，行号从 0 开始 */
   slots: Array<{ suffix: string; apiLine: number; paiLine: number; apiValue: string }>;
 }
 
@@ -47,7 +47,7 @@ function readEnvFile(): EnvFile {
   const slots = new Map<string, { suffix: string; apiLine: number; paiLine: number; apiValue: string }>();
 
   lines.forEach((line, index) => {
-    const match = /^D1V_([A-Za-z0-9]+)_API_KEY\s*=\s*(.*)$/.exec(line);
+    const match = /^A1etherOpenAi_([A-Za-z0-9]+)_API_KEY\s*=\s*(.*)$/.exec(line);
     if (!match) return;
     slots.set(match[1] as string, {
       suffix: match[1] as string,
@@ -57,7 +57,7 @@ function readEnvFile(): EnvFile {
     });
   });
   lines.forEach((line, index) => {
-    const match = /^D1V_([A-Za-z0-9]+)_PAI_API_KEY\s*=\s*(.*)$/.exec(line);
+    const match = /^A1etherOpenAi_([A-Za-z0-9]+)_PAI_API_KEY\s*=\s*(.*)$/.exec(line);
     if (!match) return;
     const slot = slots.get(match[1] as string);
     if (slot) slot.paiLine = index;
@@ -68,7 +68,7 @@ function readEnvFile(): EnvFile {
 
 /**
  * 选一个写入位置：优先复用 `.env` 里「已存在但为空」的槽位
- * （照着 .env.example 抄下来的人会有 `D1V_A_API_KEY=` 这样的空行），
+ * （照着 .env.example 抄下来的人会有 `A1etherOpenAi_A_API_KEY=` 这样的空行），
  * 没有空槽位再按 A/B/C… 往后排。
  */
 export function pickEnvSlot(): { suffix: string; reused: boolean } {
@@ -97,8 +97,8 @@ function writeEnvSlot(suffix: string, apiKey: string, paiKey: string): void {
     else lines.push(`${prefix}=${value}`);
   };
 
-  setLine(`D1V_${suffix}_API_KEY`, apiKey);
-  setLine(`D1V_${suffix}_PAI_API_KEY`, paiKey);
+  setLine(`A1etherOpenAi_${suffix}_API_KEY`, apiKey);
+  setLine(`A1etherOpenAi_${suffix}_PAI_API_KEY`, paiKey);
 
   const text = `${lines.join('\n').replace(/\n+$/, '')}\n`;
   writeFileSync(path, text, existsSync(path) ? {} : { mode: 0o600 });
@@ -140,7 +140,7 @@ function backupBeforeWrite(op: string): string {
   const dir = resolve(
     process.cwd(),
     '.run',
-    `d1v-${op}-${new Date().toISOString().replace(/[:.]/g, '-')}`,
+    `a1etheropenai-${op}-${new Date().toISOString().replace(/[:.]/g, '-')}`,
   );
   mkdirSync(dir, { recursive: true });
   for (const file of [envPath(), accountsPath()]) {
@@ -153,7 +153,7 @@ function backupBeforeWrite(op: string): string {
  * 列表
  * ------------------------------------------------------------------ */
 
-export interface D1vAccountView {
+export interface A1etherOpenAiAccountView {
   /** 稳定标识 = accounts.json 里的 displayName（可能就是空串） */
   id: string;
   /** 展示名：邮箱优先，退回 displayName */
@@ -163,17 +163,17 @@ export interface D1vAccountView {
   paiPreview: string;
   /** 两把密钥是否都配齐了（只有 apiKey 时没法展示额度、也没法复制） */
   complete: boolean;
-  /** credentials 里引用的环境变量前缀，如 `D1V_A`；写死明文时为 null */
+  /** credentials 里引用的环境变量前缀，如 `A1etherOpenAi_A`；写死明文时为 null */
   envSuffix: string | null;
 }
 
 /**
- * 列已配置的 D1V 账号。
- * 走 loadConfig() 而不是直接读文件：accounts.json 里存的是 `${D1V_A_API_KEY}`，
+ * 列已配置的 A1etherOpenAi 账号。
+ * 走 loadConfig() 而不是直接读文件：accounts.json 里存的是 `${A1etherOpenAi_A_API_KEY}`，
  * 只有展开后才能显示掩码——否则每行都是同一串占位符，等于什么都没说。
  */
-export function listD1vAccounts(): {
-  accounts: D1vAccountView[];
+export function listA1etherOpenAiAccounts(): {
+  accounts: A1etherOpenAiAccountView[];
   warnings: string[];
   missingEnvVars: string[];
 } {
@@ -181,11 +181,11 @@ export function listD1vAccounts(): {
   const { config, warnings, missingEnvVars } = loadConfig();
 
   // 环境变量前缀只能从**原始** accounts.json 里读：
-  // loadConfig() 已经把 `${D1V_A_API_KEY}` 展开成明文了，那时正则什么都匹配不到
+  // loadConfig() 已经把 `${A1etherOpenAi_A_API_KEY}` 展开成明文了，那时正则什么都匹配不到
   const rawSuffix = new Map<string, string>();
   try {
     for (const item of readAccountsFile().accounts) {
-      if (item.provider !== 'd1v') continue;
+      if (item.provider !== 'a1etheropenai') continue;
       const suffix = envSuffixOfAccount((item.credentials ?? {}) as Record<string, string>);
       if (suffix) rawSuffix.set(String(item.displayName ?? ''), suffix);
     }
@@ -194,7 +194,7 @@ export function listD1vAccounts(): {
   }
 
   const accounts = config.accounts
-    .filter((account) => account.provider === 'd1v')
+    .filter((account) => account.provider === 'a1etheropenai')
     .map((account) => {
       const api = account.credentials.apiKey ?? '';
       const pai = account.credentials.paiApiKey ?? '';
@@ -212,10 +212,10 @@ export function listD1vAccounts(): {
   return { accounts, warnings, missingEnvVars };
 }
 
-/** 从 `{ apiKey: "${D1V_A_API_KEY}" }` 里解析出 `D1V_A`；不是占位符就返回 null */
+/** 从 `{ apiKey: "${A1etherOpenAi_A_API_KEY}" }` 里解析出 `A1etherOpenAi_A`；不是占位符就返回 null */
 function envSuffixOfAccount(credentials: Record<string, string>): string | null {
   const raw = credentials.apiKey ?? '';
-  const match = /^\$\{D1V_([A-Za-z0-9]+)_API_KEY\}$/.exec(raw.trim());
+  const match = /^\$\{A1etherOpenAi_([A-Za-z0-9]+)_API_KEY\}$/.exec(raw.trim());
   return match?.[1] ?? null;
 }
 
@@ -258,7 +258,7 @@ export interface AddFailure {
   stage: 'apiKey' | 'paiKey' | 'duplicate' | 'write';
 }
 
-export async function addD1vAccount(input: AddInput): Promise<AddSuccess | AddFailure> {
+export async function addA1etherOpenAiAccount(input: AddInput): Promise<AddSuccess | AddFailure> {
   const apiKey = normalizeApiKey(input.apiKey);
   const paiKey = normalizeApiKey(input.paiKey);
   if (!apiKey || !paiKey) {
@@ -270,9 +270,9 @@ export async function addD1vAccount(input: AddInput): Promise<AddSuccess | AddFa
 
   // ① 账号密钥：复用看板适配器，命令行 / 页面 / 接口拿到的是同一份结果
   input.onStage?.('apiKey');
-  const snapshot = await d1vAdapter.probe(
+  const snapshot = await a1etheropenaiAdapter.probe(
     {
-      provider: 'd1v',
+      provider: 'a1etheropenai',
       enabled: true,
       displayName: null,
       credentials: { apiKey, paiApiKey: paiKey },
@@ -314,7 +314,7 @@ export async function addD1vAccount(input: AddInput): Promise<AddSuccess | AddFa
   }
   const existingNames = new Set(
     accountsFile.accounts
-      .filter((item) => item.provider === 'd1v')
+      .filter((item) => item.provider === 'a1etheropenai')
       .map((item) => String(item.displayName ?? '')),
   );
 
@@ -325,7 +325,7 @@ export async function addD1vAccount(input: AddInput): Promise<AddSuccess | AddFa
       ok: false,
       status: 409,
       stage: 'duplicate',
-      error: `这把账号密钥已经配置过了（D1V_${duplicate.suffix}_API_KEY）。确实要再加一条请勾选「允许重复」。`,
+      error: `这把账号密钥已经配置过了（A1etherOpenAi_${duplicate.suffix}_API_KEY）。确实要再加一条请勾选「允许重复」。`,
     };
   }
 
@@ -347,12 +347,12 @@ export async function addD1vAccount(input: AddInput): Promise<AddSuccess | AddFa
     backupDir = backupBeforeWrite('add');
     writeEnvSlot(suffix, apiKey, paiKey);
     accountsFile.accounts.push({
-      provider: 'd1v',
+      provider: 'a1etheropenai',
       displayName: name,
       enabled: true,
       credentials: {
-        apiKey: `\${D1V_${suffix}_API_KEY}`,
-        paiApiKey: `\${D1V_${suffix}_PAI_API_KEY}`,
+        apiKey: `\${A1etherOpenAi_${suffix}_API_KEY}`,
+        paiApiKey: `\${A1etherOpenAi_${suffix}_PAI_API_KEY}`,
       },
       options: {},
     });
@@ -371,7 +371,7 @@ export async function addD1vAccount(input: AddInput): Promise<AddSuccess | AddFa
  */
 function defaultName(email: string | null, existing: Set<string>): string {
   const prefix = email ? (email.includes('@') ? email.split('@')[0] : email) : '';
-  const base = `D1V · ${prefix || '新账号'}`;
+  const base = `A1etherOpenAi · ${prefix || '新账号'}`;
   if (!existing.has(base)) return base;
   for (let index = 2; index < 100; index += 1) {
     const candidate = `${base}-${index}`;
@@ -422,12 +422,12 @@ export interface RemoveResult {
 }
 
 /**
- * 删掉一个 D1V 账号：移除 accounts.json 条目，并清掉不再被引用的 .env 变量。
+ * 删掉一个 A1etherOpenAi 账号：移除 accounts.json 条目，并清掉不再被引用的 .env 变量。
  *
  * 「不再被引用」这个判断很关键：槽位是按字母复用的，
  * 直接按名字删变量有可能把别的账号还在用的那把钥匙一起删掉。
  */
-export function removeD1vAccount(accountId: string): RemoveResult {
+export function removeA1etherOpenAiAccount(accountId: string): RemoveResult {
   let accountsFile: AccountsFile;
   try {
     accountsFile = readAccountsFile();
@@ -436,16 +436,16 @@ export function removeD1vAccount(accountId: string): RemoveResult {
   }
 
   const matches = accountsFile.accounts.filter(
-    (item) => item.provider === 'd1v' && String(item.displayName ?? '') === accountId,
+    (item) => item.provider === 'a1etheropenai' && String(item.displayName ?? '') === accountId,
   );
   if (matches.length === 0) {
-    return { ok: false, status: 404, error: `找不到 D1V 账号 ${accountId ? `「${accountId}」` : '(未命名)'}。` };
+    return { ok: false, status: 404, error: `找不到 A1etherOpenAi 账号 ${accountId ? `「${accountId}」` : '(未命名)'}。` };
   }
   if (matches.length > 1) {
     return {
       ok: false,
       status: 409,
-      error: `有 ${matches.length} 个 D1V 账号的 displayName 都是「${accountId}」，无法定位。请先把它们改成不同的名字。`,
+      error: `有 ${matches.length} 个 A1etherOpenAi 账号的 displayName 都是「${accountId}」，无法定位。请先把它们改成不同的名字。`,
     };
   }
 
@@ -456,7 +456,7 @@ export function removeD1vAccount(accountId: string): RemoveResult {
   const remaining = accountsFile.accounts.filter((item) => item !== target);
   const stillReferenced = new Set(
     remaining
-      .filter((item) => item.provider === 'd1v')
+      .filter((item) => item.provider === 'a1etheropenai')
       .map((item) => envSuffixOfAccount((item.credentials ?? {}) as Record<string, string>))
       .filter((value): value is string => value !== null),
   );
@@ -469,7 +469,7 @@ export function removeD1vAccount(accountId: string): RemoveResult {
     if (suffix && !stillReferenced.has(suffix)) {
       const path = envPath();
       const lines = readFileSync(path, 'utf8').split(/\r?\n/);
-      const targets = new Set([`D1V_${suffix}_API_KEY`, `D1V_${suffix}_PAI_API_KEY`]);
+      const targets = new Set([`A1etherOpenAi_${suffix}_API_KEY`, `A1etherOpenAi_${suffix}_PAI_API_KEY`]);
       const kept = lines.filter((line) => {
         const name = line.split('=')[0]?.trim() ?? '';
         if (targets.has(name)) {

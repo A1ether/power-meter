@@ -1,22 +1,22 @@
 /**
- * 一条命令添加 / 查看 D1V 账号（终端版）。
+ * 一条命令添加 / 查看 A1etherOpenAi 账号（终端版）。
  *
- *   npm run d1v:add -- <账号密钥> <项目密钥> [--name "显示名"]
- *   npm run d1v:add -- --text "个人apikey：sk-xxx
+ *   npm run a1etheropenai:add -- <账号密钥> <项目密钥> [--name "显示名"]
+ *   npm run a1etheropenai:add -- --text "个人apikey：sk-xxx
  *   对应的项目apikey：yyy"
- *   npm run d1v:add -- --list
+ *   npm run a1etheropenai:add -- --list
  *
- * 真正的校验与写盘在 `src/d1v-store.ts`，与看板上的「添加 / 删除账号」按钮
+ * 真正的校验与写盘在 `src/a1etheropenai-store.ts`，与看板上的「添加 / 删除账号」按钮
  * 共用同一份实现——否则两边迟早会走样（比如一边备份了、一边没备份）。
  * 这里只负责解析参数与把结果打印成人话。
  */
 import {
-  addD1vAccount,
-  listD1vAccounts,
+  addA1etherOpenAiAccount,
+  listA1etherOpenAiAccounts,
   parseKeyPairText,
-  removeD1vAccount,
-} from '../d1v-store.js';
-import { normalizeApiKey } from '../providers/d1v.js';
+  removeA1etherOpenAiAccount,
+} from '../a1etheropenai-store.js';
+import { normalizeApiKey } from '../providers/a1etheropenai.js';
 import type { ProviderSnapshot } from '../types.js';
 
 /** 只带布尔含义的开关；其余 `--xxx` 一律视为「后面跟一个取值」 */
@@ -53,21 +53,21 @@ function positional(): string[] {
 }
 
 const USAGE = `
-添加 / 查看 D1V 账号（会先验证两把密钥，通过了才写文件）：
+添加 / 查看 A1etherOpenAi 账号（会先验证两把密钥，通过了才写文件）：
 
-  npm run d1v:add -- <账号密钥> <项目密钥>
-  npm run d1v:add -- --text "个人apikey：sk-xxx
+  npm run a1etheropenai:add -- <账号密钥> <项目密钥>
+  npm run a1etheropenai:add -- --text "个人apikey：sk-xxx
   对应的项目apikey：yyy"
-  npm run d1v:add -- --list                    # 看已配置的账号
-  npm run d1v:add -- --dry-run <账号> <项目>    # 只验证不写入
-  npm run d1v:add -- --remove "<账号名>"        # 删除（同样先备份）
+  npm run a1etheropenai:add -- --list                    # 看已配置的账号
+  npm run a1etheropenai:add -- --dry-run <账号> <项目>    # 只验证不写入
+  npm run a1etheropenai:add -- --remove "<账号名>"        # 删除（同样先备份）
 
 其它可选参数：
-  --name "显示名"      默认用账号邮箱前缀，例如 D1V · sb4hnm
+  --name "显示名"      默认用账号邮箱前缀，例如 A1etherOpenAi · sb4hnm
   --pai-base <URL>     项目密钥的校验地址，默认 https://pai.d1v.ai/v1
   --force              允许重复添加账号密钥（默认会拒绝）
 
-这些操作与看板上 D1V 卡片里的「添加 / 删除」是同一份实现，写完都会自动热加载。
+这些操作与看板上 A1etherOpenAi 卡片里的「添加 / 删除」是同一份实现，写完都会自动热加载。
 `;
 
 function printSnapshot(snapshot: ProviderSnapshot): void {
@@ -82,18 +82,18 @@ function printSnapshot(snapshot: ProviderSnapshot): void {
 }
 
 function listAccounts(): void {
-  const { accounts, missingEnvVars } = listD1vAccounts();
+  const { accounts, missingEnvVars } = listA1etherOpenAiAccounts();
   if (accounts.length === 0) {
-    console.log('\n当前没有 D1V 账号。加一个：\n  npm run d1v:add -- <账号密钥> <项目密钥>\n');
+    console.log('\n当前没有 A1etherOpenAi 账号。加一个：\n  npm run a1etheropenai:add -- <账号密钥> <项目密钥>\n');
     return;
   }
-  console.log(`\n已配置 ${accounts.length} 个 D1V 账号：\n`);
+  console.log(`\n已配置 ${accounts.length} 个 A1etherOpenAi 账号：\n`);
   for (const account of accounts) {
     console.log(
       `  ${account.enabled ? '● 已启用' : '○ 已停用'}  ${account.label.padEnd(26)}` +
         `账号密钥 ${(account.apiPreview || '(未配置)').padEnd(16)}` +
         `项目密钥 ${account.paiPreview || '(未配置)'}` +
-        (account.envSuffix ? `  [D1V_${account.envSuffix}_*]` : ''),
+        (account.envSuffix ? `  [A1etherOpenAi_${account.envSuffix}_*]` : ''),
     );
   }
   if (missingEnvVars.length > 0) {
@@ -111,11 +111,11 @@ async function main(): Promise<void> {
   const removeTarget = flag('remove');
   if (removeTarget !== null) {
     if (!removeTarget) {
-      console.error('\n✖ --remove 需要给出账号名，例如 --remove "D1V · sb4hnm"\n');
+      console.error('\n✖ --remove 需要给出账号名，例如 --remove "A1etherOpenAi · sb4hnm"\n');
       process.exitCode = 1;
       return;
     }
-    const result = removeD1vAccount(removeTarget);
+    const result = removeA1etherOpenAiAccount(removeTarget);
     if (!result.ok) {
       console.error(`\n✖ ${result.error}\n`);
       process.exitCode = 1;
@@ -151,7 +151,7 @@ async function main(): Promise<void> {
   }
 
   const dryRun = has('dry-run');
-  const result = await addD1vAccount({
+  const result = await addA1etherOpenAiAccount({
     apiKey,
     paiKey,
     name: flag('name') ?? undefined,
@@ -176,17 +176,17 @@ async function main(): Promise<void> {
 
   if (result.dryRun) {
     console.log('\n[dry-run] 验证全部通过，未写入文件。');
-    console.log(`  将写入 .env        : D1V_${result.suffix}_API_KEY / D1V_${result.suffix}_PAI_API_KEY`);
+    console.log(`  将写入 .env        : A1etherOpenAi_${result.suffix}_API_KEY / A1etherOpenAi_${result.suffix}_PAI_API_KEY`);
     console.log(`  将写入 accounts.json: ${result.name}\n`);
     return;
   }
 
   console.log(`\n✔ 已添加账号「${result.name}」`);
   console.log(
-    `  .env            D1V_${result.suffix}_API_KEY / D1V_${result.suffix}_PAI_API_KEY` +
+    `  .env            A1etherOpenAi_${result.suffix}_API_KEY / A1etherOpenAi_${result.suffix}_PAI_API_KEY` +
       (result.reused ? '（复用了原有空槽位）' : ''),
   );
-  console.log('  accounts.json   已追加一条 provider: "d1v"');
+  console.log('  accounts.json   已追加一条 provider: "a1etheropenai"');
   console.log(`  改动前备份      ${result.backupDir}`);
   console.log('\n服务会监听文件变化自动热加载，刷新 http://127.0.0.1:8787 即可看到。\n');
 }

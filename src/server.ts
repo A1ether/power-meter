@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
-import { addD1vAccount, listD1vAccounts, parseKeyPairText, removeD1vAccount } from './d1v-store.js';
+import { addA1etherOpenAiAccount, listA1etherOpenAiAccounts, parseKeyPairText, removeA1etherOpenAiAccount } from './a1etheropenai-store.js';
 import { describeRegistry, resolveAdapter } from './providers/index.js';
 import { DashboardService } from './service.js';
 
@@ -67,7 +67,7 @@ function describeConfig(): unknown {
 }
 
 /**
- * 本机特权操作的闸门：读密钥明文（/api/reveal）、增删账号（/api/d1v/accounts）。
+ * 本机特权操作的闸门：读密钥明文（/api/reveal）、增删账号（/api/a1etheropenai/accounts）。
  *
  * 这几个接口能读出凭证、也能改本机配置文件，所以默认**只允许本机**：
  *   1. 服务自身监听在回环地址（`HOST` 默认 127.0.0.1 就是为此）；
@@ -260,19 +260,19 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // D1V 账号管理：前置校验都在 d1v-store 里，与 npm run d1v:add 完全同一份实现
-    if (pathname === '/api/d1v/accounts' && req.method === 'GET') {
+    // A1etherOpenAi 账号管理：前置校验都在 a1etheropenai-store 里，与 npm run a1etheropenai:add 完全同一份实现
+    if (pathname === '/api/a1etheropenai/accounts' && req.method === 'GET') {
       const guard = privilegedGuard(req);
       if (!guard.ok) {
         sendJson(res, guard.status, { error: guard.error });
         return;
       }
-      const { accounts, missingEnvVars } = listD1vAccounts();
+      const { accounts, missingEnvVars } = listA1etherOpenAiAccounts();
       sendJson(res, 200, { accounts, missingEnvVars });
       return;
     }
 
-    if (pathname === '/api/d1v/accounts' && req.method === 'POST') {
+    if (pathname === '/api/a1etheropenai/accounts' && req.method === 'POST') {
       const guard = privilegedGuard(req);
       if (!guard.ok) {
         sendJson(res, guard.status, { error: guard.error });
@@ -290,7 +290,7 @@ const server = createServer(async (req, res) => {
       const apiKey = (typeof body.apiKey === 'string' && body.apiKey) || pasted?.apiKey || '';
       const paiKey = (typeof body.paiKey === 'string' && body.paiKey) || pasted?.paiKey || '';
 
-      const outcome = await addD1vAccount({
+      const outcome = await addA1etherOpenAiAccount({
         apiKey,
         paiKey,
         name: typeof body.name === 'string' ? body.name : undefined,
@@ -321,7 +321,7 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    if (pathname === '/api/d1v/accounts/remove' && req.method === 'POST') {
+    if (pathname === '/api/a1etheropenai/accounts/remove' && req.method === 'POST') {
       const guard = privilegedGuard(req);
       if (!guard.ok) {
         sendJson(res, guard.status, { error: guard.error });
@@ -329,7 +329,7 @@ const server = createServer(async (req, res) => {
       }
       const body = (await readBody(req)) as { accountId?: unknown };
       const accountId = typeof body.accountId === 'string' ? body.accountId : '';
-      const outcome = removeD1vAccount(accountId);
+      const outcome = removeA1etherOpenAiAccount(accountId);
       if (!outcome.ok) {
         sendJson(res, outcome.status, { error: outcome.error });
         return;

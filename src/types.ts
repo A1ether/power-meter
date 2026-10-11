@@ -33,7 +33,7 @@ export type BoundaryKind = 'reset' | 'expiry' | 'mixed';
 
 /**
  * 额度单位。各平台口径不同，不做换算，在界面与汇总里按单位分开计。
- * `QUOTA` 是 D1V 的模型调用计量单位（1 USD = 500,000 quota，实测恒定），
+ * `QUOTA` 是 A1etherOpenAi 的模型调用计量单位（1 USD = 500,000 quota，实测恒定），
  * 它与同平台的 USD 钱包余额是同一笔钱的两套计量，因此不能相加。
  */
 export type Currency = 'CREDITS' | 'POINTS' | 'QUOTA' | 'USD' | 'CNY';
@@ -110,7 +110,7 @@ export interface DailyUsage {
 export interface SecretRef {
   /** 凭证 key，作为 /api/reveal 的入参 */
   key: string;
-  /** 展示名，如 `D1V_PAI_API_KEY` */
+  /** 展示名，如 `A1etherOpenAi_PAI_API_KEY` */
   label: string;
   /** 掩码预览，如 `sk-abc…9f2c` */
   preview: string;
@@ -121,7 +121,7 @@ export interface SecretRef {
 /**
  * 卡片里的一个账号条目。
  *
- * 有些平台的账号是「同一个东西的多份」（D1V 就是：每个账号一把项目密钥 +
+ * 有些平台的账号是「同一个东西的多份」（A1etherOpenAi 就是：每个账号一把项目密钥 +
  * 一份 quota），摆成一屏卡片会把真正要看的对比信息冲散。
  * 这类平台的适配器声明 `groupAccounts`，聚合层把它的多个账号快照合并成
  * 一张卡片，每个账号变成这里的一条 entry。
@@ -176,14 +176,14 @@ export interface ProviderSnapshot {
   dashboardUrl: string;
   /**
    * 平台「用量页」地址：卡片「每日用量」区整块作为外链跳转的目标（新窗口打开）。
-   * 与 dashboardUrl 分开：dashboardUrl 是「面板入口」（D1V 指向 api-key 设置页），
+   * 与 dashboardUrl 分开：dashboardUrl 是「面板入口」（A1etherOpenAi 指向 api-key 设置页），
    * 不一定是用量页；空串表示没有可跳转的用量页（用量区保持纯展示）。
    */
   usageUrl: string;
   message: string | null;
   note: string | null;
   /**
-   * 可托管的密钥（目前只有 D1V 用）。与探测结果解耦：
+   * 可托管的密钥（目前只有 A1etherOpenAi 用）。与探测结果解耦：
    * 即使余额查询失败，只要凭证在，仍能复制密钥。
    */
   secrets: SecretRef[];
