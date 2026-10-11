@@ -5,7 +5,6 @@ import type { AccountConfig } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
 import {
   buildSnapshot,
-  failure,
   joinNotes,
   makeLot,
   makeWindow,
@@ -33,6 +32,10 @@ import {
  *   start_date ~ end_date                 → 计费周期，即页面显示的到期日（2026-09-25 ~ 2026-10-26）
  *   package.{status,package_name_cn,...}  → 套餐状态与名称
  *   metrics/model_metrics 里的 token 字段  → 与积分不是同一计量，本适配器不接入
+ *
+ * 混合增强（hybrid）：AK/SK 负责余额/额度窗口（权威口径），若登录态可用，
+ * 活动福利批次改用控制台逐笔明细（每笔独立到期时间），并由调用方传入 `detail`；
+ * 逐笔之和与账户级 bonus 桶的差额补一条「未明细部分」调节项。
  */
 
 const SNAP_ACCESS_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com';
@@ -61,6 +64,12 @@ export interface CodeArtsSubscription {
   packageStatus: string;
   periodStart: string | null;
   periodEnd: string | null;
+}
+
+/** 登录态口径的活动福利逐笔明细（由 codearts.ts 抓取后传入） */
+export interface CodeArtsCampaignDetail {
+  lots: CreditLot[];
+  benefitTotal: number;
 }
 
 /**
@@ -131,14 +140,15 @@ export function parseStatisticsPlugin(body: unknown): CodeArtsSubscription {
   };
 }
 
-/** AK/SK 路径取数：签名调用 statistics/plugin 并组装快照（失败时抛错，由调用方决定是否回退 Cookie） */
-export async function probeCodeArtsViaAkSk(
-  adapter: ProviderAdapter,
-  account: AccountConfig,
-  ctx: ProbeContext,
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+/** 拉取并解析订阅/积分快照（失败抛错，由调用方决定是否回退 Cookie） */
+export async function fetchCodeArtsSubscription(
   aksk: CodeArtsAkSk,
-): Promise<ProviderSnapshot> {
-  const timeoutMs = Math.min(ctx.timeoutMs || AK_SK_TIMEOUT_FALLBACK, AK_SK_TIMEOUT_FALLBACK);
+  timeoutMs: number,
+): Promise<CodeArtsSubscription> {
   const result = await huaweiSignedFetch({
     accessKey: aksk.accessKey,
     secretKey: aksk.secretKey,
@@ -147,40 +157,89 @@ export async function probeCodeArtsViaAkSk(
     // 这两项是实测唯一通过的组合，改动前请先复跑 npm run codearts:aksk-probe
     signatureStyle: 'newline',
     unsignedPayload: false,
-    timeoutMs,
+    timeoutMs: Math.min(timeoutMs || AK_SK_TIMEOUT_FALLBACK, AK_SK_TIMEOUT_FALLBACK),
   });
 
   if (!result.ok) {
     const detail = result.text.replace(/\s+/g, ' ').trim().slice(0, 160);
     throw new HttpError(`snap-access 返回 HTTP ${result.status}：${detail}`, result.status);
   }
+  return parseStatisticsPlugin(result.json);
+}
 
-  const subscription = parseStatisticsPlugin(result.json);
+/**
+ * 组装快照：
+ *   - 余额/额度窗口永远取 AK/SK 的账户级口径（total）；
+ *   - 活动福利批次：`detail` 非空时用逐笔（各自到期），否则退回聚合桶；
+ *   - 逐笔之和与聚合桶的差额 ≥1 时补「未明细部分」调节项。
+ */
+export function buildCodeArtsSnapshot(
+  adapter: ProviderAdapter,
+  account: AccountConfig,
+  ctx: ProbeContext,
+  subscription: CodeArtsSubscription,
+  detail: CodeArtsCampaignDetail | null = null,
+  extraNote: string | null = null,
+): ProviderSnapshot {
   const total = subscription.total;
   if (!total) throw new Error('响应缺少 usageTotalPackageCredit（检查 AK/SK 权限）');
 
   const lots: CreditLot[] = [];
-  const pushLot = (
-    id: string,
-    label: string,
-    metric: CodeArtsCreditMetric | null,
-    packageLabel: string,
-  ): void => {
-    if (!metric || metric.remain <= 0) return;
+
+  if (subscription.basic && subscription.basic.remain > 0) {
     lots.push(
       makeLot({
-        id,
-        label,
-        amount: metric.remain,
+        id: 'codearts-basic',
+        label: '个人订阅套餐',
+        amount: subscription.basic.remain,
         currency: 'CREDITS',
         expiresAt: subscription.periodEnd,
-        note: `${packageLabel}额度 ${metric.amount}，已用 ${metric.used}`,
+        note: `套餐额度 ${subscription.basic.amount}，已用 ${subscription.basic.used}`,
       }),
     );
-  };
-  pushLot('codearts-basic', '个人订阅套餐', subscription.basic, '套餐');
-  pushLot('codearts-bonus', '活动福利积分', subscription.bonus, '活动');
-  pushLot('codearts-ondemand', '按需积分包', subscription.ondemand, '按需');
+  }
+
+  const bonusRemain = round2(subscription.bonus?.remain ?? 0);
+  if (detail && detail.lots.length > 0) {
+    lots.push(...detail.lots);
+    const gap = round2(bonusRemain - detail.benefitTotal);
+    if (gap >= 1) {
+      lots.push(
+        makeLot({
+          id: 'codearts-bonus-gap',
+          label: '活动奖励积分（未明细部分）',
+          amount: gap,
+          currency: 'CREDITS',
+          expiresAt: subscription.periodEnd,
+          note: `活动明细合计 ${detail.benefitTotal}，与账户级 ${bonusRemain} 的差额`,
+        }),
+      );
+    }
+  } else if (subscription.bonus && bonusRemain > 0) {
+    lots.push(
+      makeLot({
+        id: 'codearts-bonus',
+        label: '活动福利积分',
+        amount: bonusRemain,
+        currency: 'CREDITS',
+        expiresAt: subscription.periodEnd,
+        note: `活动额度 ${subscription.bonus.amount}，已用 ${subscription.bonus.used}`,
+      }),
+    );
+  }
+
+  if (subscription.ondemand && subscription.ondemand.remain > 0) {
+    lots.push(
+      makeLot({
+        id: 'codearts-ondemand',
+        label: '按需积分包',
+        amount: subscription.ondemand.remain,
+        currency: 'CREDITS',
+        expiresAt: subscription.periodEnd,
+        note: `按需额度 ${subscription.ondemand.amount}，已用 ${subscription.ondemand.used}`,
+      }),
+    );
+  }
 
   const window = makeWindow({
     kind: 'billing',
@@ -208,9 +267,24 @@ export async function probeCodeArtsViaAkSk(
         ? '套餐状态非 normal，请到码道控制台检查订阅'
         : null,
       total.expiring > 0 ? `有 ${total.expiring} 积分临近过期` : null,
+      detail && detail.lots.length > 0
+        ? `活动福利：登录态逐笔口径（${detail.lots.length} 笔）`
+        : '活动福利：聚合口径',
+      extraNote,
       subscription.periodStart && subscription.periodEnd
-        ? `计费周期 ${subscription.periodStart.slice(0, 10)} ~ ${subscription.periodEnd.slice(0, 10)}（活动福利按聚合口径，逐笔到期需登录态）`
-        : 'AK/SK 口径：活动福利按聚合额度展示',
+        ? `计费周期 ${subscription.periodStart.slice(0, 10)} ~ ${subscription.periodEnd.slice(0, 10)}`
+        : null,
     ),
   });
+}
+
+/** 纯 AK/SK 模式（不叠加登录态明细） */
+export async function probeCodeArtsViaAkSk(
+  adapter: ProviderAdapter,
+  account: AccountConfig,
+  ctx: ProbeContext,
+  aksk: CodeArtsAkSk,
+): Promise<ProviderSnapshot> {
+  const subscription = await fetchCodeArtsSubscription(aksk, ctx.timeoutMs);
+  return buildCodeArtsSnapshot(adapter, account, ctx, subscription, null);
 }

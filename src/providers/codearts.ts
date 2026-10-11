@@ -3,7 +3,11 @@ import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js'
 import { localDateKey, localNoonOf, startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
 import type { AccountConfig } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
-import { probeCodeArtsViaAkSk, readCodeArtsAkSk } from './codearts-aksk.js';
+import {
+  buildCodeArtsSnapshot,
+  fetchCodeArtsSubscription,
+  readCodeArtsAkSk,
+} from './codearts-aksk.js';
 import {
   buildSnapshot,
   cred,
@@ -51,6 +55,69 @@ const CA_BASE = 'https://codearts.huaweicloud.com';
 /** 给 GET 路径追加时间戳参数（避免浏览器/网关缓存，与页面行为一致） */
 function withStamp(path: string): string {
   return `${CA_BASE}${path}${path.includes('?') ? '&' : '?'}_=${Date.now()}`;
+}
+
+/** 控制台 portal 请求头（Cookie + cftk 推导；缺 x-requested-with 会被网关当路由、返回 HTML） */
+function consoleHeaders(account: AccountConfig, cookie: string): Record<string, string> {
+  const cftk = optString(account, 'cftk') || cookieValue(cookie, CFTK_COOKIE_NAME);
+  return {
+    Cookie: cookie,
+    Accept: 'application/json, text/plain, */*',
+    'Content-Type': 'application/json',
+    'x-requested-with': 'XMLHttpRequest',
+    'x-language': 'zh-cn',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    Referer: `${CA_BASE}/portal/settings/personal-usage?locale=zh-cn`,
+    ...(cftk ? { cftk } : {}),
+  };
+}
+
+/**
+ * ④⑤ 活动福利逐笔（登录态口径）：
+ * overview 拿活动列表 → campaign/{id} 拿每一笔的 claimedAt / expireAt。
+ * 失败直接抛错，由调用方决定降级（纯 Cookie 路径退回聚合口径；
+ * 混合模式由 AK/SK 兜底余额，只把活动批次降级）。
+ */
+async function fetchCampaignBenefits(
+  headers: Record<string, string>,
+  timeoutMs: number,
+  ctx: ProbeContext,
+): Promise<{ lots: CreditLot[]; benefitTotal: number }> {
+  const lots: CreditLot[] = [];
+  let benefitTotal = 0;
+  const listResponse = await fetchJson(withStamp('/portal/promptcenter/v1/ops/credit/overview'), {
+    headers,
+    timeoutMs,
+  });
+  assertBusinessOk(listResponse.body);
+
+  for (const campaign of parseCampaignList(listResponse.body).slice(0, MAX_CAMPAIGNS)) {
+    const detailResponse = await fetchJson(
+      withStamp(`/portal/promptcenter/v1/ops/credit/campaign/${campaign.id}`),
+      { headers, timeoutMs: Math.min(timeoutMs, 8_000) },
+    );
+    assertBusinessOk(detailResponse.body);
+    for (const benefit of parseCampaignBenefits(detailResponse.body)) {
+      benefitTotal += benefit.amount;
+      lots.push(
+        makeLot({
+          id: `codearts-campaign-${campaign.id}-${benefit.benefitId}`,
+          label: campaign.title,
+          amount: benefit.amount,
+          currency: 'CREDITS',
+          expiresAt: benefit.expiresAt,
+          note: [
+            benefit.claimedAt ? `领取于 ${benefit.claimedAt.slice(0, 10)}` : '',
+            benefit.validDuration ? `有效期 ${benefit.validDuration}` : '',
+          ]
+            .filter(Boolean)
+            .join('，'),
+        }),
+      );
+    }
+  }
+  ctx.log(`CodeArts 活动逐笔：${lots.length} 笔，合计 ${benefitTotal} 积分`);
+  return { lots, benefitTotal };
 }
 const CA_TIMEOUT_FALLBACK = 12_000;
 const CFTK_COOKIE_NAME = 'devclouddevuibjtcftk';
@@ -331,7 +398,44 @@ export const codeartsAdapter: ProviderAdapter = {
     const aksk = authMode === 'cookie' ? null : readCodeArtsAkSk(account);
     if (aksk) {
       try {
-        return await probeCodeArtsViaAkSk(codeartsAdapter, account, ctx, aksk);
+        const timeoutMs = ctx.timeoutMs || CA_TIMEOUT_FALLBACK;
+        const subscription = await fetchCodeArtsSubscription(aksk, timeoutMs);
+        if (authMode === 'aksk') {
+          return buildCodeArtsSnapshot(codeartsAdapter, account, ctx, subscription, null);
+        }
+
+        // auto（混合增强）：余额/额度窗口用 AK/SK 的权威口径；登录态可用时，
+        // 活动福利批次改用控制台逐笔明细（每笔独立到期），明细缺失只降级活动批次。
+        const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+        if (!cookie) {
+          return buildCodeArtsSnapshot(
+            codeartsAdapter,
+            account,
+            ctx,
+            subscription,
+            null,
+            '未配置登录态 Cookie，活动福利按聚合口径展示',
+          );
+        }
+
+        try {
+          const detail = await fetchCampaignBenefits(consoleHeaders(account, cookie), timeoutMs, ctx);
+          if (detail.lots.length === 0) {
+            return buildCodeArtsSnapshot(
+              codeartsAdapter,
+              account,
+              ctx,
+              subscription,
+              null,
+              '登录态可用但活动明细为空，活动福利按聚合口径展示',
+            );
+          }
+          return buildCodeArtsSnapshot(codeartsAdapter, account, ctx, subscription, detail);
+        } catch (error) {
+          const detailNote = `活动逐笔明细获取失败（登录态可能已失效），活动福利退回聚合口径：${(error as Error).message}`;
+          ctx.log(`CodeArts ${detailNote}`);
+          return buildCodeArtsSnapshot(codeartsAdapter, account, ctx, subscription, null, detailNote);
+        }
       } catch (error) {
         const message = (error as Error).message;
         if (authMode === 'aksk') {
@@ -351,17 +455,7 @@ export const codeartsAdapter: ProviderAdapter = {
     if (!cookie) return notConfigured(codeartsAdapter, account, ctx, ['cookie 或 accessKey/secretKey']);
 
     const timeoutMs = ctx.timeoutMs || CA_TIMEOUT_FALLBACK;
-    const cftk = optString(account, 'cftk') || cookieValue(cookie, CFTK_COOKIE_NAME);
-    const headers: Record<string, string> = {
-      Cookie: cookie,
-      Accept: 'application/json, text/plain, */*',
-      'Content-Type': 'application/json',
-      'x-requested-with': 'XMLHttpRequest',
-      'x-language': 'zh-cn',
-      'Accept-Language': 'zh-CN,zh;q=0.9',
-      Referer: `${CA_BASE}/portal/settings/personal-usage?locale=zh-cn`,
-      ...(cftk ? { cftk } : {}),
-    };
+    const headers = consoleHeaders(account, cookie);
     const stamp = (path: string): string => `${CA_BASE}${path}${path.includes('?') ? '&' : '?'}_=${Date.now()}`;
 
     try {
@@ -415,38 +509,9 @@ export const codeartsAdapter: ProviderAdapter = {
       let benefitTotal = 0;
 
       try {
-        const listResponse = await fetchJson(
-          stamp('/portal/promptcenter/v1/ops/credit/overview'),
-          { headers, timeoutMs },
-        );
-        assertBusinessOk(listResponse.body);
-        const campaigns = parseCampaignList(listResponse.body).slice(0, MAX_CAMPAIGNS);
-
-        for (const campaign of campaigns) {
-          const detailResponse = await fetchJson(
-            stamp(`/portal/promptcenter/v1/ops/credit/campaign/${campaign.id}`),
-            { headers, timeoutMs: Math.min(timeoutMs, 8_000) },
-          );
-          assertBusinessOk(detailResponse.body);
-          for (const benefit of parseCampaignBenefits(detailResponse.body)) {
-            benefitTotal += benefit.amount;
-            lots.push(
-              makeLot({
-                id: `codearts-campaign-${campaign.id}-${benefit.benefitId}`,
-                label: campaign.title,
-                amount: benefit.amount,
-                currency: 'CREDITS',
-                expiresAt: benefit.expiresAt,
-                note: [
-                  benefit.claimedAt ? `领取于 ${benefit.claimedAt.slice(0, 10)}` : '',
-                  benefit.validDuration ? `有效期 ${benefit.validDuration}` : '',
-                ]
-                  .filter(Boolean)
-                  .join('，'),
-              }),
-            );
-          }
-        }
+        const detail = await fetchCampaignBenefits(headers, timeoutMs, ctx);
+        benefitTotal = detail.benefitTotal;
+        lots.push(...detail.lots);
       } catch (error) {
         campaignNote = `活动明细获取失败，已退回聚合口径：${(error as Error).message}`;
         ctx.log(campaignNote);
