@@ -31,14 +31,27 @@ fi
 
 mkdir -p "$PROFILE"
 
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+LOG_DIR="$REPO_DIR/.run"
+CHROME_LOG="$LOG_DIR/chrome-debug.log"
+mkdir -p "$LOG_DIR"
+
 echo "调试 profile：$PROFILE"
 echo "调试端口：   http://127.0.0.1:$PORT"
+echo "日志：       $CHROME_LOG"
 
-exec "$CHROME" \
+# 后台常驻启动（nohup + disown）：
+#   华为云 codearts 的会话 `devclouddevuibjJ_SESSION_ID` 是「会话级 Cookie」，不落盘——
+#   Chrome 一旦退出，即使在同一个 profile 里也等于未登录，必须重新登录。
+#   因此这里不再 `exec`（那会让 Chrome 随终端一起结束），改为后台常驻。
+nohup "$CHROME" \
   --remote-debugging-port="$PORT" \
   --user-data-dir="$PROFILE" \
   --no-first-run \
   --no-default-browser-check \
   --disable-background-networking \
   --disable-features=Translate,OptimizationHints \
-  about:blank
+  about:blank >>"$CHROME_LOG" 2>&1 &
+disown 2>/dev/null || true
+
+echo "✓ 调试 Chrome 已在后台启动（关闭终端不影响它；需要退出时请直接关掉 Chrome 窗口）"
