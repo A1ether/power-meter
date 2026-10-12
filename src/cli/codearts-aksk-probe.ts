@@ -48,6 +48,21 @@ const PROBES: ProbeItem[] = [
     note: '验证身份上下文（domain/user）',
   },
   {
+    label: '活动逐笔（控制台原路径 + AK/SK 直签，探测免登录态可行性）',
+    url: 'https://codearts.huaweicloud.com/portal/promptcenter/v1/ops/credit/overview',
+    note: '控制台用 Cookie 调它；若 AK/SK 签名也能过，则逐笔明细可彻底摆脱登录态',
+  },
+  {
+    label: '活动逐笔（CLI 常量反推：`${base}/v1/ops/credit/usage` 同族）',
+    url: `${SNAP_ACCESS}/v1/ops/credit/overview`,
+    note: 'CLI 二进制里积分接口是 `${snap-access}/v1/ops/credit/usage`（无 snap-manager 前缀），探测同族 overview',
+  },
+  {
+    label: '活动逐笔（snap-access + promptcenter 前缀）',
+    url: `${SNAP_ACCESS}/promptcenter/v1/ops/credit/overview`,
+    note: '控制台服务名 + 网关根路径的组合，用于排除前缀差异',
+  },
+  {
     label: '套餐总览（同名假设，已排除）',
     url: `${SNAP_ACCESS}/snap-manager/v1/package/overview`,
     note: '控制台用的是 /portal/snap-manager/v1/package/overview，网关未发布该路由',

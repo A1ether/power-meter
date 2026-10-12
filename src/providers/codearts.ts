@@ -58,7 +58,7 @@ function withStamp(path: string): string {
 }
 
 /** 控制台 portal 请求头（Cookie + cftk 推导；缺 x-requested-with 会被网关当路由、返回 HTML） */
-function consoleHeaders(account: AccountConfig, cookie: string): Record<string, string> {
+export function consoleHeaders(account: AccountConfig, cookie: string): Record<string, string> {
   const cftk = optString(account, 'cftk') || cookieValue(cookie, CFTK_COOKIE_NAME);
   return {
     Cookie: cookie,
@@ -82,16 +82,25 @@ async function fetchCampaignBenefits(
   headers: Record<string, string>,
   timeoutMs: number,
   ctx: ProbeContext,
-): Promise<{ lots: CreditLot[]; benefitTotal: number }> {
+): Promise<{ lots: CreditLot[]; benefitTotal: number; campaignCount: number }> {
   const lots: CreditLot[] = [];
   let benefitTotal = 0;
   const listResponse = await fetchJson(withStamp('/portal/promptcenter/v1/ops/credit/overview'), {
     headers,
     timeoutMs,
   });
+  // 重要：会话失效时该接口返回「HTTP 200 + 空响应」，不报 401。
+  // 若当成「0 个活动」，就会把登录态过期误报成「当前没有进行中的活动」——
+  // 这里必须先识别空响应并明确抛错，让上层给出「重新抓取登录态」的提示。
+  if (!isRecord(listResponse.body)) {
+    throw new Error(
+      '控制台返回空响应（登录态已失效），请执行 npm run capture -- codearts 重新抓取',
+    );
+  }
   assertBusinessOk(listResponse.body);
+  const campaigns = parseCampaignList(listResponse.body).slice(0, MAX_CAMPAIGNS);
 
-  for (const campaign of parseCampaignList(listResponse.body).slice(0, MAX_CAMPAIGNS)) {
+  for (const campaign of campaigns) {
     const detailResponse = await fetchJson(
       withStamp(`/portal/promptcenter/v1/ops/credit/campaign/${campaign.id}`),
       { headers, timeoutMs: Math.min(timeoutMs, 8_000) },
@@ -116,8 +125,10 @@ async function fetchCampaignBenefits(
       );
     }
   }
-  ctx.log(`CodeArts 活动逐笔：${lots.length} 笔，合计 ${benefitTotal} 积分`);
-  return { lots, benefitTotal };
+  ctx.log(
+    `CodeArts 活动逐笔：活动 ${campaigns.length} 个，逐笔 ${lots.length} 笔，合计 ${benefitTotal} 积分`,
+  );
+  return { lots, benefitTotal, campaignCount: campaigns.length };
 }
 const CA_TIMEOUT_FALLBACK = 12_000;
 const CFTK_COOKIE_NAME = 'devclouddevuibjtcftk';
@@ -341,6 +352,9 @@ export const codeartsAdapter: ProviderAdapter = {
           timeoutMs,
         },
       );
+      if (!isRecord(body)) {
+        ctx.log('CodeArts 控制台按天用量返回空响应（登录态可能已失效），退回本地采样');
+      }
       const data = pick(body, 'data');
       const series = isRecord(data) ? pick(data, 'series') : undefined;
       const creditsSeries = Array.isArray(series)
@@ -371,19 +385,26 @@ export const codeartsAdapter: ProviderAdapter = {
         timeoutMs,
       });
       assertBusinessOk(body);
-      for (const campaign of parseCampaignList(body).slice(0, MAX_CAMPAIGNS)) {
-        const detail = await fetchJson(
-          withStamp(`/portal/promptcenter/v1/ops/credit/campaign/${campaign.id}`),
-          { headers, timeoutMs: Math.min(timeoutMs, 8_000) },
-        );
-        assertBusinessOk(detail.body);
-        for (const claim of parseCampaignClaims(detail.body)) {
-          const at = claim.claimedAt ? Date.parse(claim.claimedAt) : Number.NaN;
-          if (!Number.isFinite(at)) continue;
-          records.push({ at, kind: 'grant', amount: claim.amount });
+      const campaigns = parseCampaignList(body).slice(0, MAX_CAMPAIGNS);
+      if (campaigns.length === 0) {
+        // 「活动列表为空」不等于「该日没有获取」：全新积分体系下活动记录可能不在此接口，
+        // 若这里声明已覆盖，余额明明涨了 1000 也会被压成 0 —— 交给本地采样兜底。
+        ctx.log('CodeArts 活动列表为空，获取明细降级为本地采样');
+      } else {
+        for (const campaign of campaigns) {
+          const detail = await fetchJson(
+            withStamp(`/portal/promptcenter/v1/ops/credit/campaign/${campaign.id}`),
+            { headers, timeoutMs: Math.min(timeoutMs, 8_000) },
+          );
+          assertBusinessOk(detail.body);
+          for (const claim of parseCampaignClaims(detail.body)) {
+            const at = claim.claimedAt ? Date.parse(claim.claimedAt) : Number.NaN;
+            if (!Number.isFinite(at)) continue;
+            records.push({ at, kind: 'grant', amount: claim.amount });
+          }
         }
+        grantCovered = true;
       }
-      grantCovered = true;
     } catch (error) {
       ctx.log(`CodeArts 获取明细获取失败（退回本地采样）：${(error as Error).message}`);
     }
@@ -421,14 +442,11 @@ export const codeartsAdapter: ProviderAdapter = {
         try {
           const detail = await fetchCampaignBenefits(consoleHeaders(account, cookie), timeoutMs, ctx);
           if (detail.lots.length === 0) {
-            return buildCodeArtsSnapshot(
-              codeartsAdapter,
-              account,
-              ctx,
-              subscription,
-              null,
-              '登录态可用但活动明细为空，活动福利按聚合口径展示',
-            );
+            const reason =
+              detail.campaignCount === 0
+                ? '登录态可用，但活动列表为空（当前没有进行中的活动），活动福利按聚合口径展示'
+                : `活动列表有 ${detail.campaignCount} 个但无剩余逐笔，活动福利按聚合口径展示`;
+            return buildCodeArtsSnapshot(codeartsAdapter, account, ctx, subscription, null, reason);
           }
           return buildCodeArtsSnapshot(codeartsAdapter, account, ctx, subscription, detail);
         } catch (error) {

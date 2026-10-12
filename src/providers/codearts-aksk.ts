@@ -5,10 +5,12 @@ import type { AccountConfig } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
 import {
   buildSnapshot,
+  hiddenLotsNote,
   joinNotes,
   makeLot,
   makeWindow,
   optString,
+  splitByExpiry,
   type ProbeContext,
   type ProviderAdapter,
 } from './base.js';
@@ -251,13 +253,18 @@ export function buildCodeArtsSnapshot(
     expiresAt: subscription.periodEnd,
   });
 
+  // 与 Cookie 路径保持一致：已过期批次不再逐条展示，只汇总成一句提示
+  // （逐笔明细里可能残留「已过期但上游尚未结清」的记录，直接列出会被误读成可用额度）
+  const { active, expired } = splitByExpiry(lots, ctx.now);
+  const detailCount = detail?.lots.length ?? 0;
+
   return buildSnapshot({
     adapter,
     account,
     status: 'ok',
     now: ctx.now,
     balance: { amount: total.remain, currency: 'CREDITS' },
-    credits: lots,
+    credits: active,
     windows: [window],
     note: joinNotes(
       subscription.packageName
@@ -267,9 +274,10 @@ export function buildCodeArtsSnapshot(
         ? '套餐状态非 normal，请到码道控制台检查订阅'
         : null,
       total.expiring > 0 ? `有 ${total.expiring} 积分临近过期` : null,
-      detail && detail.lots.length > 0
-        ? `活动福利：登录态逐笔口径（${detail.lots.length} 笔）`
+      detailCount > 0
+        ? `活动福利：登录态逐笔口径（取到 ${detailCount} 笔）`
         : '活动福利：聚合口径',
+      hiddenLotsNote(expired),
       extraNote,
       subscription.periodStart && subscription.periodEnd
         ? `计费周期 ${subscription.periodStart.slice(0, 10)} ~ ${subscription.periodEnd.slice(0, 10)}`

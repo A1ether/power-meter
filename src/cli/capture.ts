@@ -30,9 +30,41 @@ const DISCOVER = ARGS.includes('--discover');
 
 // ---------------------------------------------------------------- playwright-cli 封装
 
+/**
+ * 解析 playwright CLI：优先全局 `playwright-cli`；缺失时退回
+ * `npx --no-install playwright cli`（Playwright ≥1.56 自带同一套命令）。
+ * 这样无需全局安装 @playwright/cli 也能抓取，减少环境依赖带来的失败。
+ */
+let resolvedCli: { bin: string; prefix: string[] } | null = null;
+
+function resolvePwCli(): { bin: string; prefix: string[] } {
+  if (resolvedCli) return resolvedCli;
+  const candidates: Array<{ bin: string; prefix: string[] }> = [
+    { bin: 'playwright-cli', prefix: [] },
+    { bin: 'npx', prefix: ['--no-install', 'playwright', 'cli'] },
+  ];
+  for (const candidate of candidates) {
+    try {
+      execFileSync(candidate.bin, [...candidate.prefix, '--help'], {
+        stdio: 'ignore',
+        timeout: 30_000,
+      });
+      resolvedCli = candidate;
+      return candidate;
+    } catch {
+      // 试下一个候选
+    }
+  }
+  throw new Error(
+    '未找到 playwright CLI。请任选其一：安装全局 @playwright/cli（npm install -g @playwright/cli@latest），' +
+      '或确保本机 `npx playwright cli --help` 可用。',
+  );
+}
+
 function pw(args: string[], allowFailure = false): string {
+  const cli = resolvePwCli();
   try {
-    return execFileSync('playwright-cli', ['-s=' + SESSION, ...args], {
+    return execFileSync(cli.bin, [...cli.prefix, '-s=' + SESSION, ...args], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 120_000,
@@ -40,7 +72,7 @@ function pw(args: string[], allowFailure = false): string {
   } catch (error) {
     if (allowFailure) return '';
     const stderr = (error as { stderr?: string }).stderr ?? '';
-    throw new Error(`playwright-cli ${args.join(' ')} 失败：${stderr || (error as Error).message}`);
+    throw new Error(`playwright CLI ${args.join(' ')} 失败：${stderr || (error as Error).message}`);
   }
 }
 
