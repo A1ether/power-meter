@@ -4,14 +4,16 @@
 #
 # 背景（决定了本脚本的策略）：
 #   - 余额走 AK/SK（永久有效），本脚本与它无关；
-#   - 「活动福利逐笔」只能来自控制台登录态，而 codearts 的会话 Cookie
-#     `devclouddevuibjJ_SESSION_ID` 是**会话级**（不落盘）：Chrome 一旦退出，
-#     即使 profile 未变，也等于未登录 —— 所以调试 Chrome 必须常驻（见 tools/chrome-debug.sh）。
+#   - 「活动福利逐笔」只能来自控制台登录态；codearts 的会话 Cookie
+#     `devclouddevuibjJ_SESSION_ID` 是**会话级**（不落盘），但这不影响使用：
+#     `.env` 里存着它的副本，才是真正的持久存储 —— **关闭 Chrome 不影响看板**，
+#     浏览器只在「需要重新取一次 Cookie」时才用得上，用完即可关闭。
 #
 # 流程（先验证、后抓取，尽量不打扰人）：
 #   ① 校验 .env 里现有 Cookie：有效 → 只做「顺手续期」，浏览器侧没会话也不要求登录；
 #   ② 现有 Cookie 失效且浏览器侧有会话 → 抓取刷新；
-#   ③ 两边都没有 → 自动打开登录页 + 系统通知，退出码 3（这时才真的需要登录一次）。
+#   ③ 都没有 → 先打开用量页尝试华为云 SSO「静默重登」（账号长期登录态还在，
+#      多数情况无需输密码）→ 成功即自动抓取；仍不行才打开登录页 + 系统通知，退出码 3。
 #
 # 退出码：0 有效（已续期或现有仍可用）/ 3 需要人工登录 / 2 调试 Chrome 不可用 / 1 抓取失败
 #
@@ -100,8 +102,9 @@ if env_cookie_valid; then
       echo "[refresh] ⚠ 抓取续期失败，但现有 Cookie 仍有效，看板不受影响"
     fi
   else
-    echo "[refresh] ② 浏览器侧没有会话（调试 Chrome 重启过或未登录）：本次不做抓取"
-    echo "[refresh]    现有 Cookie 仍有效；等它过期后再登录一次即可（余额始终来自 AK/SK）"
+    echo "[refresh] ② 浏览器侧没有会话（Chrome 关过或未登录）：本次不做抓取，也不需要开浏览器"
+    echo "[refresh]    .env 里的 Cookie 就是持久副本，关 Chrome 不影响看板；"
+    echo "[refresh]    等它过期后，脚本会自动打开用量页尝试 SSO 静默重登"
   fi
   exit 0
 fi
@@ -129,11 +132,29 @@ if chrome_has_session; then
   show_probe_tail
 fi
 
-echo "[refresh] ⚠ 浏览器里没有有效登录态：需要登录一次"
+# ③ 尝试华为云 SSO 静默重登：账号级登录态（auth.huaweicloud.com 的刷新令牌）是长期有效的，
+#    打开用量页后通常无需输密码即可重新拿到 codearts 会话。
+echo "[refresh] ③ 打开用量页，等待华为云 SSO 静默重登（多数情况无需输密码）…"
 open_login_page
-echo "[refresh]    已在调试 Chrome 打开登录页：${LOGIN_URL}"
-echo "[refresh]    登录后重跑：npm run codearts:refresh"
-echo "[refresh]    说明：华为云会话上限 24 小时且会话 Cookie 不落盘，这一步无法用程序绕过；"
+for i in $(seq 1 4); do
+  sleep 5
+  if chrome_has_session; then
+    echo "[refresh] ✓ SSO 已静默恢复会话（等待 $((i * 5))s），抓取中…"
+    if capture_codearts && env_cookie_valid; then
+      echo "[refresh] ✓ 已刷新登录态；看板下次刷新即显示活动逐笔（Chrome 现在可以关掉了）"
+      notify "登录态已自动恢复，活动逐笔正常"
+      exit 0
+    fi
+    echo "[refresh] ⚠ SSO 恢复后抓取/校验仍失败："
+    show_probe_tail
+    break
+  fi
+done
+
+echo "[refresh] ⚠ 需要人工登录一次（已在调试 Chrome 打开页面）"
+echo "[refresh]    ${LOGIN_URL}"
+echo "[refresh]    登录后重跑：npm run codearts:refresh（之后可以正常关闭 Chrome）"
+echo "[refresh]    说明：这一步是华为云服务端会话过期的硬边界，无法用程序绕过；"
 echo "[refresh]    但余额与增量不依赖它，看板其余部分照常。"
 notify "登录态已过期，需要登录一次（余额不受影响）"
 exit 3

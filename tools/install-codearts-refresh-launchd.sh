@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 #
-# 安装 / 卸载 CodeArts 相关 launchd 定时任务（macOS LaunchAgent）。
+# 安装 / 卸载 CodeArts 登录态刷新定时任务（macOS launchd LaunchAgent）。
 #
-# 安装两个任务：
-#   ① com.powermeter.chrome-debug      —— 登录时启动「调试 Chrome」并常驻。
-#      必要性：codearts 的会话 Cookie（devclouddevuibjJ_SESSION_ID）是**会话级、不落盘**，
-#      Chrome 一退出就等于退出登录；让 Chrome 常驻是「不用反复登录」的前提。
-#   ② com.powermeter.codearts-refresh  —— 每天 09:30 / 21:30 执行 tools/codearts-refresh.sh：
-#      先校验 .env 里现有 Cookie，只有真的失效且浏览器无会话时才提醒登录（并弹系统通知）。
+# 任务：com.powermeter.codearts-refresh —— 每天 09:30 / 21:30 执行 tools/codearts-refresh.sh：
+#   ① 校验 .env 里现有 Cookie（有效就不打扰你，也不需要开浏览器）；
+#   ② 失效时先尝试打开用量页让华为云 SSO 静默重登，成功即自动抓取；
+#   ③ 真的需要人工登录时才弹系统通知并打开登录页。
+#
+# 说明：**不需要让调试 Chrome 常驻** —— codearts 的会话 Cookie 已由 .env 持有，
+#       关掉 Chrome 不影响看板；浏览器只在「需要重新取一次 Cookie」时才用得上。
 #
 # 用法：
 #   bash tools/install-codearts-refresh-launchd.sh              # 安装（幂等）
-#   bash tools/install-codearts-refresh-launchd.sh --status     # 查看两个任务状态
+#   bash tools/install-codearts-refresh-launchd.sh --status     # 查看状态
 #   bash tools/install-codearts-refresh-launchd.sh --run        # 立即跑一次刷新
-#   bash tools/install-codearts-refresh-launchd.sh --uninstall  # 卸载两个任务
+#   bash tools/install-codearts-refresh-launchd.sh --uninstall  # 卸载
 #
 set -uo pipefail
 
@@ -21,10 +22,10 @@ UID_NUM="$(id -u)"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 LOG_DIR="$PROJECT_DIR/.run"
-FRESH_LABEL="com.powermeter.codearts-refresh"
-CHROME_LABEL="com.powermeter.chrome-debug"
-FRESH_PLIST="$PLIST_DIR/${FRESH_LABEL}.plist"
-CHROME_PLIST="$PLIST_DIR/${CHROME_LABEL}.plist"
+LABEL="com.powermeter.codearts-refresh"
+PLIST="$PLIST_DIR/${LABEL}.plist"
+LEGACY_LABEL="com.powermeter.chrome-debug"
+LEGACY_PLIST="$PLIST_DIR/${LEGACY_LABEL}.plist"
 PATH_VALUE="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 if [ "$(uname -s)" != "Darwin" ]; then
@@ -32,50 +33,43 @@ if [ "$(uname -s)" != "Darwin" ]; then
   exit 1
 fi
 
-write_plist() {
-  local target="$1"
-  shift
-  cat > "$target"
+# 清理历史版本留下的「调试 Chrome 常驻」任务（该方案已废弃）
+cleanup_legacy() {
+  if [ -f "$LEGACY_PLIST" ]; then
+    launchctl bootout "gui/${UID_NUM}/${LEGACY_LABEL}" 2>/dev/null || true
+    rm -f "$LEGACY_PLIST"
+    echo "[install] 已移除历史任务：${LEGACY_LABEL}"
+  fi
 }
 
-install_jobs() {
-  mkdir -p "$PLIST_DIR" "$LOG_DIR"
+case "${1:-install}" in
+  --status)
+    if launchctl print "gui/${UID_NUM}/${LABEL}" >/dev/null 2>&1; then
+      launchctl print "gui/${UID_NUM}/${LABEL}" | grep -E "state|runs|last exit" || true
+    else
+      echo "未安装（${LABEL}）"
+    fi
+    ;;
+  --run)
+    launchctl kickstart -k "gui/${UID_NUM}/${LABEL}"
+    echo "已触发一次刷新；日志：${LOG_DIR}/codearts-refresh.log"
+    ;;
+  --uninstall)
+    launchctl bootout "gui/${UID_NUM}/${LABEL}" 2>/dev/null || true
+    rm -f "$PLIST"
+    echo "已卸载：${LABEL}"
+    cleanup_legacy
+    ;;
+  install|--install)
+    cleanup_legacy
+    mkdir -p "$PLIST_DIR" "$LOG_DIR"
 
-  # ① 调试 Chrome 常驻（登录时启动；用户手动关掉后不强行拉起）
-  write_plist "$CHROME_PLIST" <<PLIST_EOF
+    cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>${CHROME_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/bash</string>
-    <string>${PROJECT_DIR}/tools/chrome-debug.sh</string>
-    <string>9222</string>
-  </array>
-  <key>WorkingDirectory</key><string>${PROJECT_DIR}</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><false/>
-  <key>StandardOutPath</key><string>${LOG_DIR}/chrome-debug.log</string>
-  <key>StandardErrorPath</key><string>${LOG_DIR}/chrome-debug.log</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key><string>${PATH_VALUE}</string>
-  </dict>
-  <key>AbandonProcessGroup</key><true/>
-  <key>ProcessType</key><string>Background</string>
-</dict>
-</plist>
-PLIST_EOF
-
-  # ② 登录态刷新（每天 09:30 / 21:30）
-  write_plist "$FRESH_PLIST" <<PLIST_EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>${FRESH_LABEL}</string>
+  <key>Label</key><string>${LABEL}</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
@@ -101,48 +95,17 @@ PLIST_EOF
 </plist>
 PLIST_EOF
 
-  for label in "$CHROME_LABEL" "$FRESH_LABEL"; do
-    plist="$PLIST_DIR/${label}.plist"
-    launchctl bootout "gui/${UID_NUM}/${label}" 2>/dev/null || true
-    if ! launchctl bootstrap "gui/${UID_NUM}" "$plist" 2>/dev/null; then
-      echo "[install] bootstrap 失败（${label}），改用 launchctl load -w"
-      launchctl load -w "$plist"
+    launchctl bootout "gui/${UID_NUM}/${LABEL}" 2>/dev/null || true
+    if ! launchctl bootstrap "gui/${UID_NUM}" "$PLIST" 2>/dev/null; then
+      echo "[install] bootstrap 失败，改用 launchctl load -w"
+      launchctl load -w "$PLIST"
     fi
-  done
 
-  echo "✓ 已安装两个 launchd 任务"
-  echo "  ① ${CHROME_LABEL}：登录时启动调试 Chrome 并常驻（会话 Cookie 才留得住）"
-  echo "     文件：${CHROME_PLIST}"
-  echo "  ② ${FRESH_LABEL}：每天 09:30 / 21:30 刷新登录态（先校验，过期才提醒登录）"
-  echo "     文件：${FRESH_PLIST}"
-  echo "  日志：${LOG_DIR}/{chrome-debug,codearts-refresh}.log"
-  echo "  校验：bash tools/install-codearts-refresh-launchd.sh --status"
-}
-
-case "${1:-install}" in
-  --status)
-    for label in "$CHROME_LABEL" "$FRESH_LABEL"; do
-      if launchctl print "gui/${UID_NUM}/${label}" >/dev/null 2>&1; then
-        echo "== ${label} =="
-        launchctl print "gui/${UID_NUM}/${label}" | grep -E "state|runs|last exit" || true
-      else
-        echo "== ${label} == 未安装"
-      fi
-    done
-    ;;
-  --run)
-    launchctl kickstart -k "gui/${UID_NUM}/${FRESH_LABEL}"
-    echo "已触发一次刷新；日志：${LOG_DIR}/codearts-refresh.log"
-    ;;
-  --uninstall)
-    for label in "$FRESH_LABEL" "$CHROME_LABEL"; do
-      launchctl bootout "gui/${UID_NUM}/${label}" 2>/dev/null || true
-      rm -f "$PLIST_DIR/${label}.plist"
-      echo "已卸载：${label}"
-    done
-    ;;
-  install|--install)
-    install_jobs
+    echo "✓ 已安装定时任务：${LABEL}"
+    echo "  触发：每天 09:30 / 21:30（睡眠错过后唤醒补跑）"
+    echo "  行为：先校验 .env Cookie → 失效才尝试 SSO 静默重登 → 仍不行才提醒登录"
+    echo "  日志：${LOG_DIR}/codearts-refresh.log"
+    echo "  说明：关掉 Chrome 不影响看板；不需要让浏览器常驻。"
     ;;
   *)
     echo "未知参数：$1（支持 --install / --status / --run / --uninstall）" >&2

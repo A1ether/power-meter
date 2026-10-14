@@ -40,10 +40,10 @@ echo "调试 profile：$PROFILE"
 echo "调试端口：   http://127.0.0.1:$PORT"
 echo "日志：       $CHROME_LOG"
 
-# 后台常驻启动（nohup + disown）：
-#   华为云 codearts 的会话 `devclouddevuibjJ_SESSION_ID` 是「会话级 Cookie」，不落盘——
-#   Chrome 一旦退出，即使在同一个 profile 里也等于未登录，必须重新登录。
-#   因此这里不再 `exec`（那会让 Chrome 随终端一起结束），改为后台常驻。
+# 后台启动（nohup + disown）：
+#   不再 `exec`（那会让终端被 Chrome 占住，且关终端即关浏览器）。
+#   这样命令立即返回、关终端也不影响它；**是否关闭这个 Chrome 由你决定**——
+#   华为云会话 Cookie 的持久副本存在 `.env` 里，关掉浏览器不影响看板取数。
 nohup "$CHROME" \
   --remote-debugging-port="$PORT" \
   --user-data-dir="$PROFILE" \
