@@ -1,5 +1,5 @@
 import type { AccountConfig } from '../config.js';
-import type { ProviderAdapter } from './base.js';
+import type { ManageFieldDescriptor, ProviderAdapter } from './base.js';
 import { codeartsAdapter } from './codearts.js';
 import { codebuddyAdapter } from './codebuddy.js';
 import { a1etheropenaiAdapter } from './a1etheropenai.js';
@@ -84,6 +84,16 @@ export function describeRegistry(): Array<{
   credentialHint: string;
   requiredCredentialKeys: string[];
   isDemo: boolean;
+  /**
+   * 以下四项是「添加 / 删除账号」区的前端依赖：
+   * 前端只按声明渲染，不认平台名（见 public/app.js 的 renderManage）。
+   */
+  groupAccounts: boolean;
+  manageAccounts: boolean;
+  manageFields: ManageFieldDescriptor[];
+  manageHint: string;
+  /** 「扫码 / 打开链接登录」入口；未声明为 null（前端据此决定是否渲染） */
+  login: { label: string; hint: string; qr: boolean } | null;
 }> {
   return listAdapters()
     .map((adapter) => ({
@@ -94,6 +104,13 @@ export function describeRegistry(): Array<{
       credentialHint: adapter.credentialHint,
       requiredCredentialKeys: adapter.requiredCredentialKeys,
       isDemo: adapter.id.startsWith('demo:'),
+      groupAccounts: adapter.groupAccounts === true,
+      manageAccounts: adapter.manageAccounts === true,
+      manageFields: adapter.manageFields ?? [],
+      manageHint: adapter.manageHint ?? '',
+      login: adapter.login
+        ? { label: adapter.login.label, hint: adapter.login.hint, qr: adapter.login.qr }
+        : null,
     }))
     .sort((a, b) => Number(a.isDemo) - Number(b.isDemo) || a.id.localeCompare(b.id));
 }

@@ -17,6 +17,106 @@ export interface ProbeContext {
   now: number;
   timeoutMs: number;
   log: (message: string, extra?: Record<string, unknown>) => void;
+  /**
+   * 令牌刷新后写回 `.env`（由编排层注入；账号添加/登录验证时不注入）。
+   *
+   * 只有「账号已经在 accounts.json 里、且凭证是 `${VAR}` 引用」时才会真正落盘；
+   * 写回失败不阻断本次探测，只是下次刷新会再试一遍。
+   */
+  persistCredentials?: (patch: Record<string, string>) => Promise<void>;
+}
+
+/**
+ * 看板 / CLI「添加账号」表单里的一个输入项。
+ *
+ * `key` 必须是该平台 credentials 里的键（如 codebuddy 的 `cookie`、
+ * a1etheropenai 的 `apiKey`），这样表单收集到的值可以直接当凭证用。
+ */
+export interface ManageFieldDescriptor {
+  key: string;
+  label: string;
+  placeholder?: string;
+  /** 输入框下方的补充说明（可选） */
+  hint?: string;
+  /** 是否必填，默认 true */
+  required?: boolean;
+  /** 长文本（Cookie 可达数 KB）→ 渲染成 textarea */
+  multiline?: boolean;
+  /** 默认 true：输入框用 password 类型，避免明文贴在屏幕上 */
+  secret?: boolean;
+  /**
+   * 写入目标，默认 `credential`：
+   *   - `credential`：写进 accounts.json 的 `credentials`，占 `.env` 槽位、参与掩码预览；
+   *   - `option`：写进 `options`（如 Qoder 的站点选择 `site`），属非敏感配置，
+   *     不占 `.env` 槽位、不进掩码预览；表单里的取值会被校验必须在 `choices` 内。
+   */
+  target?: 'credential' | 'option';
+  /** 候选项：非空时前端渲染成下拉框（目前只对 target: 'option' 有意义） */
+  choices?: string[];
+  /** 下拉框的默认选中项，同时也是「未提供该选项时」写入 options 的值 */
+  defaultValue?: string;
+}
+
+/* ------------------------------------------------------------------ *
+ * 「扫码 / 打开链接登录」契约
+ * ------------------------------------------------------------------ */
+
+export interface LoginStartInput {
+  now: number;
+  timeoutMs: number;
+  /** 登录会话 id：Trae 用它拼回调地址（`/authorize?lt=<sessionId>`） */
+  sessionId: string;
+  /** 服务自身的回环基址，如 `http://127.0.0.1:48213` */
+  callbackBase: string;
+  /** 非敏感选项（目前只用于站点选择，登录固定 cn） */
+  options: Record<string, string>;
+  log: (message: string) => void;
+}
+
+export interface LoginStartResult {
+  /** 用户在浏览器 / 手机上打开的授权页 */
+  authUrl: string;
+  /** 该链接能否跨设备扫码（Trae 的本地回调不能） */
+  qr: boolean;
+  ttlMs: number;
+  hint?: string;
+  /** 协议私有状态（state / PKCE verifier / 设备私钥），只留在服务端内存 */
+  secret: unknown;
+}
+
+export type LoginPollResult =
+  | { status: 'waiting'; message?: string }
+  | { status: 'failed'; message: string }
+  | {
+      status: 'ready';
+      /** 平台账号身份：id 用于去重（同一账号重复登录 → 更新原条目） */
+      account: { id: string; name: string };
+      /** 明文凭证，由登录会话层写入 `.env`（0600） */
+      credentials: Record<string, string>;
+      /** 非敏感配置，写入 accounts.json 的 options */
+      options: Record<string, string>;
+      message?: string;
+    };
+
+/**
+ * 平台登录能力。声明了它，看板卡片上就会出现「扫码 / 打开链接登录」入口；
+ * 未声明的平台行为完全不变（继续用手工 Cookie 表单）。
+ */
+export interface ProviderLogin {
+  /** 按钮文案，如「扫码登录」 */
+  label: string;
+  hint: string;
+  /** 该链接是否支持手机扫码（Trae 为 false） */
+  qr: boolean;
+  /** 服务端轮询上游的间隔，默认 2000ms */
+  intervalMs?: number;
+  start(input: LoginStartInput): Promise<LoginStartResult>;
+  poll(secret: unknown, ctx: ProbeContext): Promise<LoginPollResult>;
+  /**
+   * 接收浏览器回调（Trae 的 `/authorize`）。返回 true 表示已接收；
+   * 收到的内容由适配器自己存进 `secret`，供后续 `poll()` 消费。
+   */
+  handleCallback?(secret: unknown, query: URLSearchParams): boolean | Promise<boolean>;
 }
 
 /**
@@ -30,8 +130,14 @@ export interface ProviderAdapter {
   dashboardUrl: string;
   /** 平台用量页地址：卡片「每日用量」区点击跳转目标（见 src/types.ts 的 usageUrl），没有写空串 */
   usageUrl: string;
-  /** 需要哪些凭证 key，缺失即 notConfigured */
+  /** 需要哪些凭证 key，缺失即 notConfigured（未声明 isConfigured 时生效） */
   requiredCredentialKeys: string[];
+  /**
+   * 凭证完整度判断。同一平台可能支持多种凭证形态（Cookie / 登录令牌），
+   * `requiredCredentialKeys` 表达不了「A 或 B」，由适配器自己判断。
+   * 未声明时回退 `requiredCredentialKeys`（见 src/account-store.ts）。
+   */
+  isConfigured?: (account: AccountConfig) => boolean;
   credentialHint: string;
   /**
    * 把这个平台的所有账号并进**一张卡片**（每个账号成为卡片里的一条 entry）。
@@ -55,6 +161,32 @@ export interface ProviderAdapter {
    * 声明开关 + 提供对应接口即可。
    */
   manageAccounts?: boolean;
+  /**
+   * 「添加账号」表单的字段声明（配合 manageAccounts 使用）。
+   *
+   * 只声明 manageAccounts 而不声明字段 = 仍走该平台自己的专用实现
+   * （A1etherOpenAi 就是这样：它有两把密钥与项目密钥验证等额外语义）；
+   * 两者都声明 = 接入平台无关的通用增删实现（见 src/account-store.ts）。
+   */
+  manageFields?: ManageFieldDescriptor[];
+  /** 表单底部的提示文案（如「Cookie 会先验证，通过了才写入本机配置」） */
+  manageHint?: string;
+  /**
+   * 「扫码 / 打开链接登录」能力。声明后前端在管理区顶部展示登录入口，
+   * 手工凭证表单折叠为兜底；未声明则只显示原表单。
+   */
+  login?: ProviderLogin;
+  /**
+   * credentials 的键 → .env 变量名前缀。
+   * 默认推导为 `${PROVIDER_ID}_${KEY}`（如 codebuddy 的 cookie → CODEBUDDY_COOKIE），
+   * 与历史约定不符的平台（如 codearts 的 accessKey → CODEARTS_AK）在这里显式声明。
+   * 第 N 个账号的槽位写成 `<前缀>_N`（N≥2）。
+   *
+   * 也可以传函数：同一平台的不同账号可能落在不同站点（如 Qoder 的 `options.site`），
+   * 变量前缀随之变化（cn → `QODER_COOKIE`，global → `QODER_GLOBAL_COOKIE`）。
+   * 传入的是该账号**即将写入**的 options（添加时来自表单，登录时来自登录结果）。
+   */
+  envNames?: Record<string, string> | ((options: Record<string, string>) => Record<string, string>);
   /**
    * 声明哪些凭证允许在看板上「显示 / 复制」。不声明即整条链路关闭：
    * 快照不带 secrets，`/api/reveal` 也会拒绝该 key。

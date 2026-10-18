@@ -11,6 +11,7 @@
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
     "probe": "tsx src/cli/probe.ts",
+    "account": "tsx src/cli/account.ts",
     "a1etheropenai:add": "tsx src/cli/a1etheropenai-add.ts",
     "capture": "tsx src/cli/capture.ts",
     "codearts:aksk-probe": "tsx src/cli/codearts-aksk-probe.ts",

@@ -10,6 +10,12 @@
  *   - 通过 playwright-cli 与调试 Chrome 通信，不引入任何运行时依赖
  *   - 凭证只写入本地 .env（已 gitignore），终端输出一律脱敏
  *   - 详细报告写入 .playwright-cli/capture-report.md（同样不提交）
+ *   - 多账号：`--slot 2` 把抓到的凭证写进带 `_2` 后缀的变量
+ *     （如 CODEBUDDY_COOKIE_2），因此不会覆盖槽位 1 的账号；
+ *     抓完再用 `npm run account -- --provider <平台> --env <变量名>` 注册成账号。
+ *   - 多站点：`--site global` 抓国际站（目前仅 Qoder 支持 cn / global），
+ *     国际站凭证写入 QODER_GLOBAL_COOKIE，与国内站的 QODER_COOKIE 互不覆盖；
+ *     注册时带上同一参数：npm run account -- --provider qoder --site global。
  *
  * 踩坑记录（务必保留）：
  *   Cookie 必须按「域可覆盖」收集——请求 www.codebuddy.cn 时，
@@ -27,6 +33,27 @@ const REPORT_PATH = resolve(process.cwd(), '.playwright-cli/capture-report.md');
 const ARGS = process.argv.slice(2);
 const DRY_RUN = ARGS.includes('--dry-run');
 const DISCOVER = ARGS.includes('--discover');
+
+/**
+ * `--slot N`：多账号槽位。缺省 1 = 写原有的 `*_COOKIE`（历史行为不变）；
+ * N≥2 = 所有变量名加 `_N` 后缀，用于第二个及以后的账号。
+ */
+const SLOT_INDEX = ARGS.indexOf('--slot');
+/** `--slot` 后面那个数字的位置（没有 --slot 时为 -1，不能误当成普通位置参数） */
+const SLOT_VALUE_INDEX = SLOT_INDEX >= 0 ? SLOT_INDEX + 1 : -1;
+const SLOT_RAW = SLOT_VALUE_INDEX >= 0 ? Number.parseInt(ARGS[SLOT_VALUE_INDEX] ?? '', 10) : 1;
+const SLOT = Number.isFinite(SLOT_RAW) && SLOT_RAW >= 1 ? SLOT_RAW : 1;
+/** 槽位 1 沿用原变量名（历史约定），N≥2 追加 `_N` */
+const SLOT_SUFFIX = SLOT >= 2 ? `_${SLOT}` : '';
+
+/**
+ * `--site <id>`：多站点平台的站点选择（Qoder：cn / global）。
+ * 目标声明了 `siteVariants` 且含该站点时，用变体覆盖 envKey / usageUrl / apiHost 等；
+ * 未声明变体的平台不受影响（照常抓取）。
+ */
+const SITE_INDEX = ARGS.indexOf('--site');
+const SITE_VALUE_INDEX = SITE_INDEX >= 0 ? SITE_INDEX + 1 : -1;
+const SITE = SITE_INDEX >= 0 ? (ARGS[SITE_VALUE_INDEX] ?? '').trim().toLowerCase() : '';
 
 // ---------------------------------------------------------------- playwright-cli 封装
 
@@ -162,6 +189,18 @@ interface Target {
     /** 各字段写入 .env 的变量名 */
     envKeys: { userId: string; opTicket: string; paramToken: string; uuid: string };
   };
+  /**
+   * 站点变体（多站点平台）：`--site <id>` 时覆盖 envKey / usageUrl / apiHost / cookieSites / label。
+   * Qoder 用它区分国内站（qoder.com.cn）与国际站（qoder.com）——国际站的 Cookie 必须
+   * 落到 `QODER_GLOBAL_COOKIE`，且抓取时打开的是 qoder.com 的用量页。
+   */
+  siteVariants?: Record<string, Partial<Omit<Target, 'id' | 'siteVariants'>>>;
+  /**
+   * 变体附带的账号注册参数：slot ≥2 抓完后会提示「下一步注册命令」，
+   * 这里声明的键值会拼进命令（如 `{ site: "global" }` → `--site global`），
+   * 否则国际站账号会被注册成默认的国内站。
+   */
+  optionFlags?: Record<string, string>;
 }
 
 const TARGETS: Target[] = [
@@ -172,6 +211,18 @@ const TARGETS: Target[] = [
     cookieSites: ['qoder.com.cn', 'qoder.cn', 'qoder.com'],
     usageUrl: 'https://qoder.com.cn/account/usage',
     apiHost: 'qoder.com.cn',
+    // 国内站 = 上面的默认取值（--site cn 与不带 --site 等价）；
+    // 国际站必须把 Cookie 单独放到 QODER_GLOBAL_COOKIE，两个站点的登录态互不覆盖
+    siteVariants: {
+      global: {
+        label: 'Qoder 国际站',
+        envKey: 'QODER_GLOBAL_COOKIE',
+        cookieSites: ['qoder.com'],
+        usageUrl: 'https://qoder.com/account/usage',
+        apiHost: 'qoder.com',
+        optionFlags: { site: 'global' },
+      },
+    },
   },
   {
     id: 'trae',
@@ -623,8 +674,17 @@ function main(): void {
   const pool = parseCookieList(pw(['--raw', 'cookie-list'], true));
   console.log(`浏览器中现有 Cookie：${pool.length} 个\n`);
 
-  const only = ARGS.filter((arg) => !arg.startsWith('--'));
+  // 位置参数 = 平台 id（`--slot 2` 的 2、`--site global` 的 global 都不是平台 id，要排掉）
+  const only = ARGS.filter(
+    (arg, index) => !arg.startsWith('--') && index !== SLOT_VALUE_INDEX && index !== SITE_VALUE_INDEX,
+  );
   const targets = only.length > 0 ? TARGETS.filter((t) => only.includes(t.id)) : TARGETS;
+  if (SLOT_SUFFIX) {
+    console.log(`多账号槽位：${SLOT}（变量名追加 ${SLOT_SUFFIX}，不会覆盖槽位 1）\n`);
+  }
+  if (SITE) {
+    console.log(`站点选择：${SITE}（仅对声明了该站点变体的平台生效）\n`);
+  }
 
   const results: Result[] = [];
   const envEntries = new Map<string, string>();
@@ -638,13 +698,33 @@ function main(): void {
     console.log('\u001b[33m未能读取浏览器 User-Agent，将使用内置默认值\u001b[0m\n');
   }
 
-  for (const target of targets) {
+  for (const baseTarget of targets) {
+    // `--site` 只对声明了站点变体的平台生效；声明了但不支持该站点 → 跳过并说明可选项
+    let target = baseTarget;
+    if (SITE && baseTarget.siteVariants) {
+      const variant = baseTarget.siteVariants[SITE];
+      if (!variant) {
+        const available = ['cn', ...Object.keys(baseTarget.siteVariants)].join(' / ');
+        console.log(
+          `\n\u001b[33m– ${baseTarget.label} 已跳过\u001b[0m：不支持 --site ${SITE}（可用 ${available}）`,
+        );
+        results.push({
+          target: baseTarget,
+          status: 'skipped',
+          message: `--site ${SITE} 不受支持（可用 ${available}）`,
+          cookieCount: 0,
+        });
+        continue;
+      }
+      target = { ...baseTarget, ...variant };
+    }
     try {
       const result = captureTarget(target, pool);
       results.push(result);
       if (result.status === 'ok') {
-        if (result.value) envEntries.set(target.envKey, result.value);
-        for (const extra of result.extraEnv ?? []) envEntries.set(extra.key, extra.value);
+        // 槽位后缀只作用于该平台的凭证变量，HTTP_USER_AGENT 这类全局变量不带后缀
+        if (result.value) envEntries.set(`${target.envKey}${SLOT_SUFFIX}`, result.value);
+        for (const extra of result.extraEnv ?? []) envEntries.set(`${extra.key}${SLOT_SUFFIX}`, extra.value);
       }
     } catch (error) {
       console.log(`  \u001b[31m失败\u001b[0m ${(error as Error).message}`);
@@ -725,6 +805,26 @@ function main(): void {
     console.log('\n没有写入任何凭证。');
   }
   if (!DRY_RUN) console.log(`详细报告：${REPORT_PATH}`);
+
+  // 槽位 ≥2 的凭证还没有对应的账号，给出下一步命令（单凭证平台才能一条命令搞定）
+  if (SLOT_SUFFIX) {
+    const registerable = results.filter(
+      (result) => result.status === 'ok' && !result.target.tokenEnvKey && !result.target.identityStorage,
+    );
+    if (registerable.length > 0) {
+      console.log(`\n槽位 ${SLOT} 的凭证还没有对应的账号，注册它（同样会先真实验证）：`);
+      for (const result of registerable) {
+        const optionFlags = Object.entries(result.target.optionFlags ?? {})
+          .map(([key, value]) => ` --${key} ${value}`)
+          .join('');
+        console.log(
+          `  npm run account -- --provider ${result.target.id}` +
+            ` --env ${result.target.envKey}${SLOT_SUFFIX}${optionFlags}` +
+            ` --name "${result.target.label} · 账号 ${SLOT}"`,
+        );
+      }
+    }
+  }
   console.log('\n下一步：npm run probe 验证取数是否正常。');
 }
 

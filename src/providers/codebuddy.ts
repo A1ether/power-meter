@@ -161,9 +161,45 @@ export const codebuddyAdapter: ProviderAdapter = {
   dashboardUrl: 'https://www.codebuddy.cn/profile/plans-usage',
   usageUrl: 'https://www.codebuddy.cn/profile/plans-usage',
   requiredCredentialKeys: ['cookie'],
+  /**
+   * 两种凭证形态并存：手工 Cookie（历史路径）或插件登录令牌。
+   * 登录产出的变量名固定为 `CODEBUDDY_ACCESS_TOKEN` / `CODEBUDDY_REFRESH_TOKEN`，
+   * 与 `.env.example` 的占位符一致；第 2 个账号自动用 `_2` 槽位。
+   */
+  envNames: {
+    accessToken: 'CODEBUDDY_ACCESS_TOKEN',
+    refreshToken: 'CODEBUDDY_REFRESH_TOKEN',
+  },
+  // accessToken 是取数必需；refreshToken 只影响续期，缺失时仍可工作到令牌过期
+  isConfigured: (account) =>
+    Boolean(account.credentials.cookie) || Boolean(account.credentials.accessToken),
   credentialHint:
     '登录 www.codebuddy.cn 后，在 DevTools 里复制任意 www.codebuddy.cn 请求的 Cookie 头' +
-    '（务必包含 www 子域下的会话 Cookie），填入 credentials.cookie（也可用 npm run capture 自动抓取）。',
+    '（务必包含 www 子域下的会话 Cookie），填入 credentials.cookie（也可用 npm run capture 自动抓取）；' +
+    '或在看板上点「扫码登录」自动写入插件令牌。',
+  /**
+   * 多账号：一个账号一份 Cookie，各自独立取数、各自一张卡片。
+   *
+   * 不声明 `groupAccounts`：合并卡片会把 `credits/windows/nextExpiryAt` 清空
+   * （见 src/aggregate.ts 的 finalizeCard），而 CodeBuddy 的积分包带真实到期时间，
+   * 合并后会从「最快到期」时间线与卡片批次列表里消失——与项目核心目标相悖。
+   *
+   * 第二个账号的 Cookie 抓取：`npm run capture -- codebuddy --slot 2`
+   * （写进 .env 的 CODEBUDDY_COOKIE_2），再用看板按钮或 `npm run account` 注册。
+   */
+  manageAccounts: true,
+  manageFields: [
+    {
+      key: 'cookie',
+      label: 'Cookie',
+      placeholder:
+        '登录 www.codebuddy.cn → DevTools → 任意 www.codebuddy.cn 请求 → Headers → 复制 Cookie 整段值',
+      hint: '必须是 www.codebuddy.cn 子域下的会话 Cookie，只复制父域 .codebuddy.cn 会得到 401。',
+      multiline: true,
+    },
+  ],
+  manageHint:
+    'Cookie 会先真实调用一次用量接口验证，通过了才写入本机 .env（新槽位）与 accounts.json；写入前自动备份到 .run/。',
   /**
    * 用量 + 获取明细（v2）：
    *   - 用量：`get-user-request-usage` 逐笔（`requestTime` + `credit`，支持日期区间与翻页），

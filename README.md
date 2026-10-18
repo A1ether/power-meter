@@ -54,10 +54,16 @@ npm run probe            # ④ 验证取数是否正常
 | `npm run dev` | 带文件监听的热重载开发模式 |
 | `npm run chrome:debug` | 启动带调试端口的独立 Chrome（抓取凭证用）|
 | `npm run capture` | **自动抓取各平台的登录态并写入 `.env`** |
+| `npm run capture -- codebuddy --slot 2` | 抓第二个账号的登录态，写进 `CODEBUDDY_COOKIE_2`（多账号，见下文）|
+| `npm run capture -- qoder --site global` | 抓 Qoder 国际站（qoder.com）登录态，写进 `QODER_GLOBAL_COOKIE`（国内站仍用 `QODER_COOKIE`）|
 | `npm run capture -- --dry-run` | 只预览，不写文件 |
 | `npm run probe` | **命令行探测取数是否正常**（改配置后先跑这个最快）|
 | `npm run probe -- qoder trae` | 只探测指定平台 |
 | `npm run probe -- --json` | 输出机器可读结果 |
+| `npm run account -- --list` | 列出已配置账号（含已停用/缺凭证，只显示掩码）|
+| `npm run account -- --provider codebuddy --cookie '<值>'` | **给任意平台添加账号**（先真实验证再写入，自动备份）|
+| `npm run account -- --provider codebuddy --env CODEBUDDY_COOKIE_2` | 引用 `.env` 已有变量添加账号（配合 `capture --slot`）|
+| `npm run account -- --provider codebuddy --remove 'CodeBuddy · 账号 2'` | 删除账号（同时清理不再被引用的 `.env` 变量）|
 | `npm run a1etheropenai:add -- <账号密钥> <项目密钥>` | **命令行添加 A1etherOpenAi 账号**（先验证再写入，自动备份）；看板上也有按钮 |
 | `npm run a1etheropenai:add -- --remove "A1etherOpenAi · xxx"` | 删除 A1etherOpenAi 账号（同时清理无用的 `.env` 变量）|
 | `npm run a1etheropenai:add -- --list` | 列出已配置的 A1etherOpenAi 账号 |
@@ -104,6 +110,7 @@ power-meter/
 │   └── app.js                       # 拉数、排序、筛选、倒计时渲染
 └── src/
     ├── server.ts                    # HTTP 服务 + 路由 + 静态资源（Node 内置 http）
+    ├── account-store.ts             # 通用账号增删（任何声明 manageFields 的平台，CLI 与看板接口同一份）
     ├── a1etheropenai-store.ts                 # A1etherOpenAi 账号增删的共用实现（CLI 与看板接口同一份）
     ├── service.ts                   # 编排层：并发探测、TTL 缓存、失败回退、配置热加载
     ├── aggregate.ts                 # 聚合：多账号合并成一张卡片 + 汇总统计 + 到期时间线
@@ -271,6 +278,32 @@ interface ProviderSnapshot {
 另有一个全局变量 `HTTP_USER_AGENT`：**CodeBuddy 的 WAF 会校验 UA**，
 缺失或版本过旧会直接 401，`npm run capture` 会自动写入本机浏览器的真实 UA。
 
+#### 一个平台多个账号（例：两个 CodeBuddy 账号）
+
+同一个平台支持任意多个账号：**每个账号一份凭证 + 一条 `displayName` 唯一的配置**，
+各自一张卡片、各自的余额、积分批次与「最快到期」。
+
+推荐直接用卡片上的「＋ 登录 / 添加账号」扫码：另一个账号登录后会**新增**一张卡片
+（登录身份按平台账号 ID 去重，同一账号重复登录只更新凭证）。
+下文的 Cookie 槽位方式仍然可用，适合国际站或无法扫码的场景。
+
+```bash
+npm run capture -- codebuddy --slot 2    # ② 抓第二个账号（在调试 Chrome 里登录它）→ CODEBUDDY_COOKIE_2
+npm run account -- --provider codebuddy \
+  --env CODEBUDDY_COOKIE_2 --name 'CodeBuddy · 账号 2'   # ③ 验证并注册成账号
+npm run probe -- codebuddy               # ④ 验证取数，然后刷新看板
+```
+
+也可以全程在看板上完成：卡片额度右侧「＋ 添加账号」→ 粘贴 Cookie →「验证并添加」，
+服务会自己分配 `.env` 槽位（第二个账号 = `CODEBUDDY_COOKIE_2`）并命名。
+
+| 规则 | 说明 |
+| --- | --- |
+| `displayName` 必须唯一 | 它是账号的稳定标识（缓存键、本地用量采样、读密钥、删除都靠它）；重名时看板「诊断」区会告警，且两个账号会互相覆盖取数结果 |
+| CodeBuddy 每个账号各占一张卡片 | 它的积分包带真实到期时间，合并成一张卡会丢掉各自的批次与「最快到期」 |
+| 凭证按槽位抓取 | 第一个账号 `npm run capture -- codebuddy`，第二个账号加 `--slot 2`，互不覆盖 |
+| 增删都先验证 | 看板按钮与 `npm run account` 是同一份实现（`src/account-store.ts`）：先真实调用平台接口验证，通过才写盘，写入前备份到 `.run/` |
+
 #### 取 Cookie / Token 的通用步骤
 
 > 每个平台的**逐步操作说明、字段映射写法与排错表**见
@@ -337,7 +370,8 @@ A1etherOpenAi 卡片上就有入口：
 写完后服务监听文件变化自动热加载，不用重启。
 
 卡片上只列「启用的、能取数的」账号，而停用或缺凭证的账号同样要能删——
-所以展开管理区时会额外拉一次 `/api/a1etheropenai/accounts`，把这类账号列在下方兜底区里。
+所以展开管理区时会额外拉一次 `/api/accounts?provider=a1etheropenai`，把这列账号放在下方兜底区里
+（单账号卡片则列出该平台的全部账号并标出当前卡片，见「一个平台多个账号」）。
 
 #### 或者用命令行
 
@@ -648,6 +682,59 @@ export const yourPlatformAdapter: ProviderAdapter = {
 卡片顶部显示合计。适配器侧不用做任何事——每个账号照常各探各的，
 合并只发生在聚合层，`/api/reveal` 靠 `entries[].id`（即该账号的 `displayName`）
 定位到唯一账号。
+
+> 注意：合并卡片的 `credits` / `windows` / `nextExpiryAt` 会被清空
+> （合并后这些字段该以谁为准没有唯一答案）。所以**额度带真实到期时间的平台别声明它**
+> ——CodeBuddy 就因此保持「一账号一张卡片」，让每个账号的积分批次都留在「最快到期」时间线里。
+
+如果这个平台**想让用户在界面上直接增删账号**（不必手工改 `accounts.json`），
+声明 `manageAccounts` + `manageFields` 即可接入通用实现（`/api/accounts*` 与 `npm run account`）：
+
+```ts
+export const yourPlatformAdapter: ProviderAdapter = {
+  // ...
+  manageAccounts: true,
+  manageFields: [
+    { key: 'cookie', label: 'Cookie', placeholder: '从 DevTools 复制整段 Cookie', multiline: true },
+  ],
+  manageHint: 'Cookie 会先真实验证，通过了才写入本机配置；写入前自动备份。',
+};
+```
+
+`manageFields[].key` 必须是该平台 `credentials` 里的键；`.env` 变量名默认推导为
+`<平台 id>_<字段名>`（如 `CODEBUDDY_COOKIE`），第 N 个账号自动用 `_N` 后缀（`CODEBUDDY_COOKIE_2`）——
+命名不符的平台（如 CodeArts 的 `CODEARTS_AK`）用 `envNames` 显式声明。
+前端表单、增删接口、CLI 命令都会照着这份声明工作，**不需要改前端代码**。
+
+如果这个平台**支持扫码或打开链接登录**，再声明一个 `login` 能力，
+前端会自动出现「扫码 / 打开链接登录」按钮，登录成功后由 `src/login-session.ts`
+统一完成「probe 验证 → 按平台账号 ID 去重 → 写 `.env` + `accounts.json`」：
+
+```ts
+export const yourPlatformAdapter: ProviderAdapter = {
+  // ...
+  envNames: { accessToken: 'YOUR_ACCESS_TOKEN', refreshToken: 'YOUR_REFRESH_TOKEN' },
+  // 令牌与 Cookie 二选一即可；决定「缺凭证」提示是否出现
+  isConfigured: (account) => Boolean(account.credentials.cookie) || Boolean(account.credentials.accessToken),
+  login: {
+    label: '扫码登录',
+    hint: '用手机 App 扫码，或在新窗口打开链接完成授权。',
+    qr: true,                       // false = 只能本机打开链接（如 Trae 的 127.0.0.1 回调）
+    intervalMs: 2000,               // 服务端后台轮询上游的间隔
+    async start(input) {
+      // 申请 authUrl；input.secret 里的内容只留在服务端内存
+      return { authUrl, qr: true, ttlMs: 5 * 60_000, secret: { state } };
+    },
+    async poll(secret, ctx) {
+      // 返回 waiting / failed / ready；ready 时给出平台账号 id、昵称与登录产物凭证
+      return { status: 'ready', account: { id, name }, credentials: {}, options: {} };
+    },
+  },
+};
+```
+
+令牌过期时在 `probe` 里刷新，并通过 `ctx.persistCredentials({ accessToken, refreshToken })`
+写回 `.env`（`src/service.ts` 会按账号实际引用的变量名落盘，明文直填的账号会跳过）。
 
 如果这个平台的额度**永不过期**，再加上：
 

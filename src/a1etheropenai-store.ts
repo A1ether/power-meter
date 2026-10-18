@@ -108,16 +108,17 @@ function writeEnvSlot(suffix: string, apiKey: string, paiKey: string): void {
  * accounts.json 读写
  * ------------------------------------------------------------------ */
 
-interface AccountsFile {
+/** accounts.json 的统一读写类型：通用存储层（src/account-store.ts）也复用它 */
+export interface AccountsFile {
   accounts: Array<Record<string, unknown>>;
   [key: string]: unknown;
 }
 
-function readAccountsFile(): AccountsFile {
+export function readAccountsFile(): AccountsFile {
   const path = accountsPath();
-  if (!existsSync(path)) {
-    throw new Error(`找不到 ${path}，请先 cp accounts.example.json accounts.json`);
-  }
+  // 首次使用没有账号文件是正常状态（看板里可以第一次添加账号就把它建出来），
+  // 所以按空清单返回；写入方（writeAccountsFile）会在落盘时自动创建。
+  if (!existsSync(path)) return { accounts: [] };
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(path, 'utf8'));
@@ -131,16 +132,19 @@ function readAccountsFile(): AccountsFile {
   throw new Error(`${path} 结构应为数组或 { "accounts": [...] }（未做任何修改）`);
 }
 
-function writeAccountsFile(file: AccountsFile): void {
+export function writeAccountsFile(file: AccountsFile): void {
   writeFileSync(accountsPath(), `${JSON.stringify(file, null, 2)}\n`);
 }
 
-/** 写入前备份两个文件，返回备份目录 */
-function backupBeforeWrite(op: string): string {
+/**
+ * 写入前备份两个文件，返回备份目录。
+ * `label` 用于区分是哪个平台的操作（通用存储层传入适配器 id）。
+ */
+export function backupBeforeWrite(op: string, label = 'a1etheropenai'): string {
   const dir = resolve(
     process.cwd(),
     '.run',
-    `a1etheropenai-${op}-${new Date().toISOString().replace(/[:.]/g, '-')}`,
+    `${label}-${op}-${new Date().toISOString().replace(/[:.]/g, '-')}`,
   );
   mkdirSync(dir, { recursive: true });
   for (const file of [envPath(), accountsPath()]) {

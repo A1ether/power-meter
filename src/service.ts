@@ -29,6 +29,27 @@ function displayedAmount(snapshot: ProviderSnapshot): number {
 }
 
 /**
+ * 账号的取数键：`provider#displayName`（缓存、上一次成功值、本地用量采样共用它）。
+ *
+ * 同一平台下 displayName 是账号的稳定标识，正常情况下唯一。真出现重名
+ * （含都未写 displayName）时追加出现序号——loadConfig 已经会针对重名告警，
+ * 但配置错误不该表现为「两个账号显示同一份额度」这种静默串号。
+ */
+function accountKeys(accounts: AccountConfig[]): string[] {
+  const bases = accounts.map((account) => `${account.provider}#${account.displayName ?? ''}`);
+  const totals = new Map<string, number>();
+  for (const base of bases) totals.set(base, (totals.get(base) ?? 0) + 1);
+
+  const seen = new Map<string, number>();
+  return bases.map((base) => {
+    if ((totals.get(base) ?? 1) < 2) return base;
+    const index = seen.get(base) ?? 0;
+    seen.set(base, index + 1);
+    return `${base}#${index}`;
+  });
+}
+
+/**
  * 看板编排层：
  *   - 按 accounts.json 逐平台并发探测，单平台超时不拖累整体
  *   - 结果进 TTL 缓存，前端 5 分钟轮询不会把上游打爆
@@ -115,6 +136,7 @@ export class DashboardService {
 
     if (selected.length === 0) return [];
 
+    const keys = accountKeys(selected);
     const results: ProviderSnapshot[] = [];
     let cursor = 0;
     const workers = Array.from(
@@ -136,6 +158,7 @@ export class DashboardService {
 
   private async probeAccount(
     account: AccountConfig,
+    key: string,
     force: boolean,
   ): Promise<ProviderSnapshot> {
     const adapter = resolveAdapter(account.provider);

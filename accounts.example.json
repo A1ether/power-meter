@@ -5,6 +5,11 @@
     "credentials 用 ${ENV_VAR} 引用 .env，避免把凭证明文写进文件。",
     "保存后服务会自动热加载，无需重启。",
     "provider 支持：qoder / trae / codebuddy / codearts / a1etheropenai / minimax / custom / demo:*",
+    "Qoder 是国内站（qoder.com.cn，默认）与国际站（qoder.com）双站点：options.site 取",
+    "     cn / global / auto（auto 自动探测并回退）；显式指定站点时默认不回退，",
+    "     需要失败后自动换站再加 \"fallbackSite\": true。",
+    "     国际站凭证单独放 QODER_GLOBAL_COOKIE：npm run capture -- qoder --site global 抓取，",
+    "     npm run account -- --provider qoder --site global --env QODER_GLOBAL_COOKIE 注册。",
     "MiniMax Code（minimax）凭证较特殊：请求头 token（localStorage `_token`）+ SSO 会话 Cookie +",
     "     真实身份 userId/uuid（公共参数，服务端会与 token 交叉校验），缺一不可；",
     "     opTicket 仅当 capture 抓到了 op_ticket 时才需要在 credentials 里加 \"opTicket\"。",
@@ -21,7 +26,18 @@
     "     displayName 现在是账号的稳定标识（/api/reveal 靠它定位），界面显示的是邮箱。",
     "A1etherOpenAi 的额度单位是 QUOTA 且永不过期：钱包 USD 不显示（1 USD = 500,000 quota，",
     "     但钱包恒定虚高），也不参与「最快到期」。",
-    "整个 A1etherOpenAi 只占一张卡片：所有 a1etheropenai 账号会被合并成一张卡，一条条列出密钥与额度。"
+    "整个 A1etherOpenAi 只占一张卡片：所有 a1etheropenai 账号会被合并成一张卡，一条条列出密钥与额度。",
+    "CodeBuddy / Qoder / Trae 推荐用看板上的「＋ 登录 / 添加账号」：扫码或打开链接授权后",
+    "     自动写 .env 并注册账号，一个账号一张卡片；再次登录同一账号只刷新凭证，不会新增卡片。",
+    "     令牌模式（accessToken/refreshToken）与 Cookie 二选一，Cookie 优先；",
+    "     Trae 的令牌模式还需要 credentials.deviceKey（登录时自动写入）。",
+    "多账号（同一个平台的第二个及以后的账号）：displayName 必须唯一——它是账号的稳定标识，",
+    "     重名会让两张账号共用同一份取数结果（服务启动日志与看板「诊断」区会就此告警）。",
+    "     Cookie 平台的每个账号各占一个 .env 变量：第一个用 CODEBUDDY_COOKIE，",
+    "     第二个用 CODEBUDDY_COOKIE_2（可用 npm run capture -- codebuddy --slot 2 抓取），",
+    "     以此类推；每个账号各占一张卡片（CodeBuddy 的积分批次带到期时间，不合并才能",
+    "     保留各自的最快到期信息）。",
+    "     推荐用看板卡片上的「＋ 添加账号」或 npm run account 添加，会自动分配槽位与命名。"
   ],
   "accounts": [
     {
@@ -61,6 +77,15 @@
         "accessKey": "${CODEARTS_AK}",
         "secretKey": "${CODEARTS_SK}",
         "cookie": "${CODEARTS_COOKIE}"
+      },
+      "options": {}
+    },
+    {
+      "provider": "codebuddy",
+      "displayName": "CodeBuddy · 账号 2",
+      "enabled": false,
+      "credentials": {
+        "cookie": "${CODEBUDDY_COOKIE_2}"
       },
       "options": {}
     },

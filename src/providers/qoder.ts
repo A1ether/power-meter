@@ -221,13 +221,65 @@ function parsePlanLabel(body: unknown): string {
 export const qoderAdapter: ProviderAdapter = {
   id: 'qoder',
   displayName: 'Qoder',
+  // 以下三项是国内站（默认站点）的取值；探测时由 adapterForSite() 按实际生效站点覆盖
   region: 'cn',
-  dashboardUrl: 'https://qoder.com.cn/account/usage',
-  usageUrl: 'https://qoder.cn/account/usage?client=qoder&sourceType=IDE',
+  dashboardUrl: QODER_SITES.cn.dashboardUrl,
+  usageUrl: QODER_SITES.cn.usageUrl,
   requiredCredentialKeys: ['cookie'],
+  /**
+   * 两种凭证形态：手工 Cookie（保留批次到期）或设备流登录令牌。
+   *
+   * 变量前缀按站点分开——两个站点的登录态互不通用，混用同一个变量会让后添加的
+   * 账号覆盖前一个：
+   *   - 国内站：`QODER_COOKIE` / `QODER_ACCESS_TOKEN` / `QODER_REFRESH_TOKEN`
+   *   - 国际站：`QODER_GLOBAL_COOKIE` / `QODER_GLOBAL_ACCESS_TOKEN` /
+   *     `QODER_GLOBAL_REFRESH_TOKEN`（第 N 个账号仍加 `_N` 后缀）
+   */
+  envNames: (options) => {
+    const isGlobal = String(options.site ?? '').trim().toLowerCase() === 'global';
+    if (!isGlobal) {
+      return {
+        cookie: 'QODER_COOKIE',
+        accessToken: 'QODER_ACCESS_TOKEN',
+        refreshToken: 'QODER_REFRESH_TOKEN',
+      };
+    }
+    return {
+      cookie: 'QODER_GLOBAL_COOKIE',
+      accessToken: 'QODER_GLOBAL_ACCESS_TOKEN',
+      refreshToken: 'QODER_GLOBAL_REFRESH_TOKEN',
+    };
+  },
+  // accessToken 是取数必需；refreshToken 只影响续期
+  isConfigured: (account) =>
+    Boolean(account.credentials.cookie) || Boolean(account.credentials.accessToken),
   credentialHint:
-    '登录 qoder.com.cn 后，从 DevTools 的 Network 里复制任意 /api/ 请求的 Cookie 头，' +
-    '填入 credentials.cookie（也可用 npm run capture 自动抓取）。',
+    '登录 qoder.com.cn（国际站为 qoder.com）后，从 DevTools 的 Network 里复制任意 /api/ 请求的 Cookie 头，' +
+    '填入 credentials.cookie；国际站账号请把站点选为 global（或在登录块先切到「国际站」再扫码），' +
+    '也可用 npm run capture -- qoder --site global 自动抓取。' +
+    '国际站的凭证写入 QODER_GLOBAL_* 变量，与国内站互不覆盖。',
+  /** 站点可在看板上直接切换（见 manageFields 的 site 下拉），增删账号走通用实现 */
+  manageAccounts: true,
+  manageFields: [
+    {
+      key: 'cookie',
+      label: 'Cookie',
+      placeholder: '从 DevTools 的 Network 复制任意 /api/ 请求的 Cookie 头',
+      hint: '站点要与 Cookie 的来源一致（qoder.com.cn 或 qoder.com）',
+      multiline: true,
+    },
+    {
+      key: 'site',
+      label: '站点',
+      target: 'option',
+      choices: ['cn', 'global', 'auto'],
+      defaultValue: 'cn',
+      required: false,
+      secret: false,
+      hint: 'cn 国内站（默认）· global 国际站 · auto 自动探测并回退',
+    },
+  ],
+  manageHint: 'Cookie 会先按所选站点真实验证，通过了才写入本机配置；写入前自动备份到 .run/。',
   /**
    * 用量 + 获取明细（v2）：
    *   - 用量：`/api/v1/me/usages/big_model_credits/histories` 逐笔（`time` + `credits`），

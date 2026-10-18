@@ -178,6 +178,28 @@ export function loadConfig(): LoadConfigResult {
     accounts.push(account);
   }
 
+  // 同一平台下 displayName 必须唯一：它是账号的稳定标识——缓存键、本地用量采样键、
+  // /api/reveal 与删除操作的定位都靠它。重名（含都未写）会让两个账号共享同一份结果，
+  // 界面上表现为「两个账号额度一模一样」，属于静默错误，所以在这里显式告警。
+  const nameCounts = new Map<string, { provider: string; displayName: string; count: number }>();
+  for (const account of accounts) {
+    const displayName = account.displayName ?? '';
+    const key = `${account.provider}\u0000${displayName}`;
+    const found = nameCounts.get(key);
+    if (found) found.count += 1;
+    else nameCounts.set(key, { provider: account.provider, displayName, count: 1 });
+  }
+  for (const item of nameCounts.values()) {
+    if (item.count < 2) continue;
+    warnings.push(
+      item.displayName
+        ? `平台 ${item.provider} 下有 ${item.count} 个账号的 displayName 都是「${item.displayName}」：` +
+            '它们的取数结果会互相覆盖，请分别改成不同的名字。'
+        : `平台 ${item.provider} 下有 ${item.count} 个账号都没有写 displayName：` +
+            '它们的取数结果会互相覆盖，请分别补上不同的 displayName。',
+    );
+  }
+
   return {
     config: {
       server: {
