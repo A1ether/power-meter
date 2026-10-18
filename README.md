@@ -125,7 +125,7 @@ power-meter/
     └── providers/                   # 平台适配器（新增平台只动这里）
         ├── base.ts                  # ProviderAdapter 契约 + 窗口/批次构建函数
         ├── index.ts                 # 注册表 + 平台别名解析
-        ├── qoder.ts                 # qoder.com / qoder.com.cn / qoder.cn
+        ├── qoder.ts                 # qoder.com.cn / qoder.com / qoder.cn（site: cn | global | auto 双站点）
         ├── trae.ts                  # trae.cn（权益包按过期时间拆批次）
         ├── codebuddy.ts             # codebuddy.cn（WAF 校验 UA）
         ├── codearts.ts              # codearts.huaweicloud.com（多接口拼批次）

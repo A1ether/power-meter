@@ -81,6 +81,11 @@ async function main(): Promise<void> {
           (snapshot.nextExpiryAt ? `  最快到期 ${snapshot.nextExpiryAt.slice(0, 10)}` : ''),
       );
     }
+    // 说明的第一段通常是最关键的口径信息（如 Qoder 的「站点：国际站（…）」、
+    // 回退说明），整段可能很长（含隐藏批次等），只打第一段
+    if (snapshot.note) {
+      console.log(`  ${pad('', 24)}说明 ${snapshot.note.split('；')[0]}`);
+    }
     for (const window of snapshot.windows) {
       console.log(
         `  ${pad('', 24)}${window.label}: ${window.remaining}/${window.limit}` +
