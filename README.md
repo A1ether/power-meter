@@ -4,6 +4,7 @@
 避免在浏览器多标签之间反复切换。
 
 - 运行时**零第三方依赖**（只用 Node 内置模块），`npm install` 只装 `tsx` / `typescript`
+- CodeBuddy / Qoder / Trae 支持**扫码或打开链接登录**，授权后自动落库，一个账号一张卡片
 - 后端聚合 + 缓存 + 失败降级，前端纯静态（无构建步骤）
 - 凭证默认**不下发到浏览器**：只有被显式声明为「可托管」的密钥才提供
   掩码预览 + 按需复制（默认仅限本机），`accounts.json` / `.env` 改动后**热加载**，无需重启
@@ -266,9 +267,9 @@ interface ProviderSnapshot {
 
 | 平台 | `provider` | 需要的凭证 | 关键 `options` |
 | --- | --- | --- | --- |
-| Qoder | `qoder` / `qoder.cn` | `cookie` | `site: "cn"`（国内，默认）或 `"global"` |
-| Trae | `trae` / `trae.cn` | `cookie` | JWT 由 Cookie 自动续签；可选 `accessToken` 覆盖 |
-| CodeBuddy | `codebuddy` | `cookie`（**必须含 `www` 子域**）| — |
+| Qoder | `qoder` / `qoder.cn` / `qoder-global` | `cookie`（国内站 `QODER_COOKIE`；国际站 `QODER_GLOBAL_COOKIE`）<br>或扫码登录写入的 `accessToken` + `refreshToken`（国内站 `QODER_ACCESS_TOKEN` / `QODER_REFRESH_TOKEN`；国际站加 `QODER_GLOBAL_` 前缀） | `site: "cn"`（国内站，默认）/ `"global"`（国际站 qoder.com）/ `"auto"`（自动探测并回退）；显式站点失败后要自动换站再加 `fallbackSite: true`。两种凭证模式都会拆积分批次（令牌模式在网页接口不可用时退回 openapi，`dedicated_resource_packages[]` 带各自到期时间） |
+| Trae | `trae` / `trae.cn` | `cookie`<br>或「打开链接登录」写入的 `accessToken` + `refreshToken` + `deviceKey`（`TRAE_ACCESS_TOKEN` / `TRAE_REFRESH_TOKEN` / `TRAE_DEVICE_KEY`） | JWT 由 Cookie 自动续签；令牌模式由 `deviceKey` 签名续期 |
+| CodeBuddy | `codebuddy` | `cookie`（**必须含 `www` 子域**）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`CODEBUDDY_ACCESS_TOKEN` / `CODEBUDDY_REFRESH_TOKEN`）| — |
 | CodeArts | `codearts` | **`accessKey` + `secretKey`（推荐，长期有效）**<br>`cookie`（兼容，会话过期需重抓） | 可选 `authMode: "auto" \| "aksk" \| "cookie"`、`resourceType`、`region` |
 | MiniMax Code | `minimax` / `minimax-code` / `agent.minimax.cn` | `token`（`_token`）+ `cookie`（SSO）+ 真实身份 `userId`/`opTicket`/`uuid`（capture 一并抓取，缺一不可）| `site: "cn"`（默认）或 `"global"` |
 | A1etherOpenAi | `a1etheropenai` / `d1v.ai`（上游服务域名保持不变，也是它的解析别名） | `apiKey`（查余额）<br>`paiApiKey`（托管复制） | `baseUrl`、`revealApiKey` |
@@ -512,10 +513,17 @@ A1etherOpenAi 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>）
 | --- | --- | --- |
 | GET | `/api/summary` | 聚合结果（汇总 + 各平台快照 + 到期时间线）。`?force=1` 跳过缓存强制刷新 |
 | POST | `/api/refresh` | 手动刷新，body 可带 `{ "providers": ["qoder"] }` 只刷指定平台 |
-| GET | `/api/providers` | 已注册的适配器清单及各自需要的凭证 |
+| GET | `/api/providers` | 已注册的适配器清单、各自需要的凭证，以及「添加账号」表单的字段声明（`manageFields`）|
 | GET | `/api/config` | 当前配置概览（**仅凭证 key 名，不含值**）+ 告警 + 缺失环境变量 |
 | POST | `/api/reveal` | **按需读取托管密钥明文**（默认仅本机）。body `{ provider, accountId, key }` |
-| GET | `/api/a1etheropenai/accounts` | A1etherOpenAi 账号清单（含已停用 / 缺凭证的，仍只回显掩码）|
+| GET | `/api/accounts?provider=` | 某平台的账号清单（含已停用 / 缺凭证的，仍只回显掩码）|
+| POST | `/api/accounts/add` | **通用添加账号**（声明了 `manageAccounts` + `manageFields` 的平台）：body `{ provider, credentials? \| envRefs?, name?, force?, dryRun? }`，先真实验证通过才写盘 |
+| POST | `/api/accounts/remove` | **通用删除账号**：body `{ provider, accountId }`，顺带清掉不再被引用的 `.env` 变量 |
+| POST | `/api/login/start` | **发起扫码 / 链接登录**（声明了 `login` 的平台）：body `{ provider, options? }`，返回会话（含 `authUrl`，**不含令牌**）|
+| GET | `/api/login/poll?id=` | 读登录会话状态（`waiting` / `landing` / `ready` / `failed` / `expired` / `cancelled`）|
+| POST | `/api/login/cancel` | 取消登录会话：body `{ id }` |
+| GET | `/authorize` | Trae 的 OAuth 回调（只接受回环 Host 与活跃登录会话，只投递授权码，不返回令牌）|
+| GET | `/api/a1etheropenai/accounts` | A1etherOpenAi 账号清单（兼容保留；通用接口已覆盖）|
 | POST | `/api/a1etheropenai/accounts` | **添加 A1etherOpenAi 账号**：先验证两把密钥，通过才写盘。body `{ apiKey, paiKey, name?, force? }` |
 | POST | `/api/a1etheropenai/accounts/remove` | **删除 A1etherOpenAi 账号**：body `{ accountId }`，顺带清掉不再被引用的 `.env` 变量 |
 | GET | `/api/health` | 存活探测 |
@@ -534,6 +542,10 @@ A1etherOpenAi 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>）
    否则 `evil.com` 只要一段 JS 就能 POST 到 `127.0.0.1` 读走密钥或删掉账号。
 3. **读密钥还要在白名单里**：只有适配器 `revealableSecrets()` 声明过的 key 才可读，
    且必须命中 `accounts.json` 里具体某条账号。
+
+Trae 的 OAuth 回调 `/authorize` 是唯一例外：浏览器从 trae.cn 跳回来时不带自定义头，
+因此它单独校验「回环 Host + `lt` 命中活跃会话 + 授权页域名在白名单内」，且只投递授权码、不返回任何令牌。
+登录接口的响应里也永远不出现 `accessToken` / `refreshToken` / 设备私钥。
 
 返回值带 `Cache-Control: no-store`；服务端日志只记「读了谁 / 改了谁」不记值；
 `/api/summary` 里永远只有掩码预览（`secrets[].preview`、`entries[].secrets[].preview`），绝无明文。

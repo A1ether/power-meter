@@ -4,6 +4,14 @@ import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
 import { addA1etherOpenAiAccount, listA1etherOpenAiAccounts, parseKeyPairText, removeA1etherOpenAiAccount } from './a1etheropenai-store.js';
+import { addManagedAccount, listManagedAccounts, removeManagedAccount } from './account-store.js';
+import {
+  cancelLogin,
+  deliverLoginCallback,
+  deliverLoginCallbackToActiveProvider,
+  pollLogin,
+  startLogin,
+} from './login-session.js';
 import { describeRegistry, resolveAdapter } from './providers/index.js';
 import { DashboardService } from './service.js';
 
@@ -42,6 +50,16 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
   } catch {
     return {};
   }
+}
+
+/** 只保留字符串值的小工具：请求体里的 credentials / envRefs 都用它兜底 */
+function stringRecord(value: unknown): Record<string, string> | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof item === 'string' && item.trim()) out[key] = item;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** 只暴露「配置了什么」，不暴露凭证本身 */
@@ -260,7 +278,151 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // A1etherOpenAi 账号管理：前置校验都在 a1etheropenai-store 里，与 npm run a1etheropenai:add 完全同一份实现
+    /*
+     * 通用账号管理（平台无关）：任何声明了 `manageAccounts` + `manageFields` 的适配器
+     * 都能通过这三个接口增删账号，前端「＋ 添加账号」与 `npm run account` 共用同一份实现。
+     * A1etherOpenAi 会被 src/account-store.ts 分派回它的专用存储层，行为不变。
+     */
+    if (pathname === '/api/accounts' && req.method === 'GET') {
+      const guard = privilegedGuard(req);
+      if (!guard.ok) {
+        sendJson(res, guard.status, { error: guard.error });
+        return;
+      }
+      const provider = url.searchParams.get('provider') ?? '';
+      if (!resolveAdapter(provider)) {
+        sendJson(res, 404, { error: `未知平台「${provider}」。` });
+        return;
+      }
+      sendJson(res, 200, { provider, ...listManagedAccounts(provider) });
+      return;
+    }
+
+    /*
+     * 「平台与账号」总览：全部内置平台（含一个账号都没有的平台）+ 各自已配置的账号。
+     *
+     * 看板顶栏的入口用它渲染，解决「没有账号的平台在页面上完全没有添加入口」。
+     * 只读、只回掩码；与 /api/accounts 一样只允许本机。
+     */
+    if (pathname === '/api/accounts/overview' && req.method === 'GET') {
+      const guard = privilegedGuard(req);
+      if (!guard.ok) {
+        sendJson(res, guard.status, { error: guard.error });
+        return;
+      }
+      const { config, warnings, missingEnvVars } = loadConfig();
+      const providers = describeRegistry()
+        .filter((item) => !item.isDemo)
+        .map((item) => {
+          let accounts: unknown[] = [];
+          let providerWarnings: string[] = [];
+          try {
+            const listed = listManagedAccounts(item.id);
+            accounts = listed.accounts;
+            providerWarnings = listed.warnings;
+          } catch (error) {
+            providerWarnings = [`读取 ${item.displayName} 账号失败：${(error as Error).message}`];
+          }
+          return {
+            id: item.id,
+            displayName: item.displayName,
+            region: item.region,
+            credentialHint: item.credentialHint,
+            manageAccounts: item.manageAccounts,
+            manageFields: item.manageFields,
+            manageHint: item.manageHint,
+            login: item.login,
+            accounts,
+            warnings: providerWarnings,
+          };
+        });
+      sendJson(res, 200, {
+        accountsFilePath: config.accountsFilePath,
+        warnings,
+        missingEnvVars,
+        providers,
+      });
+      return;
+    }
+
+    if (pathname === '/api/accounts/add' && req.method === 'POST') {
+      const guard = privilegedGuard(req);
+      if (!guard.ok) {
+        sendJson(res, guard.status, { error: guard.error });
+        return;
+      }
+      const body = (await readBody(req)) as {
+        provider?: unknown;
+        credentials?: unknown;
+        envRefs?: unknown;
+        /** option 字段（如 Qoder 的站点 site）：写进 accounts.json 的 options */
+        options?: unknown;
+        name?: unknown;
+        force?: unknown;
+        dryRun?: unknown;
+      };
+      const outcome = await addManagedAccount({
+        provider: typeof body.provider === 'string' ? body.provider : '',
+        credentials: stringRecord(body.credentials),
+        envRefs: stringRecord(body.envRefs),
+        options: stringRecord(body.options),
+        name: typeof body.name === 'string' ? body.name : undefined,
+        force: body.force === true,
+        dryRun: body.dryRun === true,
+        timeoutMs: bootstrap.settings.requestTimeoutMs + 6_000,
+      });
+      if (!outcome.ok) {
+        sendJson(res, outcome.status, { error: outcome.error, stage: outcome.stage });
+        return;
+      }
+      sendJson(res, 200, {
+        ok: true,
+        provider: outcome.provider,
+        name: outcome.name,
+        credentials: outcome.credentials,
+        options: outcome.options,
+        envRefs: outcome.envRefs,
+        backupDir: outcome.backupDir,
+        details: outcome.details,
+        dryRun: outcome.dryRun,
+        // 回显这次加进去的账号长什么样（仍然只有掩码）
+        account: {
+          label: outcome.snapshot.plan ?? outcome.name,
+          amount: outcome.snapshot.balance?.amount ?? 0,
+          currency: outcome.snapshot.balance?.currency ?? 'CREDITS',
+          note: outcome.snapshot.note,
+          secrets: outcome.snapshot.secrets,
+        },
+      });
+      return;
+    }
+
+    if (pathname === '/api/accounts/remove' && req.method === 'POST') {
+      const guard = privilegedGuard(req);
+      if (!guard.ok) {
+        sendJson(res, guard.status, { error: guard.error });
+        return;
+      }
+      const body = (await readBody(req)) as { provider?: unknown; accountId?: unknown };
+      const outcome = removeManagedAccount(
+        typeof body.provider === 'string' ? body.provider : '',
+        typeof body.accountId === 'string' ? body.accountId : '',
+      );
+      if (!outcome.ok) {
+        sendJson(res, outcome.status, { error: outcome.error });
+        return;
+      }
+      sendJson(res, 200, {
+        ok: true,
+        name: outcome.name,
+        removedEnvLines: outcome.removedEnvLines,
+        backupDir: outcome.backupDir,
+      });
+      return;
+    }
+
+    // A1etherOpenAi 账号管理（兼容保留：CLI 与既有脚本用的是这套路径）：
+    // 前置校验都在 a1etheropenai-store 里，与 npm run a1etheropenai:add 完全同一份实现
     if (pathname === '/api/a1etheropenai/accounts' && req.method === 'GET') {
       const guard = privilegedGuard(req);
       if (!guard.ok) {
@@ -340,6 +502,113 @@ const server = createServer(async (req, res) => {
         removedEnvLines: outcome.removedEnvLines,
         backupDir: outcome.backupDir,
       });
+      return;
+    }
+
+    /*
+     * 「扫码 / 打开链接登录」：平台无关的登录会话层（src/login-session.ts）。
+     * 三个接口都走 privilegedGuard —— 它们会发起上游请求、并在成功后写本机配置。
+     * 前端只拿到状态与 authUrl，令牌永远不经过 HTTP 响应。
+     */
+    if (pathname === '/api/login/start' && req.method === 'POST') {
+      const guard = privilegedGuard(req);
+      if (!guard.ok) {
+        sendJson(res, guard.status, { error: guard.error });
+        return;
+      }
+      const body = (await readBody(req)) as { provider?: unknown; options?: unknown };
+      const provider = typeof body.provider === 'string' ? body.provider : '';
+      const adapter = resolveAdapter(provider);
+      if (!adapter) {
+        sendJson(res, 404, { error: `未知平台「${provider}」。` });
+        return;
+      }
+      if (!adapter.login) {
+        sendJson(res, 403, { error: `平台「${adapter.id}」未开放登录。` });
+        return;
+      }
+      const outcome = await startLogin({
+        provider: adapter.id,
+        options: stringRecord(body.options),
+        callbackBase: `http://${bootstrap.server.host}:${bootstrap.server.port}`,
+        timeoutMs: bootstrap.settings.requestTimeoutMs + 6_000,
+        log: (message) => console.log(message),
+      });
+      if (!outcome.ok) {
+        sendJson(res, outcome.status, { error: outcome.error });
+        return;
+      }
+      sendJson(res, 200, { ok: true, session: outcome.session });
+      return;
+    }
+
+    if (pathname === '/api/login/poll' && req.method === 'GET') {
+      const guard = privilegedGuard(req);
+      if (!guard.ok) {
+        sendJson(res, guard.status, { error: guard.error });
+        return;
+      }
+      const session = pollLogin(url.searchParams.get('id') ?? '');
+      if (!session) {
+        sendJson(res, 404, { error: '登录会话不存在或已清理。', status: 'invalid' });
+        return;
+      }
+      sendJson(res, 200, { ok: true, session });
+      return;
+    }
+
+    if (pathname === '/api/login/cancel' && req.method === 'POST') {
+      const guard = privilegedGuard(req);
+      if (!guard.ok) {
+        sendJson(res, guard.status, { error: guard.error });
+        return;
+      }
+      const body = (await readBody(req)) as { id?: unknown };
+      const session = cancelLogin(typeof body.id === 'string' ? body.id : '');
+      if (!session) {
+        sendJson(res, 404, { error: '登录会话不存在或已清理。', status: 'invalid' });
+        return;
+      }
+      sendJson(res, 200, { ok: true, session });
+      return;
+    }
+
+    /*
+     * Trae 的 OAuth 回调（唯一一条不经 privilegedGuard 的路由）：
+     * 浏览器从 trae.cn 跳回来时不会带自定义头，所以改由三重约束保护——
+     *   ① 只接受回环 Host；② 必须命中活跃登录会话；
+     *   ③ 授权页域名由适配器白名单校验（见 trae.ts 的 traeHostAllowed）。
+     * 回调只投递授权码，不返回任何令牌。
+     *
+     * 注意：Trae 授权页只接受裸回调地址 `http://127.0.0.1:<port>/authorize`，
+     * 因此正常回调**不带** `lt`，按活跃会话反查；带 `lt` 的旧链接仍然兼容。
+     */
+    if (pathname === '/authorize' && req.method === 'GET') {
+      if (!isLoopbackHost(hostnameOf(req.headers.host))) {
+        res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }).end('Forbidden');
+        return;
+      }
+      const sessionId = url.searchParams.get('lt') ?? '';
+      const delivered = sessionId
+        ? deliverLoginCallback(sessionId, url.searchParams)
+        : deliverLoginCallbackToActiveProvider(url.searchParams);
+      if (!delivered) {
+        res
+          .writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
+          .end('登录会话不存在或已失效，请回到看板重新发起登录。');
+        return;
+      }
+      res
+        .writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+        })
+        .end(
+          '<!doctype html><meta charset="utf-8"><title>登录完成</title>' +
+            '<body style="font-family:system-ui;padding:48px;line-height:1.6">' +
+            '<h1>登录完成</h1><p>可以关闭这个页面，回到看板继续。</p>' +
+            '<script>setTimeout(function(){window.close()},800)</script>',
+        );
       return;
     }
 

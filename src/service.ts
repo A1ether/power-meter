@@ -1,7 +1,8 @@
-import { statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { buildPayload, type AggregateSettings } from './aggregate.js';
 import {
   loadConfig,
+  loadDotEnv,
   resolveDotEnvPath,
   type AccountConfig,
   type LoadConfigResult,
@@ -21,6 +22,88 @@ export interface RefreshOutcome {
 }
 
 const MAX_CONCURRENCY = 6;
+
+/** `.env` 写入串行队列：令牌刷新可能并发发生，避免两次读改写互相覆盖 */
+let envWriteChain: Promise<void> = Promise.resolve();
+
+function enqueueEnvWrite(task: () => void): Promise<void> {
+  const next = envWriteChain.then(task, task);
+  // 链上保留一个已 settle 的 Promise，失败不让后续写入被跳过
+  envWriteChain = next.catch(() => {});
+  return next;
+}
+
+/** 就地覆盖 `.env` 里的若干变量（不新增文件头，只改/追加行） */
+function writeEnvValues(entries: Map<string, string>): void {
+  const path = resolveDotEnvPath();
+  const existed = existsSync(path);
+  const lines = (existed ? readFileSync(path, 'utf8') : '').split(/\r?\n/);
+  for (const [key, value] of entries) {
+    const index = lines.findIndex((line) => {
+      const eq = line.indexOf('=');
+      return eq > 0 && line.slice(0, eq).trim() === key;
+    });
+    if (index >= 0) lines[index] = `${key}=${value}`;
+    else lines.push(`${key}=${value}`);
+  }
+  writeFileSync(path, `${lines.join('\n').replace(/\n+$/, '')}\n`, existed ? {} : { mode: 0o600 });
+}
+
+/**
+ * 把令牌刷新结果写回 `.env` 并让进程立刻用上新值。
+ *
+ * 只写「该账号当前凭证确实引用着的变量」：`accounts.json` 里存的是 `${VAR}`，
+ * 若账号是明文直填（没有引用），刷新结果无处可写，直接跳过——
+ * 这比悄悄改 `accounts.json` 更安全（后者会动到用户手写的配置）。
+ *
+ * 注意：适配器的 `patch` 用的是**凭证键**（`accessToken` / `refreshToken`），
+ * 而条目里的引用可能是历史槽位名（如 `CODEBUDDY_ACCESS_TOKEN_2`），
+ * 所以必须按 key 反查引用，不能直接用 `envNameFor()` 拼名字。
+ */
+async function persistRefreshedCredentials(
+  account: AccountConfig,
+  patch: Record<string, string>,
+): Promise<void> {
+  const names = new Map<string, string>();
+  let entryCredentials: Record<string, unknown> = {};
+  try {
+    const filePath = loadConfig().config.accountsFilePath;
+    const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf8'));
+    const list = Array.isArray((parsed as { accounts?: unknown }).accounts)
+      ? ((parsed as { accounts: unknown[] }).accounts as unknown[])
+      : [];
+    const entry = list.find((item) => {
+      if (typeof item !== 'object' || item === null) return false;
+      const record = item as Record<string, unknown>;
+      return (
+        String(record.provider ?? '').trim() === account.provider &&
+        String(record.displayName ?? '') === (account.displayName ?? '')
+      );
+    }) as Record<string, unknown> | undefined;
+    entryCredentials = (entry?.credentials ?? {}) as Record<string, unknown>;
+    for (const key of Object.keys(patch)) {
+      const raw = entryCredentials[key];
+      const match = typeof raw === 'string' ? /^\$\{([A-Za-z0-9_]+)\}$/.exec(raw.trim()) : null;
+      if (match?.[1]) names.set(key, match[1]);
+    }
+  } catch {
+    return;
+  }
+
+  const entries = new Map<string, string>();
+  for (const [key, name] of names) {
+    const value = patch[key];
+    if (typeof value === 'string' && value.trim()) entries.set(name, value.trim());
+  }
+  // 明文直填的账号没有 `${VAR}` 可写：跳过（不改用户手写的 accounts.json）
+  if (entries.size === 0) return;
+
+  await enqueueEnvWrite(() => {
+    writeEnvValues(entries);
+    // 让当前进程立即拿到新值；下一次 ensureConfigFresh 会因 mtime 变化重载配置
+    loadDotEnv();
+  });
+}
 
 /** 卡片上展示的额度：优先账户余额，无余额时退回剩余批次之和（与前端 balanceFor() 同口径） */
 function displayedAmount(snapshot: ProviderSnapshot): number {
@@ -146,7 +229,7 @@ export class DashboardService {
           const index = cursor++;
           const account = selected[index];
           if (!account) continue;
-          results.push(await this.probeAccount(account, force));
+          results.push(await this.probeAccount(account, keys[index] ?? '', force));
         }
       },
     );
@@ -192,13 +275,14 @@ export class DashboardService {
       };
     }
 
-    const key = `${account.provider}#${account.displayName ?? ''}`;
-    const ctx = {
+    const ctx: ProbeContext = {
       now,
       timeoutMs: this.configResult.config.settings.requestTimeoutMs,
       log: (message: string, extra?: Record<string, unknown>) => {
         console.log(`[${account.provider}] ${message}`, extra ? JSON.stringify(extra) : '');
       },
+      // 令牌刷新后写回 .env；失败只记日志，不阻断本次取数
+      persistCredentials: (patch) => persistRefreshedCredentials(account, patch),
     };
 
     try {

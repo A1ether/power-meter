@@ -1,3 +1,4 @@
+import { createHash, createPublicKey, generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto';
 import { fetchJson, HttpError } from '../lib/http.js';
 import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
 import { startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
@@ -44,6 +45,240 @@ import {
 const TRAE_TOKEN_URL = 'https://api.trae.cn/cloudide/api/v3/common/GetUserToken';
 const TRAE_USAGE_URL = 'https://api.trae.cn/trae/api/v2/pay/user_current_entitlement_list';
 const TRAE_TIMEOUT_FALLBACK = 12_000;
+
+/* ------------------------------------------------------------------ *
+ * 登录（OAuth + 本地回调）与 DeviceProof 刷新
+ * ------------------------------------------------------------------ */
+
+/**
+ * Trae CN 的 OAuth 常量（从 `Trae CN 1.107.1` 的 `out/main.js` 提取）：
+ *   - client_id：TRAE 稳定版固定 `ono9krqynydwx5`（SOLO 为 `en1oxy7wnw8j9n`）
+ *   - 回调：`http://127.0.0.1:<port>/authorize`，只认 `/authorize` 路径
+ *   - 换令牌：`POST {apiHost}/trae/api/v3/oauth/ExchangeToken`
+ *       `{ ClientID, AuthCode, CodeVerifier, DeviceInfo, IDEVersion }`
+ *   - 刷新：同一端点，body 带 `RefreshToken` + `DeviceProof{Signature,Timestamp,Nonce}`；
+ *       签名内容 `[method, path, clientId, refreshToken, timestamp, nonce].join('\n')`
+ *   - 取用户：`POST {apiHost}/cloudide/api/v3/trae/GetUserInfo`，头 `x-cloudide-token`
+ *
+ * 扫码不可行：回调固定落到 127.0.0.1，手机扫码后回调会打到手机自己。
+ */
+const TRAE_CONSOLE_HOST = 'https://www.trae.cn';
+const TRAE_API_HOST = 'https://api.trae.cn';
+const TRAE_CLIENT_ID = 'ono9krqynydwx5';
+const TRAE_LOGIN_TTL_MS = 5 * 60 * 1000;
+/** 与官方 IDE 的 `appVersion` 同形；上游只做展示/兼容，不参与签名 */
+const TRAE_IDE_VERSION = '1.107.1';
+
+interface TraeDeviceKey {
+  /** PKCS8 PEM（base64 后写进 .env，避免多行变量） */
+  privateKeyPem: string;
+  publicKeyPem: string;
+}
+
+function traeDeviceKeyFromPem(privateKeyPem: string): TraeDeviceKey {
+  const publicKeyPem = createPublicKey(privateKeyPem)
+    .export({ type: 'spki', format: 'pem' })
+    .toString();
+  return { privateKeyPem, publicKeyPem };
+}
+
+/** 生成 EC P-256 密钥对（与官方 `Oxe()` 同一参数） */
+function traeGenerateDeviceKey(): TraeDeviceKey {
+  const { privateKey, publicKey } = generateKeyPairSync('ec', {
+    namedCurve: 'P-256',
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  });
+  return { privateKeyPem: String(privateKey), publicKeyPem: String(publicKey) };
+}
+
+/** PKCE：verifier = base64url(random 48 bytes)，challenge = base64url(sha256(verifier)) */
+function traePkce(): { verifier: string; challenge: string } {
+  const verifier = randomBytes(48).toString('base64url');
+  const challenge = createHash('sha256').update(verifier).digest('base64url');
+  return { verifier, challenge };
+}
+
+/**
+ * DeviceProof：时间戳用**秒**，nonce 16 字节 hex，
+ * 签名内容逐行拼接后 ECDSA-SHA256，再 base64。
+ */
+function traeDeviceProof(
+  method: string,
+  path: string,
+  clientId: string,
+  refreshToken: string,
+  privateKeyPem: string,
+): { signature: string; timestamp: number; nonce: string } {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const nonce = randomBytes(16).toString('hex');
+  const payload = [method, path, clientId, refreshToken, String(timestamp), nonce].join('\n');
+  const signature = sign('sha256', Buffer.from(payload), privateKeyPem).toString('base64');
+  return { signature, timestamp, nonce };
+}
+
+/** `DeviceInfo`：字段名是协议事实，不能改风格（PascalCase） */
+function traeDeviceInfo(account: AccountConfig, key: TraeDeviceKey): Record<string, string> {
+  return {
+    DeviceID: optString(account, 'deviceId') || randomUUID(),
+    MachineID: optString(account, 'machineId') || randomUUID(),
+    PlatformCode: 'IDE_PC',
+    DeviceType: 'PC',
+    DeviceName: optString(account, 'deviceName') || 'power-meter',
+    DeviceModel: '',
+    ClientVersion: TRAE_IDE_VERSION,
+    DevicePublicKey: key.publicKeyPem,
+    DeviceBrand: '',
+    DeviceCPU: '',
+    OSInfo: '',
+    OSVersion: '',
+  };
+}
+
+/** 解出账号的 deviceKey（`.env` 里存的是 PKCS8 PEM 的 base64） */
+function traeDeviceKeyOf(account: AccountConfig, ctx: ProbeContext): TraeDeviceKey | null {
+  const raw = cred(account, ctx, ['deviceKey', 'devicePrivateKey']);
+  if (!raw) return null;
+  const pem = raw.includes('BEGIN') ? raw : Buffer.from(raw, 'base64').toString('utf8');
+  try {
+    return traeDeviceKeyFromPem(pem);
+  } catch {
+    return null;
+  }
+}
+
+/** ExchangeToken 的响应信封：{ Result: { Token, RefreshToken, ... } } */
+function traeExchangeResult(body: unknown): Record<string, unknown> {
+  const result = isRecord(body) ? pick(body, 'Result', 'result') : undefined;
+  if (!isRecord(result)) throw new Error('ExchangeToken 响应缺少 Result');
+  return result;
+}
+
+/**
+ * 用 refreshToken + DeviceProof 换新 JWT。
+ * 新值由调用方写回 `.env`（accessToken 每次探测都会变，必须落盘避免重复刷新）。
+ */
+async function traeRefreshJwt(
+  account: AccountConfig,
+  ctx: ProbeContext,
+  refreshToken: string,
+  key: TraeDeviceKey,
+): Promise<{ accessToken: string; refreshToken: string | null }> {
+  const apiHost = optString(account, 'apiHost') || TRAE_API_HOST;
+  const path = '/trae/api/v3/oauth/ExchangeToken';
+  const proof = traeDeviceProof('POST', path, TRAE_CLIENT_ID, refreshToken, key.privateKeyPem);
+  const { body } = await fetchJson(`${apiHost}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-cloudide-token': '' },
+    body: JSON.stringify({
+      ClientID: TRAE_CLIENT_ID,
+      ClientSecret: '',
+      RefreshToken: refreshToken,
+      DeviceInfo: traeDeviceInfo(account, key),
+      DeviceProof: {
+        Signature: proof.signature,
+        Timestamp: proof.timestamp,
+        Nonce: proof.nonce,
+      },
+      IDEVersion: TRAE_IDE_VERSION,
+    }),
+    timeoutMs: ctx.timeoutMs || TRAE_TIMEOUT_FALLBACK,
+  });
+  const result = traeExchangeResult(body);
+  const accessToken = firstString(pick(result, 'Token', 'token'));
+  if (!accessToken) throw new Error('ExchangeToken 未返回 Token，需重新登录');
+  const nextRefresh = firstString(pick(result, 'RefreshToken', 'refreshToken'));
+  return { accessToken, refreshToken: nextRefresh || null };
+}
+
+/** 用 JWT 取账号身份（登录落库时用于生成卡片名） */
+async function traeFetchUserInfo(
+  apiHost: string,
+  token: string,
+  ctx: ProbeContext,
+): Promise<{ id: string; name: string }> {
+  const { body } = await fetchJson(`${apiHost}/cloudide/api/v3/trae/GetUserInfo`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-cloudide-token': token },
+    body: JSON.stringify({ ReqSource: 'IDE', IDEVersion: TRAE_IDE_VERSION }),
+    timeoutMs: ctx.timeoutMs || TRAE_TIMEOUT_FALLBACK,
+  });
+  const result = isRecord(body) ? pick(body, 'Result', 'result') : undefined;
+  const data = isRecord(result) ? pick(result, 'Data', 'data') : undefined;
+  const info = isRecord(data) ? pick(data, 'UserInfo', 'userInfo') ?? data : undefined;
+  const id = firstString(isRecord(info) ? pick(info, 'UserID', 'userId', 'uid', 'ID') : undefined);
+  const name = firstString(
+    isRecord(info) ? pick(info, 'ScreenName', 'screenName', 'UserName', 'userName', 'Name') : undefined,
+  );
+  return { id, name };
+}
+
+/**
+ * 回调参数解析：Trae 把 `authCodeInfo`（JSON）、`userInfo`（用户 JSON）与
+ * `host` / `consoleHost` 追加到 `auth_callback_url`。`authCodeInfo` 可能是
+ * URL 编码的 JSON，也可能被拆成 `authCodeInfo[AuthCode]=...` 形式，两种都兼容。
+ */
+function traeReadCallback(query: URLSearchParams): {
+  authCode: string;
+  userJwt: string;
+  userInfo: string;
+  consoleHost: string;
+  apiHost: string;
+} {
+  const authCodeInfo = query.get('authCodeInfo') ?? '';
+  let authCode = '';
+  if (authCodeInfo) {
+    try {
+      const parsed = JSON.parse(authCodeInfo);
+      if (isRecord(parsed)) authCode = firstString(pick(parsed, 'AuthCode', 'authCode'));
+    } catch {
+      // 不是 JSON：可能被上游直接放成裸 AuthCode
+      authCode = authCodeInfo.trim();
+    }
+  }
+  if (!authCode) authCode = firstString(query.get('AuthCode'), query.get('authCode'));
+  if (!authCode) {
+    // `authCodeInfo[AuthCode]=...` 形式（部分版本用 qs 风格序列化）
+    authCode = firstString(query.get('authCodeInfo[AuthCode]'), query.get('authCodeInfo[authCode]'));
+  }
+  return {
+    authCode,
+    userJwt: firstString(query.get('userJwt'), query.get('user_jwt')),
+    // 官方授权页回跳时写的是 userInfo（授权页 chunk 里 `userInfo: ea`）；
+    // `userJwt` 只用于兼容旧版。两者都是 URL 里的 JSON 文本。
+    userInfo: firstString(query.get('userInfo'), query.get('user_info')),
+    consoleHost: firstString(query.get('consoleHost'), query.get('host')),
+    apiHost: firstString(query.get('apiHost'), query.get('host')),
+  };
+}
+
+/**
+ * 生成 `auth_callback_url`：官方授权页只接受 `http://127.0.0.1:<port>/authorize`
+ * （无查询串、主机名必须是字面量 `127.0.0.1`），所以这里把回环主机统一成
+ * `127.0.0.1`——它同样能连到监听 `0.0.0.0` 或 `localhost` 的服务。
+ */
+function traeCallbackUrl(callbackBase: string): string {
+  let port = '';
+  try {
+    port = new URL(callbackBase).port;
+  } catch {
+    // 基址不合法时退回调用方给的字符串（服务端自己拼的基址，正常不会走到这里）
+  }
+  if (!port) return `${callbackBase.replace(/\/+$/, '')}/authorize`;
+  return `http://127.0.0.1:${port}/authorize`;
+}
+
+/** Trae 回调域名白名单：只接受 trae.cn / trae.com.cn 及其子域，防止 SSRF/令牌外送 */
+function traeHostAllowed(value: string, fallback: string): string {
+  const candidate = value || fallback;
+  let hostname = '';
+  try {
+    hostname = new URL(candidate).hostname.toLowerCase();
+  } catch {
+    return fallback;
+  }
+  return /(^|\.)trae\.(cn|com\.cn)$/.test(hostname) ? candidate.replace(/\/+$/, '') : fallback;
+}
 
 interface CachedToken {
   token: string;
@@ -179,12 +414,13 @@ export function mergeLots(packs: TraePack[]): CreditLot[] {
     );
 }
 
-/** 用 Cookie 换取（并缓存）Cloud-IDE-JWT */
-async function resolveToken(
-  cookie: string,
-  account: AccountConfig,
-  ctx: ProbeContext,
-): Promise<string> {
+/**
+ * 解析可用的 Cloud-IDE-JWT。三条路径按顺序：
+ *   ① 显式 accessToken（登录产物或手工粘贴）——直接使用；
+ *   ② 登录产物的 refreshToken + deviceKey——刷新一次并写回 `.env`；
+ *   ③ Cookie 换 JWT（历史路径，行为不变）。
+ */
+async function resolveJwt(account: AccountConfig, ctx: ProbeContext): Promise<string> {
   const explicit = extractHeaderValue(
     cred(account, ctx, ['accessToken', 'token', 'authorization']),
     'authorization',
@@ -192,6 +428,36 @@ async function resolveToken(
     .replace(/^cloud-ide-jwt\s+/i, '')
     .trim();
   if (explicit) return explicit;
+
+  const refreshToken = cred(account, ctx, ['refreshToken', 'refresh_token']);
+  const key = traeDeviceKeyOf(account, ctx);
+  if (refreshToken && key) {
+    ctx.log('Trae 登录令牌缺失，尝试用 refreshToken + DeviceProof 续期');
+    const refreshed = await traeRefreshJwt(account, ctx, refreshToken, key);
+    if (ctx.persistCredentials) {
+      const patch: Record<string, string> = { accessToken: refreshed.accessToken };
+      if (refreshed.refreshToken) patch.refreshToken = refreshed.refreshToken;
+      try {
+        await ctx.persistCredentials(patch);
+      } catch (persistError) {
+        ctx.log(`Trae 新令牌写回 .env 失败（不影响本次取数）：${(persistError as Error).message}`);
+      }
+    }
+    return refreshed.accessToken;
+  }
+
+  return resolveTokenFromCookie(account, ctx);
+}
+
+/** 用 Cookie 换取（并缓存）Cloud-IDE-JWT */
+async function resolveTokenFromCookie(
+  account: AccountConfig,
+  ctx: ProbeContext,
+): Promise<string> {
+  const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+  if (!cookie) {
+    throw new Error('缺少 Trae 登录令牌与 Cookie：请重新登录，或粘贴 Cookie。');
+  }
 
   const key = cookieKey(cookie);
   const cached = tokenCache.get(key);
@@ -229,9 +495,35 @@ export const traeAdapter: ProviderAdapter = {
   dashboardUrl: 'https://www.trae.cn/dashboard#usage',
   usageUrl: 'https://www.trae.cn/dashboard#usage',
   requiredCredentialKeys: ['cookie'],
+  /**
+   * 两种凭证形态：手工 Cookie（历史路径）或 OAuth 登录产物
+   * （accessToken + refreshToken + deviceKey）。第 2 个账号用 `_2` 槽位。
+   */
+  envNames: {
+    accessToken: 'TRAE_ACCESS_TOKEN',
+    refreshToken: 'TRAE_REFRESH_TOKEN',
+    deviceKey: 'TRAE_DEVICE_KEY',
+  },
+  // Cookie 可换 JWT；登录产物只要有 accessToken 就能取数，refreshToken+deviceKey 负责续期
+  isConfigured: (account) =>
+    Boolean(account.credentials.cookie) || Boolean(account.credentials.accessToken),
   credentialHint:
     '登录 trae.cn 后从 DevTools 复制任意 api.trae.cn 请求的 Cookie 头，填入 credentials.cookie。' +
-    'Token 会自动续签，无需手工维护（也可用 npm run capture 自动抓取）。',
+    'Token 会自动续签，无需手工维护（也可用 npm run capture 自动抓取）；' +
+    '或在看板上点「打开链接登录」自动写入 OAuth 令牌。',
+  /** 登录入口与删除按钮走通用账号管理实现；手工表单只保留 Cookie（兜底） */
+  manageAccounts: true,
+  manageFields: [
+    {
+      key: 'cookie',
+      label: 'Cookie',
+      placeholder: '登录 trae.cn → DevTools → 任意 api.trae.cn 请求 → 复制 Cookie 整段值',
+      hint: 'Cookie 会自动换取 Cloud-IDE-JWT；也可改用「打开链接登录」。',
+      multiline: true,
+    },
+  ],
+  manageHint:
+    'Cookie 会先真实调用一次用量接口验证，通过了才写入本机 .env（新槽位）与 accounts.json；写入前自动备份到 .run/。',
   /**
    * 用量 + 获取明细（v2）：
    *   - 用量：`query_user_usage_group_by_session` 逐笔（`usage_time` + `credits_float`），
@@ -240,11 +532,12 @@ export const traeAdapter: ProviderAdapter = {
    *     与页面「奖励积分 / 查看详情」同源——每日签到、每月登录赠送、套餐发放各成一笔。
    */
   async fetchUsageLedger(account: AccountConfig, ctx: ProbeContext): Promise<UsageLedger | null> {
-    const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+    const hasCookie = Boolean(cred(account, ctx, ['cookie', 'cookieHeader']));
     const hasExplicitToken = Boolean(cred(account, ctx, ['accessToken', 'token', 'authorization']));
-    if (!cookie && !hasExplicitToken) return null;
+    const hasLoginTokens = Boolean(cred(account, ctx, ['refreshToken', 'refresh_token']));
+    if (!hasCookie && !hasExplicitToken && !hasLoginTokens) return null;
 
-    const token = await resolveToken(cookie, account, ctx);
+    const token = await resolveJwt(account, ctx);
     // 与页面请求同源同参：usage_type=[7] 对应页面「使用记录」列表；
     // page_size 实测上限 20（再大会返回 400 code 9004），因此按 20 分页、上限 10 页
     const origin = new URL(optString(account, 'usageUrl') || TRAE_USAGE_URL).origin;
@@ -328,17 +621,180 @@ export const traeAdapter: ProviderAdapter = {
     return { records, covers: { use: true, grant: grantCovered } };
   },
 
+  /**
+   * 「打开链接登录」：OAuth + 本地回调。
+   *
+   * 回调复用主服务端口，且**必须是裸地址** `http://127.0.0.1:<port>/authorize`：
+   * 官方授权页对 `auth_callback_url` 做严格正则
+   * `^http://127\.0\.0\.1:(\d+)/authorize$`，带任何查询串都会直接进入
+   * 「登录失败」并显示兜底文案「网络错误，请刷新页面重试。」。
+   * 会话定位因此改用「当前活跃会话」反查（见 `deliverLoginCallbackToActiveProvider`）。
+   * `secret` 里保存 PKCE verifier 与设备私钥；`handleCallback` 收到授权码后
+   * 由 `poll()` 完成换令牌 + 取用户信息。
+   * 扫码不可行（回调固定 127.0.0.1），所以 `qr: false`。
+   */
+  login: {
+    label: '打开链接登录',
+    hint: '必须在本机浏览器打开（回调固定 127.0.0.1）；完成后回到本页面。',
+    qr: false,
+    intervalMs: 1_000,
+    async start(input) {
+      const consoleHost = TRAE_CONSOLE_HOST;
+      const apiHost = TRAE_API_HOST;
+      const { verifier, challenge } = traePkce();
+      const key = traeGenerateDeviceKey();
+      const traceId = randomUUID();
+      const machineId = randomUUID();
+      const deviceId = randomUUID();
+      const callbackUrl = traeCallbackUrl(input.callbackBase);
+      const query = new URLSearchParams({
+        login_version: '1',
+        auth_from: 'trae',
+        login_channel: 'native_ide',
+        plugin_version: TRAE_IDE_VERSION,
+        auth_type: 'local',
+        client_id: TRAE_CLIENT_ID,
+        redirect: '0',
+        login_trace_id: traceId,
+        auth_callback_url: callbackUrl,
+        machine_id: machineId,
+        device_id: deviceId,
+        code_challenge: challenge,
+        code_challenge_method: 'S256',
+      });
+      input.log('Trae 登录链接已生成，等待浏览器回调');
+      return {
+        authUrl: `${consoleHost}/authorization?${query.toString()}`,
+        qr: false,
+        ttlMs: TRAE_LOGIN_TTL_MS,
+        hint: '在本机浏览器完成登录后，这个窗口会自动继续。',
+        secret: {
+          verifier,
+          privateKeyPem: key.privateKeyPem,
+          publicKeyPem: key.publicKeyPem,
+          consoleHost,
+          apiHost,
+          deviceId,
+          machineId,
+          callback: null,
+        },
+      };
+    },
+    handleCallback(secret, query) {
+      if (!isRecord(secret)) return false;
+      const parsed = traeReadCallback(query);
+      if (!parsed.authCode) return false;
+      (secret as Record<string, unknown>).callback = parsed;
+      return true;
+    },
+    async poll(secret, ctx) {
+      if (!isRecord(secret)) return { status: 'failed', message: '登录会话缺少 OAuth 参数，请重新发起。' };
+      const callback = pick(secret, 'callback');
+      if (!isRecord(callback)) return { status: 'waiting' };
+      const authCode = firstString(pick(callback, 'authCode'));
+      if (!authCode) return { status: 'waiting' };
+
+      const verifier = firstString(pick(secret, 'verifier'));
+      const privateKeyPem = firstString(pick(secret, 'privateKeyPem'));
+      if (!verifier || !privateKeyPem) {
+        return { status: 'failed', message: '登录会话缺少 PKCE / 设备私钥，请重新发起。' };
+      }
+      const key = traeDeviceKeyFromPem(privateKeyPem);
+      const consoleHost = traeHostAllowed(firstString(pick(callback, 'consoleHost')), TRAE_CONSOLE_HOST);
+      const apiHost = traeHostAllowed(firstString(pick(callback, 'apiHost')), TRAE_API_HOST);
+
+      // ① 授权码换令牌（不需要 DeviceProof）
+      const { body } = await fetchJson(`${apiHost}/trae/api/v3/oauth/ExchangeToken`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-cloudide-token': '' },
+        body: JSON.stringify({
+          ClientID: TRAE_CLIENT_ID,
+          AuthCode: authCode,
+          CodeVerifier: verifier,
+          DeviceInfo: traeDeviceInfo(
+            {
+              provider: 'trae',
+              enabled: true,
+              displayName: null,
+              credentials: {},
+              options: {
+                deviceId: firstString(pick(secret, 'deviceId')),
+                machineId: firstString(pick(secret, 'machineId')),
+              },
+            },
+            key,
+          ),
+          IDEVersion: TRAE_IDE_VERSION,
+        }),
+        timeoutMs: ctx.timeoutMs || TRAE_TIMEOUT_FALLBACK,
+      });
+      const result = traeExchangeResult(body);
+      const accessToken = firstString(pick(result, 'Token', 'token'));
+      const refreshToken = firstString(pick(result, 'RefreshToken', 'refreshToken'));
+      if (!accessToken) return { status: 'failed', message: 'ExchangeToken 未返回 Token，请重试。' };
+
+      // ② 取用户身份：优先回调里带的 userInfo / userJwt（省一次请求），否则用新 Token 查
+      let user: { id: string; name: string } = { id: '', name: '' };
+      for (const raw of [firstString(pick(callback, 'userInfo')), firstString(pick(callback, 'userJwt'))]) {
+        if (!raw || user.id) continue;
+        try {
+          const parsed = JSON.parse(raw);
+          if (isRecord(parsed)) {
+            user = {
+              id: firstString(pick(parsed, 'UserID', 'userId', 'uid', 'ID')),
+              name: firstString(pick(parsed, 'ScreenName', 'screenName', 'UserName', 'userName')),
+            };
+          }
+        } catch {
+          // 不是 JSON：忽略，继续尝试下一个 / 走 GetUserInfo
+        }
+      }
+      if (!user.id) {
+        try {
+          user = await traeFetchUserInfo(apiHost, accessToken, ctx);
+        } catch (error) {
+          ctx.log(`Trae 用户信息查询失败：${(error as Error).message}`);
+        }
+      }
+      if (!user.id) {
+        return {
+          status: 'failed',
+          message: '已拿到 Trae 令牌，但上游没有返回用户 ID，无法安全落库。请重试或改用 Cookie。',
+        };
+      }
+
+      return {
+        status: 'ready',
+        account: { id: user.id, name: user.name },
+        credentials: {
+          accessToken,
+          ...(refreshToken ? { refreshToken } : {}),
+          deviceKey: Buffer.from(key.privateKeyPem, 'utf8').toString('base64'),
+        },
+        options: {
+          userId: user.id,
+          consoleHost,
+          apiHost,
+          deviceId: firstString(pick(secret, 'deviceId')),
+          machineId: firstString(pick(secret, 'machineId')),
+        },
+        message: '登录成功，正在验证取数并写入本机配置…',
+      };
+    },
+  },
+
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
-    const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+    const hasCookie = Boolean(cred(account, ctx, ['cookie', 'cookieHeader']));
     const hasExplicitToken = Boolean(cred(account, ctx, ['accessToken', 'token', 'authorization']));
-    if (!cookie && !hasExplicitToken) {
-      return notConfigured(traeAdapter, account, ctx, ['cookie']);
+    const hasLoginTokens = Boolean(cred(account, ctx, ['refreshToken', 'refresh_token']));
+    if (!hasCookie && !hasExplicitToken && !hasLoginTokens) {
+      return notConfigured(traeAdapter, account, ctx, ['cookie 或 accessToken+refreshToken+deviceKey']);
     }
 
     const usageUrl = optString(account, 'usageUrl') || TRAE_USAGE_URL;
 
     try {
-      const token = await resolveToken(cookie, account, ctx);
+      const token = await resolveJwt(account, ctx);
       const { body } = await fetchJson(usageUrl, {
         method: 'POST',
         headers: {
