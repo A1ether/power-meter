@@ -526,7 +526,7 @@ A1etherOpenAi 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>）
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `PORT` | `8787` | 监听端口 |
+| `PORT` | `48213` | 监听端口 |
 | `HOST` | `127.0.0.1` | 默认只听本机；改成 `0.0.0.0` 才对外暴露 |
 | `CACHE_TTL_SECONDS` | `300` | 上游取数缓存时长 |
 | `REQUEST_TIMEOUT_MS` | `12000` | 单平台请求超时 |

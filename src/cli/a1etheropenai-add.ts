@@ -188,7 +188,7 @@ async function main(): Promise<void> {
   );
   console.log('  accounts.json   已追加一条 provider: "a1etheropenai"');
   console.log(`  改动前备份      ${result.backupDir}`);
-  console.log('\n服务会监听文件变化自动热加载，刷新 http://127.0.0.1:8787 即可看到。\n');
+  console.log('\n服务会监听文件变化自动热加载，刷新 http://127.0.0.1:48213 即可看到。\n');
 }
 
 main().catch((error: unknown) => {

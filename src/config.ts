@@ -25,7 +25,7 @@ export interface AppConfig {
 }
 
 const DEFAULTS = {
-  port: 8787,
+  port: 48213,
   host: '127.0.0.1',
   cacheTtlSeconds: 300,
   requestTimeoutMs: 12_000,
