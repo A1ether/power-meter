@@ -172,9 +172,11 @@ interface ProviderSnapshot {
 按 `expiresAt` 升序排列。这里有两个细节：
 
 - 上游 `typesafe/limits.js` 的做法是只留未来批次，本项目沿用；
-- 但 Qoder 只返回 `nextResetAt`（没有批次过期时间），如果只按批次过滤，
+- 但 Qoder 的旧版报文只返回 `nextResetAt`（没有批次过期时间），如果只按批次过滤，
   Qoder 会掉出时间线——所以补了一条**合成事件**「本期额度重置（未用完即作废）」，
   金额取该平台积分合计。这让"重置即作废"的平台也能参与排序。
+- 新版报文（含令牌模式的 openapi 兜底）会给出 `dedicated_resource_packages[].expires_at`，
+  这类批次按真实到期参与排序，不再依赖合成事件。
 
 **第三层：前端分级高亮。** 阈值可配（默认 5 天 / 14 天）：
 

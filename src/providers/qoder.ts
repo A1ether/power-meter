@@ -41,6 +41,20 @@ import {
  *
  * 国际站响应结构为 { data: { totalQuota, sharedQuota, nextResetAt } }（camelCase），
  * 这里同时兼容两种命名。
+ *
+ * openapi `/api/v2/quota/usage`（令牌模式兜底）与新版网页接口改用**扁平结构**：
+ *   {
+ *     user_quota:   { total, used, remaining, unit },          // 套餐额度
+ *     add_on_quota: { total, used, remaining },                // 赠送 / 活动额度
+ *     org_resource_package: { cap, used, remaining },          // 团队共享额度
+ *     dedicated_resource_packages: [                           // 模型专属资源包
+ *       { id, name, total, used, remaining, unit, expires_at, available, status }
+ *     ],
+ *     is_quota_exceeded, total_usage_percentage, expires_at
+ *   }
+ * 两种结构都由 `parseQoderUsage()` 统一解析：账户级额度桶各拆一个批次，
+ * `dedicated_resource_packages[]` 逐包拆批次（带各自 `expires_at`）。
+ * 详见 `docs/fixes/Qoder-令牌模式批次明细缺失-修复方案.md`。
  */
 
 const QODER_TIMEOUT_FALLBACK = 12_000;
@@ -704,7 +718,7 @@ export function parseQoderLots(container: unknown, unit: string): CreditLot[] {
     const remaining = firstNumber(pick(raw, 'remainingValue', 'remaining_value')) ?? 0;
     if (remaining <= 0) continue;
     if (pick(raw, 'isActive', 'is_active') === false) continue;
-    const expiresAt = toIso(pick(raw, 'expiresAt', 'expires_at')) ?? null;
+    const expiresAt = qoderExpiry(pick(raw, 'expiresAt', 'expires_at'));
     const source = firstString(pick(raw, 'source'));
     const id = firstString(pick(raw, 'id')) || `detail-${index}`;
     lots.push(
@@ -731,46 +745,214 @@ export interface QoderUsage {
   lots: CreditLot[];
 }
 
-export function parseQoderUsage(body: unknown): QoderUsage {
-  const payload = isRecord(body) && isRecord(body.data) ? body.data : body;
-  const container = pick(payload, 'totalQuota', 'total_quota');
-  const total = readSummary(container);
-  if (!total) throw new Error('响应缺少 total_quota.quota_summary，Cookie 可能已失效或站点选择错误');
+/**
+ * 是否属于「永不过期」的占位到期值。
+ *
+ * CN 账号的 `expires_at` 常为 `253402214400`（= 9999 年，秒）。
+ * 若直接交给 `toIso()`，它会按「秒」换算——但该值同时满足 `> 1e11`，
+ * 会被误当成毫秒，解析成 1978 年，随后被 `splitByExpiry()` 判成已过期批次。
+ * 因此这里先把秒级的大值换算成毫秒，再统一按 9000 年封顶判占位。
+ */
+export function isQoderPlaceholderExpiry(raw: unknown): boolean {
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    const ms = raw >= 1e12 ? raw : raw * 1000;
+    return ms >= Date.UTC(9000, 0, 1);
+  }
+  const iso = toIso(raw);
+  return iso !== null && Date.parse(iso) >= Date.UTC(9000, 0, 1);
+}
 
-  // 国际站会把团队共享额度放在单独的字段里，累加进总量
-  const sharedContainer = pick(payload, 'sharedQuota', 'shared_quota');
-  const shared = readSummary(sharedContainer);
+/** 批次到期：占位值 / 缺失都归一成 null（不过期） */
+function qoderExpiry(raw: unknown): string | null {
+  if (raw === null || raw === undefined || raw === 0) return null;
+  return isQoderPlaceholderExpiry(raw) ? null : toIso(raw);
+}
 
-  const usedCredits = total.used + (shared?.used ?? 0);
-  const totalCredits = total.total + (shared?.total ?? 0);
-  const remainingCredits = total.remaining + (shared?.remaining ?? 0);
-  const usagePercentage = totalCredits > 0 ? (usedCredits / totalCredits) * 100 : 0;
+interface QoderQuotaBlock {
+  used: number;
+  total: number;
+  remaining: number;
+  unit: string;
+}
 
-  const resetsAt = toIso(
-    pick(payload, 'nextResetAt', 'next_reset_at', 'resetAt', 'reset_at') ??
-      pick(container, 'nextResetAt', 'next_reset_at'),
+/**
+ * 扁平结构的账户级额度桶（`user_quota` / `add_on_quota`）。
+ * 与旧版 `quota_summary` 的区别只是字段名：`total|used|remaining` 对
+ * `limit_value|used_value|remaining_value`。
+ */
+function readQuotaBlock(source: unknown): QoderQuotaBlock | null {
+  if (!isRecord(source)) return null;
+  const total = firstNumber(pick(source, 'total', 'cap', 'limitValue', 'limit_value'));
+  const used = firstNumber(pick(source, 'used', 'usedValue', 'used_value'));
+  const explicitRemaining = firstNumber(
+    pick(source, 'remaining', 'remainingValue', 'remaining_value'),
   );
+  if (total === null && used === null && explicitRemaining === null) return null;
+  const limit = Math.max(0, total ?? (used ?? 0) + (explicitRemaining ?? 0));
+  const consumed = Math.max(0, used ?? Math.max(0, limit - (explicitRemaining ?? 0)));
+  return {
+    used: consumed,
+    total: limit,
+    remaining: Math.max(0, explicitRemaining ?? limit - consumed),
+    unit: firstString(pick(source, 'unit')),
+  };
+}
 
-  const lots = parseQoderLots(container, total.unit);
-  if (sharedContainer && (shared?.remaining ?? 0) > 0) {
+/**
+ * 团队共享额度：两种报文形态都要认——
+ *   - 旧版网页报文：`sharedQuota.quotaSummary.{usedValue,limitValue,remainingValue}`
+ *   - 扁平报文：`org_resource_package.{cap,used,remaining}` / `shared_quota`
+ */
+function readSharedBlock(body: unknown): QoderQuotaBlock | null {
+  const legacy = readSummary(pick(body, 'sharedQuota', 'shared_quota'));
+  if (legacy) return legacy;
+  return readQuotaBlock(pick(body, 'orgResourcePackage', 'org_resource_package'));
+}
+
+const DEDICATED_INACTIVE_STATUS = /EXPIRED|INVALID|INACTIVE|DISABLED|CANCELLED?/i;
+
+/**
+ * 把 `dedicated_resource_packages[]` 拆成批次。
+ *
+ * 字段契约（qodercli 1.1.63 内嵌 schema / QoderBridge 协议参考）：
+ *   `id / name / description / total / used / remaining / unit / expires_at /
+ *    available / status / model_families / model_keys`
+ *
+ * 该数组按上游注释「excluded from total_remaining」，即**不参与**账户级额度汇总，
+ * 但每个包自身带剩余与到期时间——正是「最快到期」需要的粒度。
+ */
+function readDedicatedPackages(body: unknown): CreditLot[] {
+  const raw = pick(body, 'dedicatedResourcePackages', 'dedicated_resource_packages');
+  if (!Array.isArray(raw)) return [];
+
+  const lots: CreditLot[] = [];
+  for (const [index, item] of raw.entries()) {
+    if (!isRecord(item)) continue;
+    const remaining = firstNumber(pick(item, 'remaining', 'remainingValue', 'remaining_value'));
+    if (remaining === null || remaining <= 0) continue;
+    if (pick(item, 'available') === false) continue;
+    const status = firstString(pick(item, 'status'));
+    if (status && DEDICATED_INACTIVE_STATUS.test(status)) continue;
+
+    const expiresAt = qoderExpiry(pick(item, 'expiresAt', 'expires_at'));
+    const id = firstString(pick(item, 'id')) || `pkg-${index}`;
+    const label =
+      firstString(
+        pick(item, 'name'),
+        pick(item, 'description'),
+      ) || '专属资源包';
     lots.push(
       makeLot({
-        id: 'qoder-shared',
-        label: '团队共享额度',
-        amount: shared?.remaining ?? 0,
+        id: `qoder-pkg-${id}`,
+        label,
+        amount: remaining,
         currency: 'CREDITS',
-        expiresAt: resetsAt,
-        note: resetsAt ? '随本期重置作废' : '',
+        expiresAt,
+        note: expiresAt ? '' : '无独立过期时间，随本期重置作废',
       }),
     );
   }
+  return lots;
+}
+
+export function parseQoderUsage(body: unknown): QoderUsage {
+  const payload = isRecord(body) && isRecord(body.data) ? body.data : body;
+  if (!isRecord(payload)) throw new Error('响应结构无法识别，Cookie 可能已失效或站点选择错误');
+
+  // 旧版网页报文：total_quota.{quota_summary,quota_detail[]}
+  const container = pick(payload, 'totalQuota', 'total_quota');
+  const legacyTotal = readSummary(container);
+
+  // 新版扁平报文（openapi /api/v2/quota/usage 与新版网页接口）：
+  // user_quota / add_on_quota / org_resource_package / dedicated_resource_packages[]
+  const userBlock = readQuotaBlock(pick(payload, 'userQuota', 'user_quota'));
+  const addOnBlock = readQuotaBlock(pick(payload, 'addOnQuota', 'add_on_quota'));
+  const shared = readSharedBlock(payload);
+  const dedicatedLots = readDedicatedPackages(payload);
+
+  if (!legacyTotal && !userBlock && !addOnBlock && !shared && dedicatedLots.length === 0) {
+    // 保留 `缺少 total_quota` 子串：buildFailureMessage() 依赖它给出「站点可能不匹配」的提示
+    throw new Error(
+      '响应缺少 total_quota.quota_summary（也未找到 user_quota / add_on_quota），' +
+        'Cookie 或令牌可能已失效、站点选择错误',
+    );
+  }
+
+  // 退化响应守卫：已超额但总额度为 0 = 「从没有过额度」，不能写 0 冒充「用完了」
+  // `totalUsagePercentage` 上游可能给 0~1 的小数（qodercli 同样先归一化到百分数）
+  const rawPercentage = firstNumber(
+    pick(payload, 'totalUsagePercentage', 'total_usage_percentage'),
+  );
+  const percentage =
+    rawPercentage === null
+      ? null
+      : rawPercentage > 0 && rawPercentage <= 1
+        ? rawPercentage * 100
+        : rawPercentage;
+  const exceeded =
+    pick(payload, 'isQuotaExceeded', 'is_quota_exceeded') === true ||
+    (percentage !== null && percentage >= 100);
+  const blocks: QoderQuotaBlock[] = [legacyTotal, userBlock, addOnBlock, shared].filter(
+    (block): block is QoderQuotaBlock => block !== null,
+  );
+  const blockTotal = blocks.reduce((sum, block) => sum + block.total, 0);
+  const blockRemaining = blocks.reduce((sum, block) => sum + block.remaining, 0);
+  if (
+    exceeded &&
+    blockTotal === 0 &&
+    blockRemaining === 0 &&
+    dedicatedLots.every((lot) => lot.amount === 0)
+  ) {
+    throw new Error('额度接口返回「已超额但总额度为 0」的退化数据，无法采信');
+  }
+
+  const usedCredits = blocks.reduce((sum, block) => sum + block.used, 0);
+  const totalCredits = blockTotal;
+  const remainingCredits = blockRemaining;
+  const usagePercentage = totalCredits > 0 ? (usedCredits / totalCredits) * 100 : 0;
+  const unit = blocks.map((block) => block.unit).find((value) => value) ?? '';
+
+  // 重置时间优先级：旧版 nextResetAt > 账户级 expires_at（9999 占位按「不过期」忽略）
+  const resetsAt =
+    toIso(
+      pick(payload, 'nextResetAt', 'next_reset_at', 'resetAt', 'reset_at') ??
+        pick(container, 'nextResetAt', 'next_reset_at'),
+    ) ?? qoderExpiry(pick(payload, 'expiresAt', 'expires_at'));
+
+  const lots = legacyTotal ? parseQoderLots(container, legacyTotal.unit) : [];
+  const resetNote = resetsAt ? '随本期重置作废' : '';
+  const pushBlockLot = (id: string, label: string, block: QoderQuotaBlock | null): void => {
+    if (!block || block.remaining <= 0) return;
+    lots.push(
+      makeLot({
+        id,
+        label,
+        amount: block.remaining,
+        currency: 'CREDITS',
+        expiresAt: resetsAt,
+        note: resetNote,
+      }),
+    );
+  };
+
+  // 旧结构：sharedQuota 是独立块；扁平结构的 org_resource_package 也走这里
+  if (legacyTotal) {
+    pushBlockLot('qoder-shared', '团队共享额度', shared);
+  }
+  // 扁平结构：账户级额度桶各拆一个批次，保证「批次之和 = 余额」
+  if (!legacyTotal) {
+    pushBlockLot('qoder-plan', '套餐额度', userBlock);
+    pushBlockLot('qoder-addon', '赠送/活动额度', addOnBlock);
+    pushBlockLot('qoder-shared', '团队共享额度', shared);
+  }
+  lots.push(...dedicatedLots);
 
   return {
     usedCredits,
     totalCredits,
     remainingCredits,
     usagePercentage,
-    unit: total.unit,
+    unit,
     resetsAt,
     lots,
   };
