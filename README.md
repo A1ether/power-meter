@@ -22,23 +22,47 @@
 # 1. 安装（仅开发依赖，运行时零依赖）
 npm install
 
-# 2. 生成账号配置
+# 2.（可选）生成账号配置：不复制也行，看板里添加第一个账号时会自动创建
 cp accounts.example.json accounts.json
 
 # 3. 启动
 npm start
-# 打开 http://127.0.0.1:8787
+# 打开 http://127.0.0.1:48213
 ```
 
-### 接入自己的账号（推荐：自动抓取，约 1 分钟）
+### 接入自己的账号
+
+**入口：顶栏「平台与账号」（还没有任何账号时也能用）**
+
+打开 <http://127.0.0.1:48213> 后，点顶栏的「平台与账号」：弹窗会列出**全部内置平台**
+（含一个账号都没有的平台），在这里登录、粘贴凭证或删除账号即可，不需要编辑任何文件。
+已有平台想追加第二个账号，也可以继续用卡片上的「＋ 登录 / 添加账号」。
+
+> 首次使用没有 `accounts.json` 也能直接添加：第一个账号保存时会自动创建该文件。
+
+**CodeBuddy / Qoder / Trae：看板上直接登录（推荐）**
+
+在「平台与账号」里选中平台（或对应卡片上点「＋ 登录 / 添加账号」）→「扫码 / 打开链接登录」：
+
+| 平台 | 登录方式 | 说明 |
+| --- | --- | --- |
+| CodeBuddy | 手机扫码 / 新窗口打开链接 | 用 CodeBuddy 客户端或微信完成授权 |
+| Qoder | 手机 Qoder App 扫码 / 新窗口打开链接 | 登录块里先选「国内站 / 国际站」再扫码；令牌按站点写入 `QODER_*` 或 `QODER_GLOBAL_*` |
+| Trae | 新窗口打开链接 | 回调固定 `127.0.0.1`，必须在本机浏览器完成 |
+
+授权成功后服务端会先验证取数、再把令牌写入 `.env` 并注册账号，**一个账号一张卡片**；
+同一账号再次登录只刷新凭证，不会多出一张卡。令牌过期时会自动续期并写回 `.env`。
+
+**其他平台 / 兜底：自动抓取 Cookie（约 1 分钟）**
 
 ```bash
 npm run chrome:debug     # ① 弹出一个调试专用 Chrome 窗口
                          #   ② 在里面登录 Qoder / Trae / CodeBuddy / CodeArts / MiniMax Code
-                         #      并各自打开「用量 / 账单」页面（MiniMax Code 停在 agent.minimax.cn）
+                         #      并各自打开「用量 / 账单」页面（MiniMax Code 停在 agent.minimax.cn；
+                         #      Qoder 国际站账号停在 qoder.com/account/usage，抓取时加 --site global）
 npm run capture          # ③ 自动抓取各平台的登录态，写入 .env
 npm run probe            # ④ 验证取数是否正常
-# 刷新 http://127.0.0.1:8787
+# 刷新 http://127.0.0.1:48213
 ```
 
 除 A1etherOpenAi（API 密钥）与 MiniMax Code（网页端登录态 token + Cookie）外，其余平台都只需要**一个 Cookie**，
@@ -118,6 +142,7 @@ power-meter/
     ├── config.ts                    # 配置加载：.env 解析、${VAR} 展开、mtime 监控
     ├── types.ts                     # 统一数据契约
     ├── cli/probe.ts                 # 命令行凭证探测工具
+    ├── cli/account.ts               # 一条命令给任意平台增删账号（先验证再写入）
     ├── cli/a1etheropenai-add.ts               # 一条命令添加 A1etherOpenAi 账号（先验证再写入）
     ├── lib/
     │   ├── http.ts                  # 带硬超时的 fetch + HTTP/业务错误码映射
@@ -231,7 +256,7 @@ interface ProviderSnapshot {
 - **凭证默认不外泄**：`/api/config` 只返回**存在哪些凭证 key**，不返回值；
   只有适配器显式声明 `revealableSecrets()` 的密钥（目前仅 A1etherOpenAi 的项目密钥）
   才会以掩码形式出现在快照里，明文要靠 `/api/reveal` 按需读取；
-  而 `/api/reveal` 与 `/api/a1etheropenai/accounts*` 都属于本机特权接口，默认只允许回环来源
+  而 `/api/reveal` 与 `/api/accounts*`（含遗留的 `/api/a1etheropenai/accounts*`）都属于本机特权接口，默认只允许回环来源
   （见上文「三道闸门」）；
   `accounts.json` 已加入 `.gitignore`，推荐用 `${ENV_VAR}` 引用 `.env`。
 
@@ -532,7 +557,8 @@ A1etherOpenAi 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>）
 
 ### 本机特权接口的三道闸门
 
-`/api/reveal` 能读出凭证明文，`/api/a1etheropenai/accounts*` 能改动本机配置文件，
+`/api/reveal` 能读出凭证明文，`/api/accounts*`（及其兼容路由 `/api/a1etheropenai/accounts*`）
+与 `/api/login/*` 能改动本机配置文件（登录接口还会向上游发起认证请求），
 所以这几个接口共用同一道闸门，默认**只允许本机**：
 
 1. **来源必须回环**：请求的 `Host` 与 `Origin` 都必须是 `127.0.0.1` / `localhost` / `::1`。
@@ -581,7 +607,7 @@ Trae 的 OAuth 回调 `/authorize` 是唯一例外：浏览器从 trae.cn 跳回
 | `EXPIRY_CRITICAL_DAYS` | `5` | 红色高亮阈值：≤ 该天数到期显示红色 |
 | `EXPIRY_WARNING_DAYS` | `14` | 黄色高亮阈值：`criticalDays`~该天数到期显示黄色，更久显示绿色 |
 | `ACCOUNTS_PATH` | `./accounts.json` | 账号文件路径 |
-| `ALLOW_SECRET_REVEAL` | 未设置 | 设为 `1` 才允许非本机访问本机特权接口（读密钥 `/api/reveal`、增删账号 `/api/a1etheropenai/accounts*`）（**前方必须已有反代鉴权**）|
+| `ALLOW_SECRET_REVEAL` | 未设置 | 设为 `1` 才允许非本机访问本机特权接口（读密钥 `/api/reveal`、增删账号 `/api/accounts*` 与 `/api/a1etheropenai/accounts*`）（**前方必须已有反代鉴权**）|
 
 另见 `.env.example`；`src/config.ts` 内置了极简 `.env` 解析，无需 `dotenv`。
 

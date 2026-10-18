@@ -646,7 +646,9 @@ server.listen(bootstrap.server.port, bootstrap.server.host, () => {
     );
   }
   if (!service.accounts.some((account) => account.enabled && !account.provider.startsWith('demo:'))) {
-    console.log('  提示：当前只有示例数据，配置真实凭证请编辑 accounts.json（保存后自动生效）\n');
+    console.log(
+      `  提示：还没有启用的真实账号。打开 ${origin} → 顶栏「平台与账号」即可添加（无需编辑文件）\n`,
+    );
   }
 });
 

@@ -52,6 +52,17 @@
       }
     },
     {
+      "provider": "qoder",
+      "displayName": "Qoder 国际站",
+      "enabled": false,
+      "credentials": {
+        "cookie": "${QODER_GLOBAL_COOKIE}"
+      },
+      "options": {
+        "site": "global"
+      }
+    },
+    {
       "provider": "trae",
       "displayName": "Trae",
       "enabled": true,
@@ -70,6 +81,15 @@
       "options": {}
     },
     {
+      "provider": "codebuddy",
+      "displayName": "CodeBuddy · 账号 2",
+      "enabled": false,
+      "credentials": {
+        "cookie": "${CODEBUDDY_COOKIE_2}"
+      },
+      "options": {}
+    },
+    {
       "provider": "codearts",
       "displayName": "CodeArts 华为云",
       "enabled": true,
@@ -77,15 +97,6 @@
         "accessKey": "${CODEARTS_AK}",
         "secretKey": "${CODEARTS_SK}",
         "cookie": "${CODEARTS_COOKIE}"
-      },
-      "options": {}
-    },
-    {
-      "provider": "codebuddy",
-      "displayName": "CodeBuddy · 账号 2",
-      "enabled": false,
-      "credentials": {
-        "cookie": "${CODEBUDDY_COOKIE_2}"
       },
       "options": {}
     },

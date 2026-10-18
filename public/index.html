@@ -20,6 +20,7 @@
       </div>
 
       <div class="topbar__actions">
+        <button class="btn" id="platforms-btn" type="button">平台与账号</button>
         <label class="switch" title="每 5 分钟自动刷新">
           <input type="checkbox" id="auto-refresh" checked />
           <span>自动刷新</span>
@@ -103,32 +104,8 @@
           <div class="usage__grid"></div>
         </a>
 
-        <div class="manage" hidden>
-          <form class="manage__form" hidden>
-            <label class="manage__field">
-              <span>个人 apikey</span>
-              <input type="password" name="apiKey" autocomplete="off" spellcheck="false"
-                     placeholder="sk-…（Settings → API Key 创建）" />
-            </label>
-            <label class="manage__field">
-              <span>对应的项目 apikey</span>
-              <input type="password" name="paiKey" autocomplete="off" spellcheck="false"
-                     placeholder="项目 Dashboard → Create Project Environment" />
-            </label>
-            <div class="manage__actions">
-              <button class="manage__submit" type="submit">验证并添加</button>
-              <button class="manage__cancel" type="button">取消</button>
-            </div>
-            <p class="manage__hint">两把密钥都会先验证，通过了才写入本机配置；写入前会自动备份。</p>
-          </form>
-
-          <p class="manage__result" hidden></p>
-
-          <div class="manage__hidden" hidden>
-            <p class="manage__hidden-title">以下账号已配置但未显示在卡片上（已停用或缺凭证）：</p>
-            <div class="manage__hidden-list"></div>
-          </div>
-        </div>
+        <!-- 管理区由 #manage-template 克隆进来：卡片与「平台与账号」弹窗共用同一套登录 / 表单 / 删除逻辑 -->
+        <div class="manage-slot"></div>
 
         <div class="meter" hidden>
           <div class="meter__bar"><span class="meter__fill"></span></div>
@@ -169,6 +146,82 @@
         </footer>
       </article>
     </template>
+
+    <!--
+      管理区模板：卡片内（追加账号）与顶栏「平台与账号」弹窗（首次添加）共用。
+      登录入口：适配器声明了 login（CodeBuddy / Qoder / Trae）才出现；
+      二维码由 public/vendor/qrcode.js 在本地绘制，authUrl 不出本机。
+    -->
+    <template id="manage-template">
+      <div class="manage" hidden>
+        <div class="login" hidden>
+          <div class="login__head">
+            <button class="login__start" type="button">扫码 / 打开链接登录</button>
+            <!-- 站点选择：只有声明了站点 option 的平台（Qoder）才出现。选项由
+                 manageFields 的 choices 动态填充，取值随会话发给 /api/login/start，
+                 登录结果落库时带上同一站点 -->
+            <label class="login__site" hidden>
+              <span>站点</span>
+              <select class="login__site-select"></select>
+            </label>
+            <span class="login__hint muted"></span>
+          </div>
+          <div class="login__panel" hidden>
+            <div class="login__qr">
+              <canvas class="login__canvas" width="240" height="240" hidden></canvas>
+              <p class="login__qr-fallback muted" hidden></p>
+            </div>
+            <div class="login__info">
+              <p class="login__status"></p>
+              <a class="login__link" target="_blank" rel="noreferrer noopener" hidden>在新窗口打开登录页 ↗</a>
+              <div class="login__actions">
+                <button class="login__copy secret__btn" type="button">复制链接</button>
+                <button class="login__cancel secret__btn" type="button">取消</button>
+              </div>
+              <p class="login__note muted"></p>
+            </div>
+          </div>
+        </div>
+
+        <!-- 手工凭证：登录能力缺失或登录失败时的兜底入口，默认折叠 -->
+        <details class="manage__manual">
+          <summary>填写凭证</summary>
+          <form class="manage__form">
+            <!-- 凭证字段由适配器声明驱动（/api/providers 的 manageFields），前端不认平台名 -->
+            <div class="manage__fields"></div>
+            <label class="manage__field">
+              <span>账号备注名（可选）</span>
+              <input type="text" name="accountName" autocomplete="off" spellcheck="false"
+                     placeholder="留空自动命名，如「CodeBuddy · 账号 2」" />
+            </label>
+            <div class="manage__actions">
+              <button class="manage__submit" type="submit">验证并添加</button>
+              <button class="manage__cancel" type="button">取消</button>
+            </div>
+            <p class="manage__hint"></p>
+          </form>
+        </details>
+
+        <p class="manage__result" hidden></p>
+
+        <div class="manage__hidden" hidden>
+          <p class="manage__hidden-title"></p>
+          <div class="manage__hidden-list"></div>
+        </div>
+      </div>
+    </template>
+
+    <!-- 「平台与账号」弹窗：没有账号的平台也能在这里添加（入口常驻顶栏） -->
+    <dialog class="dialog" id="platforms-dialog" aria-label="平台与账号">
+      <div class="dialog__head">
+        <div>
+          <h2 id="platforms-title">平台与账号</h2>
+          <p class="muted" id="platforms-subtitle">登录或填写凭证，成功后自动写入本机配置</p>
+        </div>
+        <button class="dialog__close" id="platforms-close" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="dialog__body" id="platforms-body"></div>
+    </dialog>
 
     <script type="module" src="/app.js"></script>
   </body>

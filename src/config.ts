@@ -153,7 +153,10 @@ export function loadConfig(): LoadConfigResult {
       warnings.push(`accounts.json 解析失败：${(error as Error).message}`);
     }
   } else {
-    warnings.push(`未找到 ${accountsFilePath}，请先复制 accounts.example.json`);
+    warnings.push(
+      `未找到 ${accountsFilePath}：看板里添加第一个账号时会自动创建；` +
+        '想一次性带入示例配置可复制 accounts.example.json。',
+    );
   }
 
   const accounts: AccountConfig[] = [];

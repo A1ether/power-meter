@@ -867,6 +867,171 @@ body {
   gap: 9px;
 }
 
+/* 手工凭证的折叠区（登录能力之外的兜底入口）：登录块在上面，这里默认收起 */
+.manage__manual {
+  margin-top: 10px;
+}
+
+.manage__manual > summary {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.manage__manual > summary:hover {
+  color: var(--text);
+}
+
+/* ------------------------- 扫码 / 打开链接登录 ------------------------- */
+
+.login {
+  margin-top: 10px;
+  padding: 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.login__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+}
+
+.login__start {
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: linear-gradient(135deg, var(--accent), var(--info));
+  color: #fff;
+  cursor: pointer;
+  transition: transform 0.15s ease, opacity 0.15s ease;
+}
+
+.login__start:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.login__start:disabled {
+  opacity: 0.6;
+  cursor: progress;
+  transform: none;
+}
+
+/* 登录站点选择：与登录按钮同一行，只有多站点平台（Qoder）才显示 */
+.login__site {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.login__site-select {
+  font: inherit;
+  font-size: 11.5px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.login__hint {
+  flex: 1;
+  min-width: 180px;
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.login__panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.login__qr {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 160px;
+  min-height: 120px;
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  background: #fff;
+}
+
+/* 二维码始终白底：canvas 自己画了静区，容器只负责托底 */
+.login__canvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.login__qr-fallback {
+  margin: 0;
+  max-width: 220px;
+  padding: 10px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: #4a5568;
+}
+
+.login__info {
+  flex: 1;
+  min-width: 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.login__status {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.login__status[data-state='ready'] {
+  color: var(--ok);
+}
+
+.login__status[data-state='failed'],
+.login__status[data-state='expired'] {
+  color: var(--danger);
+}
+
+.login__link {
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+  word-break: break-all;
+}
+
+.login__link:hover {
+  text-decoration: underline;
+}
+
+.login__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.login__note {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 .manage__field {
   display: flex;
   flex-direction: column;
@@ -878,7 +1043,9 @@ body {
   color: var(--text-muted);
 }
 
-.manage__field input {
+.manage__field input,
+.manage__field textarea,
+.manage__field select {
   font: inherit;
   font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
   font-size: 12px;
@@ -889,10 +1056,31 @@ body {
   border-radius: var(--radius-sm);
 }
 
-.manage__field input:focus {
+/* 下拉字段（如 Qoder 的站点）：原生箭头保留，只统一主题与指针 */
+.manage__field select {
+  cursor: pointer;
+}
+
+/* Cookie 这类长文本：允许纵向拖拽查看，但不让用户横向撑破卡片 */
+.manage__field textarea {
+  min-height: 56px;
+  resize: vertical;
+  word-break: break-all;
+}
+
+.manage__field input:focus,
+.manage__field textarea:focus,
+.manage__field select:focus {
   outline: none;
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+/* 字段级补充说明（如「必须含 www 子域 Cookie」），比标签更小一号 */
+.manage__field-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
 }
 
 .manage__actions {
@@ -1263,6 +1451,191 @@ body {
   border: 1px dashed var(--border-strong);
   border-radius: var(--radius);
   grid-column: 1 / -1;
+}
+
+.empty__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.empty__hint {
+  margin: 6px 0 16px;
+  font-size: 12.5px;
+}
+
+.empty__action {
+  margin: 0 auto;
+}
+
+/* ------------------------------------------------------------------ *
+ * 「平台与账号」弹窗：没有账号的平台也能从这里第一次添加
+ * ------------------------------------------------------------------ */
+
+.dialog {
+  width: min(720px, calc(100vw - 32px));
+  max-height: min(84vh, 760px);
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-strong);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.dialog::backdrop {
+  background: rgba(3, 6, 14, 0.62);
+  backdrop-filter: blur(3px);
+}
+
+.dialog__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.dialog__head h2 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.dialog__head p {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+}
+
+.dialog__close {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.dialog__close:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+.dialog__body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 20px 20px;
+  max-height: calc(84vh - 82px);
+  overflow: auto;
+}
+
+.dialog__back {
+  align-self: flex-start;
+}
+
+.dialog__path,
+.dialog__error {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.dialog__error {
+  color: var(--danger);
+}
+
+.dialog__issues {
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+  padding: 10px 12px;
+}
+
+.dialog__issues-title {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--warn);
+}
+
+.dialog__issue {
+  margin: 4px 0 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+.platforms {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.platform {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+}
+
+.platform__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.platform__title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.platform__name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.platform__count {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.platform__count--empty {
+  color: var(--warn);
+}
+
+.platform__unsupported {
+  flex: none;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.platform__hint {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.platform__accounts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .footer {

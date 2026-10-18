@@ -77,6 +77,26 @@ export const a1etheropenaiAdapter: ProviderAdapter = {
   neverExpires: true,
   // 卡片上直接提供「添加 / 删除账号」的入口
   manageAccounts: true,
+  /**
+   * 表单字段声明：前端照它渲染「个人 apikey / 项目 apikey」两个输入框。
+   *
+   * 增删的落地实现仍是专用的 `src/a1etheropenai-store.ts`（两把密钥要分别验证、
+   * .env 用 `A1etherOpenAi_<字母>_API_KEY` 槽位、项目密钥还要打只读模型列表），
+   * 通用接口只负责把请求转发过去——见 src/account-store.ts 的 provider 分派。
+   */
+  manageFields: [
+    {
+      key: 'apiKey',
+      label: '个人 apikey',
+      placeholder: 'sk-…（Settings → API Key 创建）',
+    },
+    {
+      key: 'paiApiKey',
+      label: '对应的项目 apikey',
+      placeholder: '项目 Dashboard → Create Project Environment',
+    },
+  ],
+  manageHint: '两把密钥都会先验证，通过了才写入本机配置；写入前会自动备份。',
   credentialHint:
     '在 https://www.d1v.ai/settings?tab=api-key 创建一把具名密钥（只在创建时完整显示一次），' +
     '填入 credentials.apiKey；' +
