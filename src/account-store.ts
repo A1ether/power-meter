@@ -198,6 +198,15 @@ export interface ManagedAccountView {
   previews: Record<string, string>;
   /** 引用到的 .env 变量名（明文直填的条目为空数组） */
   envRefs: string[];
+  /**
+   * 账号的非敏感选项，**只含适配器在 `manageFields` 里声明为 `target: 'option'` 的键**
+   * （如 Qoder 的 `site`）。
+   *
+   * 用途：「平台与账号」弹窗按站点拆行、账号按站点归桶。之所以要白名单而不是整份
+   * `options` 透出去：`options` 里可能有用户自定义域名之类的配置，而 `option` 字段
+   * 的契约本身就是「非敏感、可展示」（见 base.ts 的 ManageFieldDescriptor）。
+   */
+  options: Record<string, string>;
 }
 
 export interface ListManagedResult {
@@ -229,6 +238,8 @@ export function listManagedAccounts(provider: string): ListManagedResult {
         envRefs: account.envSuffix
           ? [`A1etherOpenAi_${account.envSuffix}_API_KEY`, `A1etherOpenAi_${account.envSuffix}_PAI_API_KEY`]
           : [],
+        // 该平台没有站点之类的 option 字段，恒为空（见 declaredOptionsOf）
+        options: {},
       })),
       warnings: listed.warnings,
       missingEnvVars: listed.missingEnvVars,
@@ -262,9 +273,31 @@ export function listManagedAccounts(provider: string): ListManagedResult {
         Object.entries(account.credentials).map(([key, value]) => [key, maskSecret(value)]),
       ),
       envRefs: rawRefs.get(account.displayName ?? '') ?? [],
+      // 只透出声明为 option 的键（非敏感）；前端据此把账号归到对应站点行
+      options: declaredOptionsOf(adapter, account),
     }));
 
   return { accounts, warnings, missingEnvVars };
+}
+
+/**
+ * 账号的非敏感选项白名单：`manageFields` 里 `target === 'option'` 的键。
+ *
+ * 前端「平台与账号」按站点拆行时要读 `options.site`，但 `options` 还可能装着
+ * 用户自定义域名之类的配置，不该整份下发。声明为 option 的字段本身就是
+ * 「非敏感、可展示」的契约（见 base.ts 的 ManageFieldDescriptor）。
+ */
+function declaredOptionsOf(
+  adapter: ProviderAdapter,
+  account: AccountConfig,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const field of adapter.manageFields ?? []) {
+    if (field.target !== 'option') continue;
+    const value = account.options[field.key];
+    if (typeof value === 'string' && value.trim()) out[field.key] = value.trim();
+  }
+  return out;
 }
 
 /* ------------------------------------------------------------------ *
