@@ -385,17 +385,129 @@ function renderSortOptions(data) {
   els.sort.value = state.sort;
 }
 
+/**
+ * 站点 → 前端文案。Qoder 的国内站 / 国际站是同一个 provider 下的两个账号，
+ * 「按平台」子菜单、「平台与账号」弹窗与卡片 region 徽标都按这张表说人话。
+ * 出现未登记的站点值时回退大写标识，不抛错——分组与筛选仍然可用。
+ */
+const SITE_LABELS = { cn: '国内版', global: '国际版' };
+
+/**
+ * 站点筛选词：`<平台名> <站点标签>`。
+ *
+ * 子菜单行的标签、命令面板的「查看 X」、卡片搜索 haystack 三处**必须**走同一个函数，
+ * 否则「点菜单能筛到、手输同样的词却筛空」这种口径分裂就会出现。
+ */
+function siteFilterTerm(baseName, region) {
+  const site = SITE_LABELS[region] ?? String(region ?? '').toUpperCase();
+  return `${baseName} ${site}`.trim();
+}
+
+/** 平台显示名：优先用 /api/providers 的适配器名（干净、稳定，不含账号后缀） */
+function baseNameOf(providerId, members) {
+  const meta = metaFor({ provider: providerId });
+  if (meta?.displayName) return meta.displayName;
+  // 回退：快照标题去掉「 · 账号名」后缀，避免把某一账号的身份当成平台名
+  const first = members[0]?.displayName ?? providerId;
+  return first.split(' · ')[0].trim() || providerId;
+}
+
+/**
+ * 哪些平台需要按站点拆行：同一 provider 的快照里出现了多于一种 region。
+ *
+ * 只有这类平台才需要「Qoder CN / Qoder 国际版」两行；CodeBuddy 两个账号都是 cn，
+ * 语义上就是一个平台，合并成一行才是对的。
+ */
+function crossRegionProviders(providers) {
+  const seen = new Map();
+  for (const provider of providers) {
+    if (!seen.has(provider.provider)) seen.set(provider.provider, new Set());
+    seen.get(provider.provider).add(provider.region);
+  }
+  const cross = new Set();
+  for (const [id, regions] of seen) {
+    if (regions.size > 1) cross.add(id);
+  }
+  return cross;
+}
+
+/**
+ * 「按平台」子菜单与命令面板的行模型：一个平台一行；跨站点平台按站点拆行。
+ *
+ * 返回 `[{ key, provider, region, label, members }]`，其中 region 为 null 表示
+ * 未拆站点的整平台行。行数口径 = 平台数（跨站点平台按站点计），与「按平台」一致。
+ */
+function platformGroups(data) {
+  const providers = data?.providers ?? [];
+  if (providers.length === 0) return [];
+
+  const cross = crossRegionProviders(providers);
+  const buckets = new Map();
+
+  for (const provider of providers) {
+    const split = cross.has(provider.provider);
+    const key = split ? `${provider.provider}#${provider.region}` : provider.provider;
+    const bucket = buckets.get(key);
+    if (bucket) {
+      bucket.members.push(provider);
+    } else {
+      buckets.set(key, {
+        key,
+        provider: provider.provider,
+        region: split ? provider.region : null,
+        members: [provider],
+      });
+    }
+  }
+
+  return [...buckets.values()].map((group) => {
+    const baseName = baseNameOf(group.provider, group.members);
+    return {
+      ...group,
+      label: group.region ? siteFilterTerm(baseName, group.region) : baseName,
+    };
+  });
+}
+
+/**
+ * 组金额：组内可用快照、**同币种**才求和。
+ * 混币种返回 null（界面显示 —），与 src/aggregate.ts 的取向一致——
+ * 不同单位硬加会给出一个假数字。
+ */
+function groupBalance(members) {
+  const healthy = members.filter((item) => item.status === 'ok' || item.status === 'demo');
+  if (healthy.length === 0) return null;
+  const currencies = new Set(healthy.map((item) => currencyFor(item)));
+  if (currencies.size > 1) return null;
+  return healthy.reduce((sum, item) => sum + balanceFor(item), 0);
+}
+
+/** 组状态点：组内最紧急的那一条（critical > warning > safe） */
+function groupUrgency(members, thresholds) {
+  const levels = members.map((item) => urgencyOf(item, thresholds));
+  if (levels.includes('critical')) return 'critical';
+  if (levels.includes('warning')) return 'warning';
+  return 'safe';
+}
+
 function sortedProviders(data) {
   const thresholds = data.expiryThresholds;
   const query = state.query.trim().toLowerCase();
   let providers = data.providers;
+  // 跨站点平台（如 Qoder）的卡片要能被「Qoder CN / Qoder 国际版」精确命中：
+  // 卡片标题里没有站点字样，所以在这里补上站点筛选词（与子菜单同源）
+  const crossRegion = crossRegionProviders(providers);
 
   if (query) {
     providers = providers.filter((provider) => {
+      const siteText = crossRegion.has(provider.provider)
+        ? siteFilterTerm(baseNameOf(provider.provider, [provider]), provider.region)
+        : '';
       const haystack = [
         provider.displayName,
         provider.provider,
         provider.plan ?? '',
+        siteText,
         currencyFor(provider),
         ...provider.credits.map((lot) => lot.label),
       ]
@@ -464,11 +576,15 @@ function renderGrid(data) {
   }
 
   const fragment = document.createDocumentFragment();
-  for (const provider of providers) fragment.append(buildCard(provider, thresholds));
+  // 跨站点平台（如 Qoder）的卡片徽标要显示站点标签，与「按平台」子菜单的行文案对齐
+  const crossRegion = crossRegionProviders(providers);
+  for (const provider of providers) {
+    fragment.append(buildCard(provider, thresholds, crossRegion));
+  }
   els.grid.append(fragment);
 }
 
-function buildCard(provider, thresholds) {
+function buildCard(provider, thresholds, crossRegion = new Set()) {
   const node = els.cardTemplate.content.firstElementChild.cloneNode(true);
   const healthy = provider.status === 'ok' || provider.status === 'demo';
   node.dataset.state = healthy ? 'ok' : 'failed';
@@ -477,9 +593,14 @@ function buildCard(provider, thresholds) {
   node.querySelector('.card__name').textContent = provider.displayName;
 
   const tags = node.querySelector('.card__tags');
-  tags.append(
-    element('span', `chip chip--${provider.region}`, provider.region === 'cn' ? '国内' : '国际'),
-  );
+  // 同平台跨站点时（Qoder 国内 / 国际），徽标说「CN / 国际版」才和左侧子菜单对得上；
+  // 只有一个站点的平台保持原「国内 / 国际」，不为没有歧义的地方造新词
+  const regionText = crossRegion.has(provider.provider)
+    ? (SITE_LABELS[provider.region] ?? String(provider.region ?? '').toUpperCase())
+    : provider.region === 'cn'
+      ? '国内'
+      : '国际';
+  tags.append(element('span', `chip chip--${provider.region}`, regionText));
   if (provider.status === 'demo') tags.append(element('span', 'chip chip--demo', '示例数据'));
   if (provider.stale) tags.append(element('span', 'chip chip--warning', '数据可能过期'));
   // 有到期概念的走三色分级；明确不过期的（如 A1etherOpenAi 的 quota）直接给绿色标签。
@@ -2012,37 +2133,42 @@ function countDiagnostics(data) {
 }
 
 /**
- * 「按平台」子菜单：一行一个平台，右侧金额与到期状态点。
+ * 「按平台」子菜单：一行一个平台（同一平台的多个账号合成一行），
+ * 跨站点的平台（Qoder 国内 / 国际）按站点拆行，标签为 `Qoder CN` / `Qoder 国际版`。
+ * 右侧是该组金额合计与组内最紧急的到期状态点。
  * data 为 null（首屏接口还没回来）时保持空清单，不写占位行。
  */
 function renderNavPlatforms(data) {
   if (!els.navPlatforms) return;
   els.navPlatforms.replaceChildren();
 
-  const providers = data?.providers ?? [];
-  if (providers.length > 0) {
+  const groups = platformGroups(data);
+  if (groups.length > 0) {
     // 阈值缺省时给个兜底，避免 urgencyOf 读 undefined.criticalDays 直接抛错
     const thresholds = data.expiryThresholds ?? { criticalDays: 3, warningDays: 7 };
     const fragment = document.createDocumentFragment();
-    for (const provider of providers) {
-      const healthy = provider.status === 'ok' || provider.status === 'demo';
+    for (const group of groups) {
+      const amount = groupBalance(group.members);
       const row = element('button', 'nav__sub-item');
       row.type = 'button';
-      row.dataset.provider = provider.displayName;
+      // 点行 = 把组标签写进筛选框（跨站点行即「Qoder CN」这类站点筛选词）
+      row.dataset.provider = group.provider;
+      if (group.region) row.dataset.region = group.region;
+      row.dataset.filter = group.label;
 
       const dot = element('span', 'nav__sub-dot');
-      dot.dataset.level = urgencyOf(provider, thresholds);
+      dot.dataset.level = groupUrgency(group.members, thresholds);
       row.append(
         dot,
-        element('span', 'nav__sub-label', provider.displayName),
-        // 取数失败的平台金额没有意义：显示占位符并弱化，别让人以为它是 0
+        element('span', 'nav__sub-label', group.label),
+        // 取数失败 / 混币种时金额没有意义：显示占位符并弱化，别让人以为它是 0
         element(
           'span',
-          `nav__sub-amount${healthy ? '' : ' nav__sub-amount--muted'}`,
-          healthy ? fmtNumber(balanceFor(provider)) : '—',
+          `nav__sub-amount${amount === null ? ' nav__sub-amount--muted' : ''}`,
+          amount === null ? '—' : fmtNumber(amount),
         ),
       );
-      row.addEventListener('click', () => filterByProvider(provider.displayName));
+      row.addEventListener('click', () => filterByProvider(group.label));
       fragment.append(row);
     }
     els.navPlatforms.append(fragment);
@@ -2268,11 +2394,13 @@ function buildCommands() {
     { label: '打开平台与账号', hint: '操作', run: () => openPlatformsDialog() },
     { label: '切换自动刷新', hint: '操作', run: () => toggleAutoRefresh() },
   ];
-  for (const provider of state.data?.providers ?? []) {
+  // 平台命令与「按平台」子菜单同源（platformGroups）：跨站点平台出两条
+  // 「查看 Qoder CN / 查看 Qoder 国际版」，不拆站点的平台仍是一条
+  for (const group of platformGroups(state.data)) {
     items.push({
-      label: `查看 ${provider.displayName}`,
+      label: `查看 ${group.label}`,
       hint: '平台',
-      run: () => filterByProvider(provider.displayName),
+      run: () => filterByProvider(group.label),
     });
   }
   return items;
