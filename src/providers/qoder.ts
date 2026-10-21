@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { ensureDebugChrome, openCookieCollector, type CookieCollector } from '../lib/cdp.js';
 import { assertBusinessOk, fetchJson, HttpError } from '../lib/http.js';
 import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
 import { startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
@@ -20,6 +21,7 @@ import {
   splitByExpiry,
   type ProbeContext,
   type ProviderAdapter,
+  type ProviderLogin,
 } from './base.js';
 
 /**
@@ -87,6 +89,25 @@ const QODER_LOGIN = {
 const QODER_CLIENT_ID = 'e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb';
 const QODER_LOGIN_TTL_MS = 5 * 60 * 1000;
 const QODER_POLL_INTERVAL_MS = 1_000;
+/** 网页端登录的轮询间隔：抓 Cookie 无需打上游接口，稍慢一点也无妨 */
+const QODER_WEB_POLL_INTERVAL_MS = 2_000;
+/**
+ * 网页端登录：页面**空闲**超过此时长且仍未检测到登录态，才主动刷新页面重新采集。
+ *
+ * 为什么必须等页面空闲：用户正在调试 Chrome 里填表单 / 扫码时，页面是「忙」的
+ * （有请求在飞），此时刷新会重置表单、打断登录。旧实现是「等待超过 20 秒后
+ * 每一轮轮询（2 秒）都刷新一次」，5 分钟 TTL 内约 140 次刷新，等于把登录页
+ * 反复重置——这正是用户「登录完成后仍一直等待」的加剧因素。
+ */
+const QODER_WEB_RELOAD_IDLE_MS = 20_000;
+/** 两次主动刷新之间的最小间隔 */
+const QODER_WEB_RELOAD_MIN_INTERVAL_MS = 15_000;
+/** 整个会话内最多主动刷新几次（用于「页面不再发请求」「跨标签页 SSO」这类兜底） */
+const QODER_WEB_RELOAD_MAX = 2;
+/** 网页端登录是人工操作（输密码 / 扫码），TTL 比扫码登录放宽一倍，避免输到一半被判超时 */
+const QODER_WEB_LOGIN_TTL_MS = 10 * 60 * 1000;
+/** 网页侧身份接口：登录态 200、访客态 401（实测），作为站点无关的功能性登录判据 */
+const QODER_WEB_IDENTITY_PATH = '/api/v1/me';
 const PKCE_CHARS =
   'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
 
@@ -459,6 +480,16 @@ interface QoderSiteMeta {
   usageUrl: string;
   /** 该站点偏好的 Accept-Language：语言会跟着站点走，国际站以英文优先 */
   acceptLanguage: string;
+  /**
+   * 该站点的**登录态** Cookie 名（用来把「已登录」和「只是访客」区分开）。
+   *
+   * 注意不能拿风控/统计 Cookie 当判据：`arms_uid`、`isg`、`acw_tc`、`cna`、`tfstk`
+   * 在**未登录**的匿名上下文里也会出现（实测 `arms_uid` 3 秒内就有），
+   * 只有服务端下发的会话 Cookie 才能证明登录成功。
+   * 留空表示「该站点登录态 Cookie 名未确认」——此时仅靠功能性判据
+   * （页面自身请求 `/api/v1/me` 得到 2xx）兜底。
+   */
+  loginCookieNames: string[];
 }
 
 /**
@@ -474,6 +505,10 @@ const QODER_SITES: Record<QoderSiteId, QoderSiteMeta> = {
     dashboardUrl: 'https://qoder.com.cn/account/usage',
     usageUrl: 'https://qoder.cn/account/usage?client=qoder&sourceType=IDE',
     acceptLanguage: 'zh-CN,zh;q=0.9,en;q=0.8',
+    // 实测（2026-10-18，Chrome 155）：登录态独有 `qoder_session_cookie`（httpOnly、secure、
+    // 域 .qoder.com.cn）；匿名上下文 25 秒窗口内从未出现。`yunpk` 只出现在第三方域
+    // gm.mmstat.com，永远不会进入 qoder 域的 Cookie 头，因此不作为判据。
+    loginCookieNames: ['qoder_session_cookie'],
   },
   global: {
     id: 'global',
@@ -482,6 +517,9 @@ const QODER_SITES: Record<QoderSiteId, QoderSiteMeta> = {
     dashboardUrl: 'https://qoder.com/account/usage',
     usageUrl: 'https://qoder.com/account/usage',
     acceptLanguage: 'en-US,en;q=0.9,zh-CN;q=0.8',
+    // 待确认：国际站登录态 Cookie 名未实测。留空 → 只走功能性判据（/api/v1/me 2xx），
+    // 避免用一个没验证过的名字把国际站用户永久卡在 waiting。
+    loginCookieNames: [],
   },
 };
 
@@ -1114,6 +1152,134 @@ function parsePlanLabel(body: unknown): string {
   return '';
 }
 
+/**
+ * 「网页端登录」（Qoder 第二个登录方法，`loginMethods` 的第二项）：
+ * 服务端驱动本机调试 Chrome 打开 Qoder 用量页，用户在那个窗口里自己完成登录，
+ * 我们只**旁听浏览器真实发出的 Cookie 请求头**（不注入、不代填、不拼 cookie jar——
+ * jar 拼装会超上游 header 上限而 401，见 `src/cli/capture.ts:445-452` 的踩坑记录）。
+ *
+ * 抓到 Cookie 后走同一个登录会话层落库：probe 验证、去重、`.env` 槽位、备份全部复用。
+ * 令牌模式拿不到逐包批次明细，Cookie 模式才能拿到——这是本方法存在的理由。
+ */
+const qoderWebLogin: ProviderLogin = {
+  id: 'web',
+  kind: 'web',
+  label: '网页端登录',
+  hint: '自动打开调试 Chrome 的 Qoder 用量页；你在那个窗口登录后，本页面自动完成添加。',
+  qr: false,
+  intervalMs: QODER_WEB_POLL_INTERVAL_MS,
+  async start(input) {
+    const site = input.options.site === 'global' ? 'global' : 'cn';
+    const siteMeta = QODER_SITES[site];
+
+    // ① 确保调试 Chrome 在跑（没跑就按 tools/chrome-debug.sh 同款参数拉起）
+    const chrome = await ensureDebugChrome();
+    input.log(
+      `Qoder 调试 Chrome 已就绪（${chrome.browser}${chrome.started ? '，本次已拉起' : '，复用已运行的实例'}）`,
+    );
+
+    // ② 打开用量页并开始旁听请求头；采集器挂在 secret 里，cleanup 时释放
+    const collector = await openCookieCollector({ url: siteMeta.dashboardUrl });
+    input.log(`Qoder ${siteMeta.label}用量页已打开，等待登录`);
+
+    const startedAt = Date.now();
+    return {
+      authUrl: siteMeta.dashboardUrl,
+      qr: false,
+      ttlMs: QODER_WEB_LOGIN_TTL_MS,
+      hint: `请在刚打开的 Chrome 窗口里登录${siteMeta.label}（${siteMeta.origin}）；登录后本页面会自动完成添加。`,
+      secret: { site, collector, startedAt, reloads: 0, lastReloadAt: 0 },
+    };
+  },
+  async poll(secret, ctx) {
+    if (!isRecord(secret)) return { status: 'failed', message: '登录会话缺少采集器参数，请重新发起。' };
+    const collector = pick(secret, 'collector') as CookieCollector | undefined;
+    const site = firstString(pick(secret, 'site')) === 'global' ? 'global' : 'cn';
+    const startedAt = Number(pick(secret, 'startedAt')) || Date.now();
+    if (!collector || typeof collector.cookieFor !== 'function') {
+      return { status: 'failed', message: '登录会话缺少采集器，请重新发起。' };
+    }
+
+    const siteMeta = QODER_SITES[site];
+    // 目标域清单：origin 与用量页的主机（qoder.com.cn / qoder.cn；国际站 qoder.com），
+    // 采集到的 Cookie 头只要落在这些域上就算命中
+    const hosts = [...new Set([hostnameOf(siteMeta.origin), hostnameOf(siteMeta.dashboardUrl)])].filter(
+      Boolean,
+    );
+    const raw = collector.cookieFor(hosts);
+
+    /**
+     * 登录态判据：**不能**只看「抓到了 Cookie」。
+     *
+     * 采集修好后，未登录页面同样会带访客 Cookie 发请求（acw_tc / cna / tfstk /
+     * qoder_visitor_id / arms_uid / isg 等）。若此时直接报 ready，会话层会拿这串
+     * 访客 Cookie 去 probe，必然 401 → 直接判 failed，比「一直等待」更糟。
+     *
+     * 两条判据取「或」：
+     *   ① 站点声明的登录态 Cookie 名出现（国内站：qoder_session_cookie）；
+     *   ② 功能性证据：页面**自己**请求身份接口 `/api/v1/me` 拿到 2xx
+     *      （实测登录态 200、匿名态 401）。站点无关，登录态 Cookie 名随上游改版时仍成立。
+     */
+    const names = collector.cookieNamesFor(hosts);
+    const hasLoginCookie = siteMeta.loginCookieNames.some((name) => names.includes(name));
+    const identityOk = collector.sawSuccessfulRequest(QODER_WEB_IDENTITY_PATH);
+    const loggedIn = Boolean(raw) && (hasLoginCookie || identityOk);
+
+    if (!loggedIn) {
+      // 刷新策略：只在页面**确实空闲**时刷新，且限次 + 最小间隔。
+      // 旧实现是「20 秒后每轮（2 秒）刷新」，会反复重置用户正在填写的登录页。
+      const reloads = Number(pick(secret, 'reloads')) || 0;
+      const lastReloadAt = Number(pick(secret, 'lastReloadAt')) || 0;
+      const now = Date.now();
+      const idle = collector.idleMs();
+      const idleLongEnough = idle >= QODER_WEB_RELOAD_IDLE_MS || idle === 0;
+      if (
+        reloads < QODER_WEB_RELOAD_MAX &&
+        idleLongEnough &&
+        now - lastReloadAt >= QODER_WEB_RELOAD_MIN_INTERVAL_MS
+      ) {
+        await collector.reload();
+        if (isRecord(secret)) {
+          secret.reloads = reloads + 1;
+          secret.lastReloadAt = now;
+        }
+      }
+      const waitedSec = Math.round((now - startedAt) / 1000);
+      return {
+        status: 'waiting',
+        message: raw
+          ? `已抓到 ${siteMeta.label}的页面 Cookie，但尚未检测到登录态，请在该 Chrome 窗口完成登录（已等待 ${waitedSec} 秒）…`
+          : `正在等待你在调试 Chrome 窗口里登录（已等待 ${waitedSec} 秒）…`,
+      };
+    }
+
+    const cookie = normalizeCookieHeader(raw ?? '') ?? '';
+    if (!cookie) return { status: 'waiting', message: '抓到的 Cookie 头为空，继续等待页面发起新请求…' };
+
+    // 账号身份：网页侧没有权威 uid（openapi /userinfo 要 Bearer，Cookie 拿不到），
+    // 用「Cookie 指纹」做去重键：同一账号的登录态 Cookie 相对稳定，
+    // 重新登录 → 指纹一致 → 更新原条目；不同账号 → 指纹不同 → 新建卡片。
+    // 平台侧若有更权威的 uid 字段，只需改这一处（方案 §3.6 待确认项）。
+    const accountId = createHash('sha256').update(cookie).digest('hex').slice(0, 16);
+    ctx.log(`Qoder 网页端登录已抓到 Cookie（指纹 ${accountId}），开始验证落库`);
+
+    return {
+      status: 'ready',
+      account: { id: accountId, name: '' },
+      credentials: { cookie },
+      options: { site },
+      message: '已抓到登录 Cookie，正在验证取数并写入本机配置…',
+    };
+  },
+  async cleanup(secret) {
+    // 释放我们开出的标签页与 WebSocket；浏览器本体不关（用户可能还在用）
+    const collector = isRecord(secret)
+      ? (pick(secret, 'collector') as CookieCollector | undefined)
+      : undefined;
+    await collector?.close().catch(() => {});
+  },
+};
+
 export const qoderAdapter: ProviderAdapter = {
   id: 'qoder',
   displayName: 'Qoder',
@@ -1305,6 +1471,7 @@ export const qoderAdapter: ProviderAdapter = {
     },
   },
 
+
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
     const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
     // 令牌分支：手工 Cookie 优先（保留批次到期），没有 Cookie 才走设备令牌
@@ -1410,3 +1577,15 @@ export const qoderAdapter: ProviderAdapter = {
     );
   },
 };
+
+/**
+ * 登录方法清单：`login`（扫码，默认方法）+ `webLogin`（网页端抓 Cookie）。
+ *
+ * 声明后前端按清单渲染两个按钮，会话层按 `method` 路由；
+ * `login` 仍保留在适配器上（不传 method 时走它），行为向后兼容。
+ * 放在对象外组装：两个方法都引用 `qoderAdapter` 定义时的上下文，
+ * 对象字面量内部无法安全自引用。
+ */
+qoderAdapter.loginMethods = [qoderAdapter.login, qoderWebLogin].filter(
+  (method): method is ProviderLogin => Boolean(method),
+);
