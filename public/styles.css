@@ -1755,6 +1755,23 @@ kbd {
   transform: none;
 }
 
+/* 次要登录按钮（如 Qoder 的「网页端登录」）：与主按钮并列但视觉退一级 */
+.login__start--secondary {
+  border-color: var(--line-strong);
+  background: var(--fill-1);
+  color: var(--text);
+}
+
+.login__start--secondary:hover:not(:disabled) {
+  background: var(--fill-2);
+}
+
+.login__buttons {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
 .login__site {
   display: inline-flex;
   align-items: center;

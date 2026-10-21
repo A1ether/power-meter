@@ -83,9 +83,10 @@ const state = {
   /** GET /api/providers 的适配器元信息：管理表单的字段声明与文案都来自它（只拉一次） */
   adapterMeta: null,
   /**
-   * 当前登录会话：`{ providerId, session, timer }`。
-   * 全局只保留一个——发起新登录会取消上一个会话，避免两个二维码同时有效。
-   * 用 providerId 而不是卡片键：同一平台在卡片与「平台与账号」弹窗里共享同一个会话。
+   * 当前登录会话：`{ providerId, method, session, timer }`。
+   * 全局只保留一个——发起新登录会先取消旧会话，避免两个二维码同时有效。
+   * method 是会话的登录方法（`ProviderLogin.id`）：同一平台的扫码与网页端
+   * 登录各是一个会话，按钮按 provider+method 匹配自己的状态。
    */
   login: null,
   /**
@@ -941,12 +942,15 @@ const LOGIN_SITE_LABELS = {
 };
 
 /**
- * 一个平台的登录块：按钮 → 申请会话 → 画二维码 / 给链接 → 轮询 → 刷新看板。
+ * 一个平台的登录块：按钮组（按 loginMethods 声明渲染）→ 申请会话 →
+ * 画二维码 / 给链接 / 等网页抓取 → 轮询 → 刷新看板。
  *
  * 约定：
- *   - 二维码只在 `login.qr === true` 时展示（Trae 的回调固定落 127.0.0.1，扫码无意义）；
- *   - 面板状态存 `state.login`，卡片重建时按会话重绘，不会因为一次 renderGrid 丢状态；
- *   - 同一时刻只保留一个会话：发起新登录会先取消上一个（后端也会取消同平台旧会话）。
+ *   - 二维码只在会话 `qr === true` 时展示（Trae 的回调固定落 127.0.0.1，扫码无意义；
+ *     Qoder 的「网页端登录」由服务端驱动本机 Chrome，也不产生二维码）；
+ *   - 面板状态存 `state.login`，按「providerId + method」记——同一平台的
+ *     扫码与网页端登录是两个会话，互不挤占；卡片与弹窗共享同一会话；
+ *   - 同一方法只保留一个会话：再点同方法按钮会先取消旧会话。
  */
 function renderLogin(box, target, loginMeta, siteField = null) {
   const panel = box.querySelector('.login__panel');
@@ -956,66 +960,96 @@ function renderLogin(box, target, loginMeta, siteField = null) {
   const link = box.querySelector('.login__link');
   const copyBtn = box.querySelector('.login__copy');
   const cancelBtn = box.querySelector('.login__cancel');
-  const startBtn = box.querySelector('.login__start');
   const note = box.querySelector('.login__note');
 
   const providerId = target.provider.provider;
-  // 同一平台在卡片与弹窗里共享会话状态：用 providerId 识别，而不是卡片键
-  const session = state.login?.providerId === providerId ? state.login.session : null;
+  // 同一平台在卡片与弹窗里共享会话状态：用 providerId 识别，而不是卡片键。
+  // buttonsBox 里每个按钮带 data-method，指向自己发起的会话方法。
+  const buttonsBox = box.querySelector('.login__buttons');
+  const methodButtons = [];
+
+  // 会话查找：state.login 只有一个全局槽位，但匹配按 provider+method——
+  // 其他方法（或其他平台）的会话不能污染本方法的按钮状态
+  const sessionOf = (methodId) =>
+    state.login?.providerId === providerId && state.login.method === methodId
+      ? state.login.session
+      : null;
 
   // 站点选择：只有「声明了站点 option 的平台」（Qoder）才渲染，选项直接取
-  // manageFields 的 choices，与手工表单同源。会话进行中禁用——已发起的会话
-  // 后端已冻结站点，改下拉不会改变它的去向。
+  // manageFields 的 choices，与手工表单同源。
   const siteBox = box.querySelector('.login__site');
   const siteSelect = box.querySelector('.login__site-select');
   siteBox.hidden = !siteField;
-  if (siteField) {
-    if (siteSelect.options.length === 0) {
-      // 登录只支持「具体站点」：auto 是探测策略，不是登录目标，过滤掉
-      for (const choice of siteField.choices ?? []) {
-        if (choice === 'auto') continue;
-        const option = document.createElement('option');
-        option.value = choice;
-        option.textContent = LOGIN_SITE_LABELS[choice] ?? choice;
-        if (choice === (siteField.defaultValue ?? 'cn')) option.selected = true;
-        siteSelect.append(option);
-      }
-    }
-    siteSelect.disabled = Boolean(session && !LOGIN_TERMINAL.has(session.status));
-    // 回显会话实际申请的站点（卡片重建 / 弹窗切换后仍对得上）
-    if (session?.site) siteSelect.value = session.site;
+
+  // 按钮组：方法清单来自 /api/providers 的 loginMethods（前端不认平台名）。
+  // loginMeta 兼容旧字段：声明了 loginMethods 的平台以它为准。
+  const methods =
+    Array.isArray(loginMeta.methods) && loginMeta.methods.length
+      ? loginMeta.methods
+      : [
+          {
+            id: 'default',
+            label: loginMeta.label,
+            hint: loginMeta.hint,
+            qr: loginMeta.qr,
+            kind: loginMeta.qr ? 'scan' : 'link',
+          },
+        ];
+  for (const method of methods) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = method.kind === 'web' ? 'login__start login__start--secondary' : 'login__start';
+    btn.dataset.method = method.id;
+    btn.textContent = method.label;
+    btn.title = method.hint || method.label;
+    buttonsBox.append(btn);
+    methodButtons.push({ ...method, btn });
   }
 
-  const paint = (view) => {
+  const paint = (view, methodId) => {
+    // 没有会话：所有按钮恢复文案可用；有活跃会话：发起它的按钮显示「登录中」，
+    // 其余按钮保持可用（点了会先取消旧会话再发起新的）
+    for (const { id, label, btn } of methodButtons) {
+      const active = view && id === methodId;
+      if (!view) {
+        btn.disabled = false;
+        btn.textContent = label;
+      } else if (active) {
+        btn.disabled = !LOGIN_TERMINAL.has(view.status);
+        btn.textContent = LOGIN_TERMINAL.has(view.status) ? '重新获取' : '登录中…';
+      } else {
+        btn.disabled = false;
+        btn.textContent = label;
+      }
+    }
     if (!view) {
       panel.hidden = true;
-      startBtn.disabled = false;
-      startBtn.textContent = loginMeta.label;
       return;
     }
     panel.hidden = false;
-    startBtn.disabled = !LOGIN_TERMINAL.has(view.status);
-    startBtn.textContent = LOGIN_TERMINAL.has(view.status) ? '重新获取' : '登录中…';
 
     const text = view.message || LOGIN_STATUS_TEXT[view.status] || view.status;
     statusLine.textContent = text;
     statusLine.dataset.state = view.status;
 
-    // authUrl 只在等待阶段下发；终态后后端会清空
+    // authUrl 只在等待阶段下发；终态后后端会清空。
+    // 「网页端登录」（kind=web）的 authUrl 是本机 Chrome 已打开的页面，
+    // 不重复给链接与复制按钮。
     const authUrl = view.authUrl || '';
-    link.hidden = !authUrl;
-    if (authUrl) link.href = authUrl;
-    copyBtn.hidden = !authUrl;
+    const isWebKind = (methodButtons.find((m) => m.id === methodId)?.kind ?? '') === 'web';
+    link.hidden = !authUrl || isWebKind;
+    if (authUrl && !isWebKind) link.href = authUrl;
+    copyBtn.hidden = !authUrl || isWebKind;
 
     const showQr = Boolean(authUrl) && view.qr === true && Boolean(window.QRCode);
     canvas.hidden = !showQr;
-    qrFallback.hidden = !authUrl || showQr;
+    qrFallback.hidden = !authUrl || showQr || isWebKind;
     if (showQr) {
       const drawn = window.QRCode.toCanvas(canvas, authUrl, { size: 220, margin: 4 });
       canvas.hidden = !drawn;
       qrFallback.hidden = drawn;
       if (!drawn) qrFallback.textContent = '链接过长，二维码生成失败；请点下方按钮在新窗口打开。';
-    } else if (authUrl) {
+    } else if (authUrl && !isWebKind) {
       qrFallback.textContent =
         view.qr === true
           ? '二维码组件未加载，请直接打开链接。'
@@ -1031,37 +1065,68 @@ function renderLogin(box, target, loginMeta, siteField = null) {
     }
   };
 
-  paint(session);
-
-  startBtn.onclick = async () => {
-    startBtn.disabled = true;
-    startBtn.textContent = '申请中…';
-    try {
-      // 先取消上一张卡片的会话，避免两个二维码同时有效
-      if (state.login && state.login.session) {
-        await loginRequest('/api/login/cancel', { body: { id: state.login.session.id } }).catch(
-          () => {},
-        );
+  // 初绘：把当前会话（如有）画到它自己的方法按钮上；站点下拉只认当前会话
+  const currentSession = methodButtons.map((m) => sessionOf(m.id)).find(Boolean) ?? null;
+  if (currentSession) {
+    paint(currentSession, currentSession.method);
+  } else {
+    paint(null, null);
+  }
+  if (siteField) {
+    if (siteSelect.options.length === 0) {
+      // 登录只支持「具体站点」：auto 是探测策略，不是登录目标，过滤掉
+      for (const choice of siteField.choices ?? []) {
+        if (choice === 'auto') continue;
+        const option = document.createElement('option');
+        option.value = choice;
+        option.textContent = LOGIN_SITE_LABELS[choice] ?? choice;
+        if (choice === (siteField.defaultValue ?? 'cn')) option.selected = true;
+        siteSelect.append(option);
       }
-      // 站点随会话一起提交：登录结果落库时带同一站点，之后 probe 走对应 origin
-      const options = {};
-      if (siteField) options[siteField.key] = siteSelect.value;
-      const payload = await loginRequest('/api/login/start', {
-        body: { provider: providerId, ...(siteField ? { options } : {}) },
-      });
-      const view = payload.session;
-      if (state.login?.timer) clearTimeout(state.login.timer);
-      state.login = { providerId, session: view, timer: null };
-      paint(view);
-      // 面板里已经是发起结果；其余卡片 / 弹窗在下次重绘时按 providerId 隐藏旧面板
-      scheduleLoginPoll(providerId);
-    } catch (error) {
-      paint(null);
-      statusLine.textContent = `发起登录失败：${error.message}`;
-      statusLine.dataset.state = 'failed';
-      panel.hidden = false;
     }
-  };
+    siteSelect.disabled = Boolean(currentSession && !LOGIN_TERMINAL.has(currentSession.status));
+    // 回显会话实际申请的站点（卡片重建 / 弹窗切换后仍对得上）
+    if (currentSession?.site) siteSelect.value = currentSession.site;
+  }
+
+  for (const method of methodButtons) {
+    method.btn.onclick = async () => {
+      const methodId = method.id;
+      method.btn.disabled = true;
+      method.btn.textContent = '申请中…';
+      try {
+        // 先取消本平台其它方法的会话：面板只有一个，同时挂两个会状态混乱。
+        // （后端按 provider+method 隔离会话，这里取消是纯前端选择。）
+        if (state.login && state.login.session) {
+          await loginRequest('/api/login/cancel', { body: { id: state.login.session.id } }).catch(
+            () => {},
+          );
+          if (state.login.timer) clearTimeout(state.login.timer);
+          state.login = null;
+        }
+        // 站点随会话一起提交：登录结果落库时带同一站点，之后 probe 走对应 origin
+        const options = {};
+        if (siteField) options[siteField.key] = siteSelect.value;
+        const payload = await loginRequest('/api/login/start', {
+          body: {
+            provider: providerId,
+            ...(methodId === 'default' ? {} : { method: methodId }),
+            ...(siteField ? { options } : {}),
+          },
+        });
+        const view = payload.session;
+        state.login = { providerId, method: view.method || methodId, session: view, timer: null };
+        paint(view, view.method || methodId);
+        // 面板里已经是发起结果；其余卡片 / 弹窗在下次重绘时按 providerId 隐藏旧面板
+        scheduleLoginPoll(providerId);
+      } catch (error) {
+        paint(null, methodId);
+        statusLine.textContent = `发起登录失败：${error.message}`;
+        statusLine.dataset.state = 'failed';
+        panel.hidden = false;
+      }
+    };
+  }
 
   copyBtn.onclick = async () => {
     const authUrl = state.login?.session?.authUrl;
@@ -1209,9 +1274,10 @@ function renderManage(root, target, options = {}) {
     else state.manualOpen.delete(target.key);
   });
 
-  // 登录块：适配器声明了 login 才出现；没有登录能力的平台保持手工表单。
-  // 注意：.manage 的显隐由展开态统一控制，这里只切块内元素。
-  const loginMeta = meta?.login ?? null;
+  // 登录块：适配器声明了登录能力才出现；没有登录能力的平台保持手工表单。
+  // loginMeta.methods 来自 /api/providers 的 loginMethods（后端对未声明多方法的
+  // 平台自动回退为单方法清单），renderLogin 据此渲染按钮组。
+  const loginMeta = meta?.login ? { ...meta.login, methods: meta.loginMethods ?? [] } : null;
   // 多站点平台的登录站点选择：取 manageFields 里「有 choices 的第一个 option 字段」，
   // 前端不认平台名——Qoder 的 site（cn / global / auto）之外，
   // 未来别的平台声明站点字段也能直接复用这块 UI。
