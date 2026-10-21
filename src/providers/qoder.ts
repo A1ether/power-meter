@@ -371,10 +371,30 @@ async function qoderProbeWithToken(
   });
   const { active, expired } = splitByExpiry(usage.lots, ctx.now);
   const hasDatedLots = active.some((lot) => lot.expiresAt !== null);
+  const packageLots = active.filter((lot) => lot.id.startsWith(QODER_PACKAGE_LOT_PREFIX));
+
+  // 昵称：设备流不一定带回；仅当卡片名还是「登录账号」占位名时补查一次，改完就不再打这个接口
+  const needsName =
+    Boolean(ctx.persistAccountName) &&
+    isPlaceholderAccountName(qoderAdapter.displayName, account.displayName ?? '');
+  const userInfo = needsName ? await qoderUserInfo(site.id, current, ctx) : null;
+  const displayName =
+    userInfo?.name && ctx.persistAccountName
+      ? await ctx
+          .persistAccountName(userInfo.name)
+          .catch((error: unknown) => {
+            ctx.log(`Qoder 账号昵称写回失败（不影响取数）：${(error as Error).message}`);
+            return null;
+          })
+      : null;
 
   return buildSnapshot({
     adapter: adapterForSite(site),
     account,
+    // 本轮已解析出昵称时直接用最终展示名，避免等下一轮配置热加载才更新标题；
+    // accountId 同步指向新名字，卡片上的管理操作才不会落在旧条目上
+    displayName,
+    accountId: displayName,
     status: 'ok',
     now: ctx.now,
     balance: { amount: usage.remaining, currency: 'CREDITS' },
@@ -383,11 +403,14 @@ async function qoderProbeWithToken(
     note: joinNotes(
       `站点：${site.label}（${site.origin}）`,
       '登录令牌模式，逐笔用量由本地采样兜底',
-      usage.openapiOnly && active.length > 0
-        ? '批次来自 openapi 额度接口（网页用量接口不可用）'
+      usage.openapiOnly
+        ? '令牌模式仅返回账户级额度分桶（套餐 / 赠送 / 团队共享）；逐包批次明细需 Cookie 模式'
+        : null,
+      packageLots.length > 0
+        ? `其中 ${packageLots.length} 个专属资源包来自 dedicated_resource_packages`
         : null,
       usage.openapiOnly && active.length === 0
-        ? '平台未返回批次明细；未用完额度随本期重置作废'
+        ? '平台未返回额度数据；未用完额度随本期重置作废'
         : null,
       hiddenLotsNote(expired),
       active.length > 0 && !hasDatedLots && resetsAt
