@@ -157,12 +157,9 @@ async function qoderUserInfo(
       headers: qoderBearerHeaders(token),
       timeoutMs: Math.min(ctx.timeoutMs || QODER_TIMEOUT_FALLBACK, 8_000),
     });
-    const payload = qoderPayload(body);
-    if (!isRecord(payload)) return null;
-    return {
-      id: firstString(pick(payload, 'id', 'user_id', 'uid')),
-      name: firstString(pick(payload, 'name', 'username', 'user_name')),
-    };
+    // 与网页身份接口共用同一份解析：昵称只认展示名字段，`username` 是 UUID 时不采用
+    const identity = parseQoderIdentity(body);
+    return identity.id || identity.name ? identity : null;
   } catch (error) {
     ctx.log(`Qoder ${QODER_SITES[site].label}账号信息获取失败（不影响取数）：${(error as Error).message}`);
     return null;
@@ -651,6 +648,68 @@ function headersForSite(site: QoderSiteMeta, cookie: string): Record<string, str
     'Accept-Language': site.acceptLanguage,
     'x-requested-with': 'XMLHttpRequest',
   };
+}
+
+/** UUID 形态的串（Qoder 的 `username` 字段就是这种，不是人名） */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * 从身份报文里取「平台账号 id + 昵称」。
+ *
+ * 两个身份接口共用这一份解析，因为它们的字段同名同义：
+ *   - openapi `GET /api/v1/userinfo`（Bearer，令牌模式用）→ `{ id, name, username, email, organization_id }`
+ *   - 网页  `GET /api/v1/me`（Cookie，Cookie 模式用）      → `{ id, username, name, email, avatar }`
+ *
+ * **昵称只认 `name` 一类的展示名，`username` 必须排除 UUID 形态**：
+ * 实测网页侧 `username` 是 `f17e9028-ba34-4e1c-8d1c-7250c0268219`（UUID），
+ * 直接兜底进昵称会让卡片标题变成一串 UUID；只有当它不是 UUID 时才认为它是人取的名字。
+ */
+export function parseQoderIdentity(payload: unknown): { id: string; name: string } {
+  const body = qoderPayload(payload);
+  if (!isRecord(body)) return { id: '', name: '' };
+
+  // 逐个字段取值（而不是 pick 一串 key）：`pick` 遇到 `name: ""` 就停在那里返回空串，
+  // 后面的 `display_name` 等候选永远读不到。`firstString` 会跳过空串继续找。
+  const username = firstString(body.username, body.user_name, body.userName);
+  const name = firstString(
+    body.name,
+    body.display_name,
+    body.displayName,
+    body.nickname,
+    body.nick_name,
+  );
+  return {
+    id: firstString(body.id, body.user_id, body.userId, body.uid),
+    // 展示名优先；username 仅在「看着像人名」时兜底
+    name: name || (username && !UUID_PATTERN.test(username) ? username : ''),
+  };
+}
+
+/**
+ * 用 **Cookie 会话** 查网页身份（`GET {origin}/api/v1/me`）。
+ *
+ * 为什么另开一个而不是复用 `qoderUserInfo()`：那个走 openapi + Bearer，
+ * Cookie 请求头打过去是 401——两条信任面互不通用（见 `docs/协议参考` 与
+ * `docs/fixes/Qoder-Cookie模式卡片标题拿不到昵称-修复方案.md` §2.3）。
+ * 纯 best-effort：失败返回 null 并记日志，绝不阻断取数。
+ */
+async function qoderCookieIdentity(
+  site: QoderSiteMeta,
+  cookie: string,
+  ctx: ProbeContext,
+  timeoutMs: number,
+): Promise<{ id: string; name: string } | null> {
+  try {
+    const { body } = await fetchJson(`${site.origin}${QODER_WEB_IDENTITY_PATH}`, {
+      headers: headersForSite(site, cookie),
+      timeoutMs: Math.min(timeoutMs || QODER_TIMEOUT_FALLBACK, 8_000),
+    });
+    const identity = parseQoderIdentity(body);
+    return identity.name || identity.id ? identity : null;
+  } catch (error) {
+    ctx.log(`Qoder ${site.label}账号信息获取失败（不影响取数）：${(error as Error).message}`);
+    return null;
+  }
 }
 
 interface QoderSiteUsage {
@@ -1256,16 +1315,26 @@ const qoderWebLogin: ProviderLogin = {
     const cookie = normalizeCookieHeader(raw ?? '') ?? '';
     if (!cookie) return { status: 'waiting', message: '抓到的 Cookie 头为空，继续等待页面发起新请求…' };
 
-    // 账号身份：网页侧没有权威 uid（openapi /userinfo 要 Bearer，Cookie 拿不到），
-    // 用「Cookie 指纹」做去重键：同一账号的登录态 Cookie 相对稳定，
-    // 重新登录 → 指纹一致 → 更新原条目；不同账号 → 指纹不同 → 新建卡片。
-    // 平台侧若有更权威的 uid 字段，只需改这一处（方案 §3.6 待确认项）。
+    // 账号身份：
+    //   - 去重键仍用「Cookie 指纹」：同一账号的登录态 Cookie 相对稳定，重新登录 → 指纹一致
+    //     → 更新原条目；不同账号 → 指纹不同 → 新建卡片。改成上游 id 会让已有账号的
+    //     loginAccountId 对不上（重新登录会新建卡片），故本次不动。
+    //   - 昵称走**网页**身份接口 `GET /api/v1/me`（与 Cookie 同一条信任面）。早先
+    //     「网页侧拿不到昵称」的结论只对 openapi `/api/v1/userinfo`（要 Bearer）成立，
+    //     网页接口本来就返回 `{ id, username, name, email }`——实测 `name` 即昵称。
     const accountId = createHash('sha256').update(cookie).digest('hex').slice(0, 16);
-    ctx.log(`Qoder 网页端登录已抓到 Cookie（指纹 ${accountId}），开始验证落库`);
+    const identity = await qoderCookieIdentity(siteMeta, cookie, ctx, QODER_TIMEOUT_FALLBACK);
+    const name = identity?.name ?? '';
+    ctx.log(
+      `Qoder 网页端登录已抓到 Cookie（指纹 ${accountId}）` +
+        (name ? `，账号昵称：${name}` : '，未能解析昵称（将使用占位名，探测时再补）') +
+        '，开始验证落库',
+    );
 
     return {
       status: 'ready',
-      account: { id: accountId, name: '' },
+      // 昵称交给落库层命名；为空时优回落占位名「平台 · 登录账号」
+      account: { id: accountId, name },
       credentials: { cookie },
       options: { site },
       message: '已抓到登录 Cookie，正在验证取数并写入本机配置…',
@@ -1538,9 +1607,32 @@ export const qoderAdapter: ProviderAdapter = {
           ? `options.site 取值「${sitePlan.invalidSetting}」无法识别（可用 cn / global / auto），已按国内站处理`
           : null;
 
+        // 昵称：与令牌模式同一门禁——只在卡片名仍是「登录账号」占位名时补查一次，
+        // 改完即停（isPlaceholderAccountName 不再命中），不产生常驻开销。
+        // Cookie 模式走网页身份接口 /api/v1/me（openapi /userinfo 要 Bearer，Cookie 打过去 401）。
+        const needsName =
+          Boolean(ctx.persistAccountName) &&
+          isPlaceholderAccountName(qoderAdapter.displayName, account.displayName ?? '');
+        const identity = needsName
+          ? await qoderCookieIdentity(site, cookie, ctx, timeoutMs)
+          : null;
+        const resolvedName =
+          identity?.name && ctx.persistAccountName
+            ? await ctx
+                .persistAccountName(identity.name)
+                .catch((error: unknown) => {
+                  ctx.log(`Qoder 账号昵称写回失败（不影响取数）：${(error as Error).message}`);
+                  return null;
+                })
+            : null;
+
         return buildSnapshot({
           adapter: adapterForSite(site),
           account,
+          // 本轮已解析出昵称时直接用最终展示名，避免等下一轮配置热加载才更新标题；
+          // accountId 同步指向新名字，卡片上的管理操作才不会落在旧条目上
+          displayName: resolvedName,
+          accountId: resolvedName,
           status: 'ok',
           now: ctx.now,
           plan: plan || null,
