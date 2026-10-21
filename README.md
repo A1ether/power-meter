@@ -200,8 +200,10 @@ interface ProviderSnapshot {
 - 但 Qoder 的旧版报文只返回 `nextResetAt`（没有批次过期时间），如果只按批次过滤，
   Qoder 会掉出时间线——所以补了一条**合成事件**「本期额度重置（未用完即作废）」，
   金额取该平台积分合计。这让"重置即作废"的平台也能参与排序。
-- 新版报文（含令牌模式的 openapi 兜底）会给出 `dedicated_resource_packages[].expires_at`，
+- 新版报文（含令牌模式的 openapi 接口）会给出 `dedicated_resource_packages[].expires_at`，
   这类批次按真实到期参与排序，不再依赖合成事件。
+- 注意：令牌模式只能拿到**账户级额度分桶**（套餐 / 赠送 / 团队共享）；
+  网页上那种「N 个 Credit Pack、每个包各自剩余与到期」的逐包明细需要 Cookie 模式。
 
 **第三层：前端分级高亮。** 阈值可配（默认 5 天 / 14 天）：
 
@@ -294,7 +296,7 @@ interface ProviderSnapshot {
 
 | 平台 | `provider` | 需要的凭证 | 关键 `options` |
 | --- | --- | --- | --- |
-| Qoder | `qoder` / `qoder.cn` / `qoder-global` | `cookie`（国内站 `QODER_COOKIE`；国际站 `QODER_GLOBAL_COOKIE`）<br>或扫码登录写入的 `accessToken` + `refreshToken`（国内站 `QODER_ACCESS_TOKEN` / `QODER_REFRESH_TOKEN`；国际站加 `QODER_GLOBAL_` 前缀） | `site: "cn"`（国内站，默认）/ `"global"`（国际站 qoder.com）/ `"auto"`（自动探测并回退）；显式站点失败后要自动换站再加 `fallbackSite: true`。两种凭证模式都会拆积分批次（令牌模式在网页接口不可用时退回 openapi，`dedicated_resource_packages[]` 带各自到期时间） |
+| Qoder | `qoder` / `qoder.cn` / `qoder-global` | `cookie`（国内站 `QODER_COOKIE`；国际站 `QODER_GLOBAL_COOKIE`）<br>或扫码登录写入的 `accessToken` + `refreshToken`（国内站 `QODER_ACCESS_TOKEN` / `QODER_REFRESH_TOKEN`；国际站加 `QODER_GLOBAL_` 前缀） | `site: "cn"`（国内站，默认）/ `"global"`（国际站 qoder.com）/ `"auto"`（自动探测并回退）；显式站点失败后要自动换站再加 `fallbackSite: true`。两种凭证模式都会拆积分批次：Cookie 模式给出逐包明细（`quota_detail[]`），令牌模式只能给出账户级分桶 + 可选的 `dedicated_resource_packages[]`（逐包明细需 Cookie） |
 | Trae | `trae` / `trae.cn` | `cookie`<br>或「打开链接登录」写入的 `accessToken` + `refreshToken` + `deviceKey`（`TRAE_ACCESS_TOKEN` / `TRAE_REFRESH_TOKEN` / `TRAE_DEVICE_KEY`） | JWT 由 Cookie 自动续签；令牌模式由 `deviceKey` 签名续期 |
 | CodeBuddy | `codebuddy` | `cookie`（**必须含 `www` 子域**）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`CODEBUDDY_ACCESS_TOKEN` / `CODEBUDDY_REFRESH_TOKEN`）| — |
 | CodeArts | `codearts` | **`accessKey` + `secretKey`（推荐，长期有效）**<br>`cookie`（兼容，会话过期需重抓） | 可选 `authMode: "auto" \| "aksk" \| "cookie"`、`resourceType`、`region` |
