@@ -810,6 +810,30 @@ function readSharedBlock(body: unknown): QoderQuotaBlock | null {
 }
 
 const DEDICATED_INACTIVE_STATUS = /EXPIRED|INVALID|INACTIVE|DISABLED|CANCELLED?/i;
+/** 专属资源包批次 id 前缀：令牌模式 note 据此统计「真正的逐包批次」 */
+const QODER_PACKAGE_LOT_PREFIX = 'qoder-pkg-';
+
+/**
+ * 专属资源包的展示名：网页优先取 `display_labels` 里维度为 `title` 的项
+ * （带 `value_i18n` 时按语言取值），其次 `name` / `description`。
+ */
+function dedicatedPackageLabel(item: Record<string, unknown>): string {
+  const labels = pick(item, 'displayLabels', 'display_labels');
+  if (Array.isArray(labels)) {
+    const title = labels.find(
+      (entry) => isRecord(entry) && firstString(pick(entry, 'dimension')).toLowerCase() === 'title',
+    );
+    if (isRecord(title)) {
+      const i18n = pick(title, 'valueI18n', 'value_i18n');
+      const localized = isRecord(i18n)
+        ? firstString(pick(i18n, 'zh-CN', 'zh_CN', 'zh', 'en', 'en-US'))
+        : '';
+      const label = localized || firstString(pick(title, 'value'));
+      if (label) return label;
+    }
+  }
+  return firstString(pick(item, 'name'), pick(item, 'description')) || '专属资源包';
+}
 
 /**
  * 把 `dedicated_resource_packages[]` 拆成批次。
@@ -828,27 +852,30 @@ function readDedicatedPackages(body: unknown): CreditLot[] {
   const lots: CreditLot[] = [];
   for (const [index, item] of raw.entries()) {
     if (!isRecord(item)) continue;
-    const remaining = firstNumber(pick(item, 'remaining', 'remainingValue', 'remaining_value'));
-    if (remaining === null || remaining <= 0) continue;
+    // 与 qodercli 的 Kg() 同口径：remaining 缺失时用 total - used 兜底
+    const total = firstNumber(pick(item, 'total', 'limit', 'limit_value', 'limitValue')) ?? 0;
+    const used = firstNumber(pick(item, 'used', 'used_value', 'usedValue')) ?? 0;
+    const remaining =
+      firstNumber(pick(item, 'remaining', 'remainingValue', 'remaining_value')) ??
+      Math.max(0, total - used);
+    if (remaining <= 0) continue;
     if (pick(item, 'available') === false) continue;
     const status = firstString(pick(item, 'status'));
     if (status && DEDICATED_INACTIVE_STATUS.test(status)) continue;
 
     const expiresAt = qoderExpiry(pick(item, 'expiresAt', 'expires_at'));
     const id = firstString(pick(item, 'id')) || `pkg-${index}`;
-    const label =
-      firstString(
-        pick(item, 'name'),
-        pick(item, 'description'),
-      ) || '专属资源包';
+    const label = dedicatedPackageLabel(item);
+    // 包总量与剩余都给出来，否则「剩 200」无法判断是刚发还是快用完
+    const amountNote = total > 0 ? `共 ${total} ${firstString(pick(item, 'unit')) || 'CREDITS'}` : '';
     lots.push(
       makeLot({
-        id: `qoder-pkg-${id}`,
+        id: `${QODER_PACKAGE_LOT_PREFIX}${id}`,
         label,
         amount: remaining,
         currency: 'CREDITS',
         expiresAt,
-        note: expiresAt ? '' : '无独立过期时间，随本期重置作废',
+        note: joinNotes(amountNote, expiresAt ? null : '无独立过期时间，随本期重置作废') ?? '',
       }),
     );
   }
@@ -862,6 +889,26 @@ export function parseQoderUsage(body: unknown): QoderUsage {
   // 旧版网页报文：total_quota.{quota_summary,quota_detail[]}
   const container = pick(payload, 'totalQuota', 'total_quota');
   const legacyTotal = readSummary(container);
+  /**
+   * 逐包明细的兜底容器（Cookie 模式的网页报文）。
+   *
+   * 网页 AddOnCredits / DedicatedResourcePackages 消费的都是
+   * `{ quota_summary, quota_detail[] }`，容器键可能是
+   * `resource_package_quota`（赠送/购买包）或 `dedicated_resource_package_quota`
+   * （模型专属包），不一定挂在 `total_quota` 下。
+   * 仅在 `total_quota.quota_detail[]` 为空时启用，避免同一笔额度算两次。
+   */
+  const detailContainer =
+    parseQuotaDetail(container).length === 0
+      ? pick(
+          payload,
+          'resourcePackageQuota',
+          'resource_package_quota',
+          'dedicatedResourcePackageQuota',
+          'dedicated_resource_package_quota',
+        )
+      : undefined;
+  const detailSummary = readSummary(detailContainer);
 
   // 新版扁平报文（openapi /api/v2/quota/usage 与新版网页接口）：
   // user_quota / add_on_quota / org_resource_package / dedicated_resource_packages[]
@@ -870,7 +917,20 @@ export function parseQoderUsage(body: unknown): QoderUsage {
   const shared = readSharedBlock(payload);
   const dedicatedLots = readDedicatedPackages(payload);
 
-  if (!legacyTotal && !userBlock && !addOnBlock && !shared && dedicatedLots.length === 0) {
+  /**
+   * 只在「既没有 total_quota 也没有任何账户级分桶」时，才把兜底容器的
+   * `quota_summary` 当汇总——否则它会与 `total_quota.quota_summary` 重复计数。
+   */
+  const summaryFallback = !legacyTotal && !userBlock && !addOnBlock && !shared ? detailSummary : null;
+
+  if (
+    !legacyTotal &&
+    !summaryFallback &&
+    !userBlock &&
+    !addOnBlock &&
+    !shared &&
+    dedicatedLots.length === 0
+  ) {
     // 保留 `缺少 total_quota` 子串：buildFailureMessage() 依赖它给出「站点可能不匹配」的提示
     throw new Error(
       '响应缺少 total_quota.quota_summary（也未找到 user_quota / add_on_quota），' +
@@ -892,7 +952,7 @@ export function parseQoderUsage(body: unknown): QoderUsage {
   const exceeded =
     pick(payload, 'isQuotaExceeded', 'is_quota_exceeded') === true ||
     (percentage !== null && percentage >= 100);
-  const blocks: QoderQuotaBlock[] = [legacyTotal, userBlock, addOnBlock, shared].filter(
+  const blocks: QoderQuotaBlock[] = [legacyTotal, summaryFallback, userBlock, addOnBlock, shared].filter(
     (block): block is QoderQuotaBlock => block !== null,
   );
   const blockTotal = blocks.reduce((sum, block) => sum + block.total, 0);
@@ -916,10 +976,15 @@ export function parseQoderUsage(body: unknown): QoderUsage {
   const resetsAt =
     toIso(
       pick(payload, 'nextResetAt', 'next_reset_at', 'resetAt', 'reset_at') ??
-        pick(container, 'nextResetAt', 'next_reset_at'),
+        pick(container, 'nextResetAt', 'next_reset_at') ??
+        pick(detailContainer, 'nextResetAt', 'next_reset_at'),
     ) ?? qoderExpiry(pick(payload, 'expiresAt', 'expires_at'));
 
-  const lots = legacyTotal ? parseQoderLots(container, legacyTotal.unit) : [];
+  const lots = legacyTotal
+    ? parseQoderLots(container, legacyTotal.unit)
+    : detailSummary
+      ? parseQoderLots(detailContainer, detailSummary.unit)
+      : [];
   const resetNote = resetsAt ? '随本期重置作废' : '';
   const pushBlockLot = (id: string, label: string, block: QoderQuotaBlock | null): void => {
     if (!block || block.remaining <= 0) return;
@@ -940,7 +1005,8 @@ export function parseQoderUsage(body: unknown): QoderUsage {
     pushBlockLot('qoder-shared', '团队共享额度', shared);
   }
   // 扁平结构：账户级额度桶各拆一个批次，保证「批次之和 = 余额」
-  if (!legacyTotal) {
+  // （summaryFallback 已把兜底容器当汇总，此时不能再按分桶拆）
+  if (!legacyTotal && !summaryFallback) {
     pushBlockLot('qoder-plan', '套餐额度', userBlock);
     pushBlockLot('qoder-addon', '赠送/活动额度', addOnBlock);
     pushBlockLot('qoder-shared', '团队共享额度', shared);
