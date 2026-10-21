@@ -5,6 +5,7 @@
  *   npm run probe -- qoder trae      # 只探测指定平台
  *   npm run probe -- --json          # 输出原始 JSON
  */
+import { adoptResolvedAccountName } from '../account-store.js';
 import { loadConfig } from '../config.js';
 import { resolveAdapter } from '../providers/index.js';
 import type { ProviderSnapshot } from '../types.js';
@@ -66,6 +67,10 @@ async function main(): Promise<void> {
       now: Date.now(),
       timeoutMs: config.settings.requestTimeoutMs,
       log: () => {},
+      // 探针同样把解析出的平台昵称落库（只替换「登录账号」占位名），
+      // 这样 CLI 验证一次就能看到卡片标题变成「平台 · 昵称」，与看板口径一致
+      persistAccountName: async (resolvedName) =>
+        adoptResolvedAccountName(account.provider, account.displayName ?? '', resolvedName),
     });
     snapshots.push(snapshot);
     const elapsed = Date.now() - started;

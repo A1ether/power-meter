@@ -28,7 +28,7 @@ import {
 } from './a1etheropenai-store.js';
 import { loadConfig, loadDotEnv } from './config.js';
 import type { AccountConfig } from './config.js';
-import { maskSecret } from './providers/base.js';
+import { isPlaceholderAccountName, maskSecret } from './providers/base.js';
 import type { ManageFieldDescriptor, ProviderAdapter } from './providers/base.js';
 import { resolveAdapter } from './providers/index.js';
 import type { ProviderSnapshot } from './types.js';
@@ -645,6 +645,70 @@ function loginIdentityOf(item: Record<string, unknown>): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+/** 是否是「登录账号」占位名（判定在 `base.ts`，探测与落库共用） */
+function isPlaceholderLoginName(adapter: ProviderAdapter, name: string): boolean {
+  return isPlaceholderAccountName(adapter.displayName, name);
+}
+
+/** 在「同平台已有名字」集合里挑一个不撞名的 `平台 · 昵称`（撞名追加序号） */
+function uniqueAccountName(
+  adapter: ProviderAdapter,
+  accountName: string,
+  taken: Set<string>,
+): string {
+  const base = accountName
+    ? `${adapter.displayName} · ${accountName}`
+    : `${adapter.displayName} · 登录账号`;
+  let name = base;
+  for (let index = 2; taken.has(name) && index < 1000; index += 1) {
+    name = `${base} ${index}`;
+  }
+  return name;
+}
+
+/**
+ * 探测阶段解析到昵称后，把通用占位名改成「平台 · 昵称」并写回 accounts.json。
+ *
+ * 由编排层通过 `ProbeContext.persistAccountName` 注入：
+ *   - 只处理当前仍是占位名的条目（见 `isPlaceholderLoginName`），自定义名不动；
+ *   - 返回最终展示名供本轮快照使用；不需要改或写盘失败时返回 null；
+ *   - 写入前备份到 `.run/`，只改 `displayName` 与 `options.loginName` 两个字段。
+ */
+export function adoptResolvedAccountName(
+  provider: string,
+  currentName: string,
+  resolvedName: string,
+): string | null {
+  const adapter = resolveAdapter(provider);
+  const next = resolvedName.trim();
+  if (!adapter || !next) return null;
+  if (!isPlaceholderLoginName(adapter, currentName)) return null;
+
+  let accountsFile;
+  try {
+    accountsFile = readAccountsFile();
+  } catch {
+    return null;
+  }
+  const members = accountsFile.accounts.filter((item) => sameProvider(item, adapter));
+  const target = members.find((item) => String(item.displayName ?? '') === currentName);
+  if (!target) return null;
+
+  const taken = new Set(members.map((item) => String(item.displayName ?? '')));
+  taken.delete(currentName);
+  const name = uniqueAccountName(adapter, next, taken);
+
+  try {
+    backupBeforeWrite('login-name', adapter.id);
+    target.displayName = name;
+    target.options = { ...((target.options ?? {}) as Record<string, unknown>), loginName: next };
+    writeAccountsFile(accountsFile);
+  } catch {
+    return null;
+  }
+  return name;
+}
+
 /**
  * 登录成功后落库：**同一平台账号更新原条目，否则新建**。
  *
@@ -765,16 +829,16 @@ export async function landLoginAccount(input: LandLoginInput): Promise<LandLogin
     }
   }
 
-  // ③ 命名：更新保持原名（displayName 是卡片/缓存/删除的稳定标识），新建按昵称生成
+  // ③ 命名：更新默认保持原名（displayName 是卡片/缓存/删除的稳定标识），
+  //    例外：原名仍是「登录账号」占位名、而本次登录拿到了昵称 → 改成「平台 · 昵称」。
+  //    新建按昵称生成。
   let name = existing ? String(existing.displayName ?? '') : '';
   if (!existing) {
-    const base = accountName
-      ? `${adapter.displayName} · ${accountName}`
-      : `${adapter.displayName} · 登录账号`;
-    name = base;
-    for (let index = 2; existingNames.has(name) && index < 1000; index += 1) {
-      name = `${base} ${index}`;
-    }
+    name = uniqueAccountName(adapter, accountName, existingNames);
+  } else if (accountName && isPlaceholderLoginName(adapter, name)) {
+    const taken = new Set(existingNames);
+    taken.delete(name);
+    name = uniqueAccountName(adapter, accountName, taken);
   }
 
   // ④ 落盘
@@ -788,6 +852,8 @@ export async function landLoginAccount(input: LandLoginInput): Promise<LandLogin
       // 登录产物替换整份凭证：同一账号不再混用旧 Cookie，避免探测走错分支
       existing.credentials = credentialRefs;
       existing.options = { ...currentOptions, ...optionValues };
+      // 占位名被昵称取代时同步落盘（此时 name 与原名不同，见 ③）
+      existing.displayName = name;
     } else {
       accountsFile.accounts.push({
         provider: adapter.id,

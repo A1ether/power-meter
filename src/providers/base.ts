@@ -24,6 +24,14 @@ export interface ProbeContext {
    * 写回失败不阻断本次探测，只是下次刷新会再试一遍。
    */
   persistCredentials?: (patch: Record<string, string>) => Promise<void>;
+  /**
+   * 探测时解析出的平台昵称 → 写回 accounts.json 的展示名（由编排层注入）。
+   *
+   * 只在账号当前仍是通用占位名（`<适配器> · 登录账号`）时才会真正改名，
+   * 用户自定义过的名字一律不动；返回最终展示名（未改动时即原值），
+   * 适配器用它组装本轮快照，避免等下一轮配置热加载。
+   */
+  persistAccountName?: (resolvedName: string) => Promise<string | null>;
 }
 
 /**
@@ -246,6 +254,20 @@ export function makeWindow(input: WindowInput): QuotaWindow {
   };
 }
 
+/**
+ * 是否是「登录时没拿到昵称」留下的通用占位名：
+ * `<适配器> · 登录账号`，撞名时是 `... 登录账号 2`。
+ *
+ * 只有这种名字允许在后续拿到昵称时自动改名——用户手动改过的名字一律不动。
+ * 放在适配器层：探测（provider）与落库（account-store）要用同一份判定。
+ */
+export function isPlaceholderAccountName(adapterDisplayName: string, name: string): boolean {
+  const pattern = new RegExp(
+    `^${adapterDisplayName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} · 登录账号(?: \\d+)?$`,
+  );
+  return pattern.test(name.trim());
+}
+
 export function makeLot(input: {
   id: string;
   label: string;
@@ -318,6 +340,16 @@ export interface SnapshotInput {
   note?: string | null;
   /** 无批次过期时间时，用窗口的重置时间兜底 */
   fallbackExpiryFromWindow?: boolean;
+  /**
+   * 本轮刚解析出的展示名（如平台昵称写回后的最终名字）。
+   * 缺省时沿用 `account.displayName`；仅用于标题，不改变缓存键。
+   */
+  displayName?: string | null;
+  /**
+   * 与 `displayName` 配套的账号标识（前端管理/删除/读取密钥靠它定位）。
+   * 改名当轮必须一起给，否则卡片标题已变、操作仍指向旧名字。
+   */
+  accountId?: string | null;
 }
 
 /**
@@ -351,12 +383,12 @@ export function buildSnapshot(input: SnapshotInput): ProviderSnapshot {
   // 否则多张卡片会顶着各自的账号名、看起来像不同平台
   const displayName = input.adapter.groupAccounts
     ? input.adapter.displayName
-    : input.account.displayName || input.adapter.displayName;
+    : input.displayName || input.account.displayName || input.adapter.displayName;
 
   return {
     provider: input.adapter.id,
     displayName,
-    accountId: input.account.displayName ?? '',
+    accountId: input.accountId ?? input.account.displayName ?? '',
     groupAccounts: input.adapter.groupAccounts === true,
     neverExpires: input.adapter.neverExpires === true,
     manageAccounts: input.adapter.manageAccounts === true,

@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { adoptResolvedAccountName } from './account-store.js';
 import { buildPayload, type AggregateSettings } from './aggregate.js';
 import {
   loadConfig,
@@ -103,6 +104,37 @@ async function persistRefreshedCredentials(
     // 让当前进程立即拿到新值；下一次 ensureConfigFresh 会因 mtime 变化重载配置
     loadDotEnv();
   });
+}
+
+/**
+ * 把探测时解析出的平台昵称写回 accounts.json（仅「登录账号」占位名会被替换）。
+ *
+ * 与 `persistRefreshedCredentials` 的区别：这里改的是展示名而不是凭证，
+ * 因此走 `account-store` 的落库函数（自带备份），避免两处各写一套 JSON 逻辑。
+ * 写盘失败不阻断取数：返回 null，调用方沿用原名。
+ */
+async function persistResolvedName(
+  account: AccountConfig,
+  resolvedName: string,
+): Promise<string | null> {
+  try {
+    const name = adoptResolvedAccountName(
+      account.provider,
+      account.displayName ?? '',
+      resolvedName,
+    );
+    if (name) {
+      // 留痕：改的是卡片身份，排查「卡片怎么突然改名了」时要能对上时间点与旧名字
+      console.log(
+        `[account] ${account.provider} 展示名自动更新：「${account.displayName ?? ''}」→「${name}」` +
+          '（来源：平台 userinfo 昵称，已备份到 .run/）',
+      );
+    }
+    return name;
+  } catch (error) {
+    console.log(`[account] ${account.provider} 展示名更新失败：${(error as Error).message}`);
+    return null;
+  }
 }
 
 /** 卡片上展示的额度：优先账户余额，无余额时退回剩余批次之和（与前端 balanceFor() 同口径） */
@@ -283,6 +315,8 @@ export class DashboardService {
       },
       // 令牌刷新后写回 .env；失败只记日志，不阻断本次取数
       persistCredentials: (patch) => persistRefreshedCredentials(account, patch),
+      // 平台昵称 → 展示名（只替换「登录账号」占位名）
+      persistAccountName: (resolvedName) => persistResolvedName(account, resolvedName),
     };
 
     try {

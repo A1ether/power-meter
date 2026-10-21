@@ -9,6 +9,7 @@ import {
   cred,
   failure,
   hiddenLotsNote,
+  isPlaceholderAccountName,
   joinNotes,
   makeLot,
   makeWindow,
@@ -116,6 +117,35 @@ function qoderBearerHeaders(token: string): Record<string, string> {
 /** openapi 响应信封：部分接口把数据包在 data 里 */
 function qoderPayload(body: unknown): unknown {
   return isRecord(body) && isRecord(body.data) ? body.data : body;
+}
+
+/**
+ * 账号昵称（openapi `GET /api/v1/userinfo`，纯 Bearer）。
+ *
+ * 设备流首次授权的响应里不一定带昵称（`user_name` 常常为空），
+ * 而卡片标题需要「Qoder · <昵称>」——这是唯一权威来源。
+ * 纯 best-effort：失败只记日志，不阻断取数（展示名退回原值）。
+ */
+async function qoderUserInfo(
+  site: QoderSiteId,
+  token: string,
+  ctx: ProbeContext,
+): Promise<{ id: string; name: string } | null> {
+  try {
+    const { body } = await fetchJson(`${QODER_LOGIN[site].openapi}/api/v1/userinfo`, {
+      headers: qoderBearerHeaders(token),
+      timeoutMs: Math.min(ctx.timeoutMs || QODER_TIMEOUT_FALLBACK, 8_000),
+    });
+    const payload = qoderPayload(body);
+    if (!isRecord(payload)) return null;
+    return {
+      id: firstString(pick(payload, 'id', 'user_id', 'uid')),
+      name: firstString(pick(payload, 'name', 'username', 'user_name')),
+    };
+  } catch (error) {
+    ctx.log(`Qoder ${QODER_SITES[site].label}账号信息获取失败（不影响取数）：${(error as Error).message}`);
+    return null;
+  }
 }
 
 /**
@@ -299,6 +329,7 @@ async function qoderProbeWithToken(
     throw pickFailure(failures);
   };
 
+  // `current` 是「本轮实际生效的令牌」：401 续期后会换成新令牌，昵称查询必须用它
   let current = token;
   let result: { usage: QoderTokenUsage; site: QoderSiteMeta };
   try {
@@ -1228,9 +1259,11 @@ export const qoderAdapter: ProviderAdapter = {
           message: '已拿到设备令牌，但上游没有返回用户 ID，无法安全落库。请重试或改用 Cookie。',
         };
       }
-      const userName = firstString(
-        isRecord(payload) ? pick(payload, 'user_name', 'userName', 'name') : undefined,
-      );
+      // 设备流响应不一定带昵称；缺了就用 userinfo 补一次（卡片标题要显示账号名）
+      const userName =
+        firstString(isRecord(payload) ? pick(payload, 'user_name', 'userName', 'name') : undefined) ||
+        (await qoderUserInfo(site, token, ctx))?.name ||
+        '';
 
       return {
         status: 'ready',
