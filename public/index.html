@@ -9,75 +9,167 @@
   </head>
   <body>
     <div class="glow" aria-hidden="true"></div>
+    <div class="grain" aria-hidden="true"></div>
 
-    <header class="topbar">
-      <div class="topbar__brand">
-        <span class="logo">⚡</span>
-        <div>
-          <h1>A1ether&rsquo;s Power Meter</h1>
-          <p id="subtitle">多平台余额 / 积分看板</p>
+    <div class="shell">
+      <!--
+        左侧导航（教程「滑动高亮块」+「就地展开子菜单」+「状态点与计数微标」）：
+        .nav__pill 是那块宽度跟着文字伸缩的高亮底色，位置由 app.js 按当前项量出来；
+        子菜单由 app.js 按 /api/summary 的 providers 动态填充，不写死在 HTML 里。
+      -->
+      <aside class="rail" id="rail">
+        <div class="rail__brand">
+          <span class="logo" aria-hidden="true"></span>
+          <span class="rail__brand-text">
+            <strong>Power Meter</strong>
+            <small>A1ether&rsquo;s 额度看板</small>
+          </span>
+        </div>
+
+        <nav class="nav" id="nav" aria-label="区块导航">
+          <!-- 初始 is-hidden：尺寸为 0 时若还带描边，会在导航左上角留下一个像素点 -->
+          <span class="nav__pill is-hidden" aria-hidden="true"></span>
+
+          <a class="nav__item" href="#overview" data-nav-item data-target="summary">
+            <span class="nav__label">总览</span>
+            <span class="nav__badge" id="nav-badge-platforms">–</span>
+          </a>
+
+          <button class="nav__item nav__item--group" type="button" id="nav-group-platforms"
+                  aria-expanded="false" aria-controls="nav-platforms">
+            <span class="nav__label">按平台</span>
+            <span class="nav__caret" aria-hidden="true">⌄</span>
+          </button>
+          <!-- 就地展开的子菜单：一行一个平台，右侧是它的到期状态点 -->
+          <div class="nav__sub" id="nav-platforms" hidden></div>
+
+          <a class="nav__item" href="#providers" data-nav-item data-target="providers">
+            <span class="nav__label">额度卡片</span>
+            <span class="nav__badge" id="nav-badge-providers">–</span>
+          </a>
+
+          <a class="nav__item" href="#timeline-panel" data-nav-item data-target="timeline-panel">
+            <span class="nav__label">到期时间线</span>
+            <span class="nav__badge nav__badge--warn" id="nav-badge-timeline">–</span>
+          </a>
+
+          <a class="nav__item" href="#diagnostics-panel" data-nav-item data-target="diagnostics-panel">
+            <span class="nav__label">诊断</span>
+            <span class="nav__badge nav__badge--danger" id="nav-badge-diag">–</span>
+          </a>
+        </nav>
+
+        <div class="rail__foot">
+          <button class="rail__cmd" type="button" id="cmd-open" aria-label="打开命令面板">
+            <span>命令面板</span>
+            <kbd>⌘K</kbd>
+          </button>
+        </div>
+      </aside>
+
+      <div class="main">
+        <header class="topbar">
+          <div class="topbar__head">
+            <h1 id="page-title">总览</h1>
+            <p id="subtitle">多平台余额 / 积分看板</p>
+          </div>
+
+          <div class="topbar__actions">
+            <span class="status" id="status-chip">
+              <span class="status__dot" aria-hidden="true"></span>
+              <span id="status-text">等待数据</span>
+            </span>
+            <button class="btn btn--ghost" id="cmd-btn" type="button">
+              <span>搜索</span><kbd>⌘K</kbd>
+            </button>
+            <button class="btn" id="platforms-btn" type="button">平台与账号</button>
+            <label class="switch" title="每 5 分钟自动刷新">
+              <input type="checkbox" id="auto-refresh" checked />
+              <span>自动刷新</span>
+            </label>
+            <button class="btn btn--primary" id="refresh-btn" type="button">立即刷新</button>
+          </div>
+        </header>
+
+        <main class="wrap">
+          <section class="summary" id="summary" data-section="summary" aria-label="总体汇总"></section>
+
+          <section class="alert" id="alert" data-section="alert" hidden></section>
+
+          <section class="toolbar" data-section="toolbar" aria-label="排序与筛选">
+            <div class="toolbar__group">
+              <label for="sort">排序</label>
+              <select id="sort">
+                <option value="expiry">最快到期优先</option>
+                <option value="risk">仅看有到期风险的</option>
+                <option value="amount-asc">余额从少到多</option>
+                <option value="amount-desc">余额从多到少</option>
+                <option value="status">异常优先</option>
+                <option value="name">按名称</option>
+              </select>
+            </div>
+
+            <div class="toolbar__group">
+              <label for="search">筛选</label>
+              <input id="search" type="search" placeholder="平台名 / 批次 / 币种" />
+            </div>
+
+            <div class="toolbar__meta" id="meta"></div>
+          </section>
+
+          <section class="grid" id="grid" data-section="providers" aria-live="polite"></section>
+
+          <section class="panel" id="timeline-panel" data-section="timeline-panel" aria-label="到期时间线">
+            <div class="panel__head">
+              <h2>到期时间线</h2>
+              <p class="muted">按过期时间升序，优先消耗排在最前面的积分</p>
+            </div>
+            <ol class="timeline" id="timeline"></ol>
+          </section>
+
+          <section class="panel" id="diagnostics-panel" data-section="diagnostics-panel" aria-label="诊断信息">
+            <div class="panel__head">
+              <h2>诊断</h2>
+              <p class="muted">凭证与配置问题会在这里提示</p>
+            </div>
+            <div id="diagnostics" class="diagnostics"></div>
+          </section>
+        </main>
+
+        <footer class="footer">
+          <span id="footer-updated"></span>
+          <span>凭证默认只留在本机；仅在点击「显示 / 复制」时按需读取，且只允许本机访问</span>
+        </footer>
+      </div>
+    </div>
+
+    <!-- 移动端底部停靠栏（教程「底部停靠栏」）：≤1024px 时替代左侧导航 -->
+    <nav class="dock" id="dock" aria-label="快捷导航">
+      <span class="dock__pill is-hidden" aria-hidden="true"></span>
+      <button class="dock__item" type="button" data-nav-item data-target="summary">总览</button>
+      <button class="dock__item" type="button" data-nav-item data-target="providers">额度</button>
+      <button class="dock__item" type="button" data-nav-item data-target="timeline-panel">时间线</button>
+      <button class="dock__item" type="button" id="dock-cmd">搜索</button>
+    </nav>
+
+    <!-- 命令面板（教程「命令面板」）：⌘K / Ctrl+K 唤起，键盘 ↑↓ 选择、↵ 执行 -->
+    <dialog class="cmd" id="cmd" aria-label="命令面板">
+      <div class="cmd__box">
+        <div class="cmd__search">
+          <span class="cmd__icon" aria-hidden="true">⌕</span>
+          <input class="cmd__input" id="cmd-input" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="搜索平台、跳转区块或执行命令…" aria-label="命令面板输入" />
+          <kbd>Esc</kbd>
+        </div>
+        <ul class="cmd__list" id="cmd-list" role="listbox" aria-label="命令结果"></ul>
+        <p class="cmd__empty" id="cmd-empty" hidden>没有匹配的结果</p>
+        <div class="cmd__foot">
+          <span><kbd>↑</kbd><kbd>↓</kbd> 选择</span>
+          <span><kbd>↵</kbd> 执行</span>
+          <span class="cmd__foot-hint" id="cmd-hint"></span>
         </div>
       </div>
-
-      <div class="topbar__actions">
-        <button class="btn" id="platforms-btn" type="button">平台与账号</button>
-        <label class="switch" title="每 5 分钟自动刷新">
-          <input type="checkbox" id="auto-refresh" checked />
-          <span>自动刷新</span>
-        </label>
-        <button class="btn btn--primary" id="refresh-btn" type="button">立即刷新</button>
-      </div>
-    </header>
-
-    <main class="wrap">
-      <section class="summary" id="summary" aria-label="总体汇总"></section>
-
-      <section class="alert" id="alert" hidden></section>
-
-      <section class="toolbar" aria-label="排序与筛选">
-        <div class="toolbar__group">
-          <label for="sort">排序</label>
-          <select id="sort">
-            <option value="expiry">最快到期优先</option>
-            <option value="risk">仅看有到期风险的</option>
-            <option value="amount-asc">余额从少到多</option>
-            <option value="amount-desc">余额从多到少</option>
-            <option value="status">异常优先</option>
-            <option value="name">按名称</option>
-          </select>
-        </div>
-
-        <div class="toolbar__group">
-          <label for="search">筛选</label>
-          <input id="search" type="search" placeholder="平台名 / 批次 / 币种" />
-        </div>
-
-        <div class="toolbar__meta" id="meta"></div>
-      </section>
-
-      <section class="grid" id="grid" aria-live="polite"></section>
-
-      <section class="panel" aria-label="到期时间线">
-        <div class="panel__head">
-          <h2>到期时间线</h2>
-          <p class="muted">按过期时间升序，优先消耗排在最前面的积分</p>
-        </div>
-        <ol class="timeline" id="timeline"></ol>
-      </section>
-
-      <section class="panel" aria-label="诊断信息">
-        <div class="panel__head">
-          <h2>诊断</h2>
-          <p class="muted">凭证与配置问题会在这里提示</p>
-        </div>
-        <div id="diagnostics" class="diagnostics"></div>
-      </section>
-    </main>
-
-    <footer class="footer">
-      <span id="footer-updated"></span>
-      <span>凭证默认只留在本机；仅在点击「显示 / 复制」时按需读取，且只允许本机访问</span>
-    </footer>
+    </dialog>
 
     <template id="card-template">
       <article class="card">

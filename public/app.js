@@ -103,6 +103,21 @@ const state = {
   dialog: { providerId: null },
   /** GET /api/accounts/overview 的缓存；增删 / 登录成功后置空重拉 */
   platformOverview: null,
+  /**
+   * 左侧导航「按平台」子菜单是否展开。必须存 state：render() / renderGrid() 会
+   * 反复重建这个子菜单，展开态写进 DOM 会被下一次渲染重置。
+   */
+  navPlatformsOpen: false,
+  /** 当前 scrollspy 命中的导航目标（data-target 值）；null 表示还没算过 */
+  activeTarget: null,
+  /** 命令面板当前这一屏的命令（见 buildCommands），index 是选中项 */
+  commands: [],
+  cmdIndex: -1,
+  /**
+   * 点击导航项后正在做平滑滚动。滚动过程中 scrollspy 会把途经的区块逐个点亮，
+   * 所以这段时间先锁住，等落位（scrollend / 兜底定时器）再交还给 scrollspy。
+   */
+  navScrollLock: false,
 };
 
 /** 登录会话轮询间隔：与后端 intervalMs 无关，后端已经是后台轮询，前端只读状态 */
@@ -129,6 +144,28 @@ const els = {
   platformsTitle: document.getElementById('platforms-title'),
   platformsSubtitle: document.getElementById('platforms-subtitle'),
   platformsBody: document.getElementById('platforms-body'),
+  // 新版看板外壳（public/index.html）：导航、徽标、状态条、命令面板、移动端停靠栏
+  pageTitle: document.getElementById('page-title'),
+  statusChip: document.getElementById('status-chip'),
+  statusText: document.getElementById('status-text'),
+  nav: document.getElementById('nav'),
+  navPill: document.querySelector('#nav .nav__pill'),
+  navGroupPlatforms: document.getElementById('nav-group-platforms'),
+  navPlatforms: document.getElementById('nav-platforms'),
+  navBadgePlatforms: document.getElementById('nav-badge-platforms'),
+  navBadgeProviders: document.getElementById('nav-badge-providers'),
+  navBadgeTimeline: document.getElementById('nav-badge-timeline'),
+  navBadgeDiag: document.getElementById('nav-badge-diag'),
+  dock: document.getElementById('dock'),
+  dockPill: document.querySelector('#dock .dock__pill'),
+  dockCmd: document.getElementById('dock-cmd'),
+  cmdOpen: document.getElementById('cmd-open'),
+  cmdBtn: document.getElementById('cmd-btn'),
+  cmd: document.getElementById('cmd'),
+  cmdInput: document.getElementById('cmd-input'),
+  cmdList: document.getElementById('cmd-list'),
+  cmdEmpty: document.getElementById('cmd-empty'),
+  cmdHint: document.getElementById('cmd-hint'),
 };
 
 const numberFormat = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 });
@@ -248,6 +285,8 @@ function render() {
   renderGrid(data);
   renderTimeline(data);
   renderDiagnostics(data);
+  // 外壳（导航徽标 / 平台子菜单 / 状态条）跟着同一份数据走，放在业务渲染之后
+  renderShell(data);
 
   els.meta.textContent = `共 ${data.providers.length} 个平台 · 服务端缓存 ${data.cacheTtlSeconds}s`;
   els.subtitle.textContent = `多平台余额 / 积分看板 · ${data.totals.ok} 个平台数据正常`;
@@ -399,6 +438,9 @@ function sortedProviders(data) {
 function renderGrid(data) {
   const thresholds = data.expiryThresholds;
   const providers = sortedProviders(data);
+  // 「额度卡片」徽标就是排序 / 筛选后的张数：所有分支（含空结果提前 return）都要同步，
+  // 所以放在算完 providers 的位置，而不是函数末尾
+  refreshProviderBadge(providers.length);
   els.grid.replaceChildren();
 
   if (providers.length === 0) {
@@ -1803,6 +1845,583 @@ function renderDiagnostics(data) {
   els.diagnostics.append(fragment);
 }
 
+// ===========================================================================
+// 看板外壳：导航徽标 / 按平台子菜单 / 滑动高亮块（scrollspy）/ 命令面板 / 停靠栏
+//
+// 这些只负责「外壳」的交互，不参与取数，也不重写任何业务渲染。数字口径一律复用
+// 业务侧已有的函数（sortedProviders / urgencyOf / balanceFor / fmtNumber），
+// 避免外壳和区块各算一套、对不上。
+// ===========================================================================
+
+/** 导航目标 → 顶栏标题。alert / toolbar 故意不在表里：它们没有导航项，向上沿用 */
+const NAV_SECTION_TITLES = {
+  summary: '总览',
+  providers: '额度卡片',
+  'timeline-panel': '到期时间线',
+  'diagnostics-panel': '诊断',
+};
+
+/** 「有导航项」的 data-section 值（与左侧导航的 data-target 一一对应） */
+const NAV_TARGETS = new Set(Object.keys(NAV_SECTION_TITLES));
+
+/** scrollspy 探针落在视口高度的这个比例处，用来判断「正在看哪个区块」 */
+const NAV_PROBE_RATIO = 0.28;
+
+/**
+ * 点击导航后滚动停止多久才把控制权交还 scrollspy。
+ * 用「最后一次滚动后静默 240ms」而不是固定时长：平滑滚动可能比任何固定值都长。
+ */
+const NAV_SCROLL_SETTLE_MS = 240;
+
+let navPillFrame = 0;
+let scrollSpyFrame = 0;
+let navScrollLockTimer = 0;
+
+/**
+ * 外壳刷新入口，由 render() 在业务区块渲染完之后调用。
+ * 只写徽标 / 状态条 / 平台子菜单；这些都必须跟着同一份 /api/summary 数据走。
+ */
+function renderShell(data) {
+  if (!data) return;
+  const totals = data.totals ?? {};
+  const providers = data.providers ?? [];
+  const timeline = data.expiryTimeline ?? [];
+  const thresholds = data.expiryThresholds ?? { criticalDays: 3, warningDays: 7 };
+
+  setBadge(els.navBadgePlatforms, totals.providers ?? providers.length);
+  setBadge(els.navBadgeTimeline, timeline.length);
+
+  // 到期时间线：有 critical 批次就把徽标点热（CSS 的 .nav__badge--hot）
+  if (els.navBadgeTimeline) {
+    els.navBadgeTimeline.classList.toggle(
+      'nav__badge--hot',
+      timeline.some((hit) => hit.inDays <= thresholds.criticalDays),
+    );
+  }
+
+  // 诊断徽标口径：与 renderDiagnostics 同源，但排除 notConfigured——
+  // 「还没配账号」是常态，不该天天飘一个待处理角标
+  const diagCount = countDiagnostics(data);
+  setBadge(els.navBadgeDiag, diagCount);
+  if (els.navBadgeDiag) {
+    els.navBadgeDiag.classList.toggle('is-zero', diagCount === 0);
+    els.navBadgeDiag.classList.toggle('nav__badge--hot', diagCount > 0);
+  }
+
+  // 状态条：N 正常 / M 异常；有异常时整条转 warning 色
+  if (els.statusText) {
+    els.statusText.textContent = `${totals.ok ?? 0} 正常 / ${totals.failed ?? 0} 异常`;
+  }
+  if (els.statusChip) {
+    els.statusChip.classList.toggle('status--warn', (totals.failed ?? 0) > 0);
+  }
+
+  renderNavPlatforms(data);
+  // 徽标文案变了导航项宽度就变了，高亮块得重新量一次
+  scheduleNavPill();
+}
+
+/** 写一个徽标数字；元素缺失（旧版 HTML）时静默跳过 */
+function setBadge(node, value) {
+  if (!node) return;
+  node.textContent = String(value ?? 0);
+}
+
+/** 「额度卡片」徽标 = 当前排序 / 筛选后的卡片张数，renderGrid 每次都会调用 */
+function refreshProviderBadge(count) {
+  setBadge(els.navBadgeProviders, count);
+}
+
+/** 需要处理的诊断条数：缺环境变量 + 聚合警告 + 状态既不是 ok/demo/notConfigured 的平台 */
+function countDiagnostics(data) {
+  const missing = (data.missingEnvVars ?? []).length;
+  const warnings = (data.warnings ?? []).length;
+  const unhealthy = (data.providers ?? []).filter(
+    (provider) =>
+      provider.status !== 'ok' &&
+      provider.status !== 'demo' &&
+      provider.status !== 'notConfigured',
+  ).length;
+  return missing + warnings + unhealthy;
+}
+
+/**
+ * 「按平台」子菜单：一行一个平台，右侧金额与到期状态点。
+ * data 为 null（首屏接口还没回来）时保持空清单，不写占位行。
+ */
+function renderNavPlatforms(data) {
+  if (!els.navPlatforms) return;
+  els.navPlatforms.replaceChildren();
+
+  const providers = data?.providers ?? [];
+  if (providers.length > 0) {
+    // 阈值缺省时给个兜底，避免 urgencyOf 读 undefined.criticalDays 直接抛错
+    const thresholds = data.expiryThresholds ?? { criticalDays: 3, warningDays: 7 };
+    const fragment = document.createDocumentFragment();
+    for (const provider of providers) {
+      const healthy = provider.status === 'ok' || provider.status === 'demo';
+      const row = element('button', 'nav__sub-item');
+      row.type = 'button';
+      row.dataset.provider = provider.displayName;
+
+      const dot = element('span', 'nav__sub-dot');
+      dot.dataset.level = urgencyOf(provider, thresholds);
+      row.append(
+        dot,
+        element('span', 'nav__sub-label', provider.displayName),
+        // 取数失败的平台金额没有意义：显示占位符并弱化，别让人以为它是 0
+        element(
+          'span',
+          `nav__sub-amount${healthy ? '' : ' nav__sub-amount--muted'}`,
+          healthy ? fmtNumber(balanceFor(provider)) : '—',
+        ),
+      );
+      row.addEventListener('click', () => filterByProvider(provider.displayName));
+      fragment.append(row);
+    }
+    els.navPlatforms.append(fragment);
+  }
+
+  // 展开态存在 state 里：子菜单每次重建后按它恢复，刷新数据时不会被收起
+  syncNavGroupState();
+}
+
+/** 把 state.navPlatformsOpen 落到 DOM（hidden / aria-expanded / is-open 三处） */
+function syncNavGroupState() {
+  if (!els.navPlatforms || !els.navGroupPlatforms) return;
+  els.navPlatforms.hidden = !state.navPlatformsOpen;
+  els.navGroupPlatforms.setAttribute('aria-expanded', String(state.navPlatformsOpen));
+  els.navGroupPlatforms.classList.toggle('is-open', state.navPlatformsOpen);
+}
+
+function toggleNavPlatforms() {
+  state.navPlatformsOpen = !state.navPlatformsOpen;
+  syncNavGroupState();
+  scheduleNavPill();
+}
+
+/**
+ * 子菜单行 / 命令面板「查看 X」共用：等价于在筛选框里输入平台名。
+ * 复用现有 state.query + renderGrid，不另开一套筛选逻辑。
+ */
+function filterByProvider(name) {
+  state.query = name;
+  if (els.search && els.search.value !== name) els.search.value = name;
+  if (state.data) renderGrid(state.data);
+  const grid = document.querySelector('#grid');
+  if (grid) grid.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  // 高亮块与顶栏标题立刻跟到「额度卡片」，不等滚动结束
+  applyActiveTarget('providers');
+  lockNavScroll();
+}
+
+/** 平滑滚到某个导航目标（data-section 值） */
+function scrollToSection(target) {
+  const section = document.querySelector(`[data-section="${target}"]`);
+  if (!section) return;
+  applyActiveTarget(target);
+  section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  lockNavScroll();
+}
+
+/** 点亮某个导航目标：左侧导航、移动端停靠栏、顶栏标题一起更新 */
+function applyActiveTarget(target) {
+  if (!target) return;
+  state.activeTarget = target;
+
+  for (const item of document.querySelectorAll('#nav .nav__item[data-target]')) {
+    item.classList.toggle('is-active', item.dataset.target === target);
+  }
+  // 停靠栏只有 4 个固定项（没有「诊断」），匹配不到就一个都不点亮
+  for (const item of document.querySelectorAll('#dock .dock__item[data-target]')) {
+    item.classList.toggle('is-active', item.dataset.target === target);
+  }
+
+  const title = NAV_SECTION_TITLES[target];
+  if (title && els.pageTitle && els.pageTitle.textContent !== title) {
+    els.pageTitle.textContent = title;
+  }
+  scheduleNavPill();
+}
+
+/**
+ * scrollspy 的核心判断：取所有 [data-section]，选「顶部已越过探针、且离探针最近」的那个；
+ * alert / toolbar 没有导航项，向前沿用最近一个有导航项的区块。
+ */
+function currentSectionTarget() {
+  const sections = [...document.querySelectorAll('[data-section]')];
+  if (sections.length === 0) return null;
+
+  // 页面还在顶部（或整页没有滚动余地）：总览就是激活项
+  if (window.scrollY <= 2) return 'summary';
+
+  // 隐藏区块（#alert 有内容才显示）没有盒子，rect 恒为 0，会把探针判断带偏；
+  // getClientRects() 为空正是「当前没有渲染」的可靠信号
+  const rendered = sections.filter((section) => section.getClientRects().length > 0);
+  if (rendered.length === 0) return 'summary';
+
+  const probe = window.innerHeight * NAV_PROBE_RATIO;
+  let passed = null;
+  for (const section of rendered) {
+    if (section.getBoundingClientRect().top <= probe) passed = section;
+  }
+
+  // 滚到页面底部时，最后一个区块往往还没到探针位置（它太矮，页脚先到头了）。
+  // 但「刚点过导航」不能直接认最后一个：点「到期时间线」后页面会顶到底，
+  // 此时用户要的是时间线，不该被紧随其后的「诊断」抢走。
+  // 所以兜底只在「没有任何区块越过探针」时生效。
+  const doc = document.documentElement;
+  const scrollable = doc.scrollHeight > window.innerHeight + 4;
+  const atBottom = scrollable && window.scrollY + window.innerHeight >= doc.scrollHeight - 2;
+  const hit = passed ?? (atBottom ? rendered[rendered.length - 1] : rendered[0]);
+  if (!hit) return null;
+
+  // 从命中点向前找第一个有导航项的区块，把 alert / toolbar 这类「无导航项」的沿用掉。
+  // 这里用全量 sections 的顺序定位，保证 alert 消失与否都不影响沿用结果
+  const index = sections.indexOf(hit);
+  for (let i = index; i >= 0; i -= 1) {
+    const target = sections[i].dataset.section;
+    if (NAV_TARGETS.has(target)) return target;
+  }
+  return 'summary';
+}
+
+/** 滚动位置变化后重算激活项；rAF 节流，绝不用 setInterval */
+function updateScrollSpy() {
+  if (state.navScrollLock) return;
+  // 命令面板是模态的：它内部滚动（列表 scrollIntoView）会带出 window scroll，
+  // 此时背后区块的激活项与标题不该跳
+  if (els.cmd?.open) return;
+  const target = currentSectionTarget();
+  if (!target || target === state.activeTarget) return;
+  applyActiveTarget(target);
+}
+
+function scheduleScrollSpy() {
+  if (scrollSpyFrame) return;
+  scrollSpyFrame = requestAnimationFrame(() => {
+    scrollSpyFrame = 0;
+    updateScrollSpy();
+  });
+}
+
+/** scroll 事件的唯一入口：锁定期间只续期，不重算激活项 */
+function onWindowScroll() {
+  if (state.navScrollLock) {
+    extendNavScrollLock();
+    return;
+  }
+  scheduleScrollSpy();
+}
+
+/**
+ * 点击导航后先锁住 scrollspy，否则平滑滚动的中途会把途经区块逐个点亮。
+ * 每次收到滚动事件就续期，停稳 NAV_SCROLL_SETTLE_MS 后自动交还（scrollend 支持时提前）。
+ */
+function lockNavScroll() {
+  state.navScrollLock = true;
+  extendNavScrollLock();
+}
+
+function extendNavScrollLock() {
+  if (!state.navScrollLock) return;
+  if (navScrollLockTimer) clearTimeout(navScrollLockTimer);
+  navScrollLockTimer = setTimeout(releaseNavScrollLock, NAV_SCROLL_SETTLE_MS);
+}
+
+function releaseNavScrollLock() {
+  if (navScrollLockTimer) clearTimeout(navScrollLockTimer);
+  navScrollLockTimer = 0;
+  if (!state.navScrollLock) return;
+  state.navScrollLock = false;
+  scheduleScrollSpy();
+}
+
+/** 重新量高亮块：尺寸/位置一律走行内 style，配合 CSS transition 实现滑动 */
+function positionNavPill() {
+  // 左侧导航是竖排：高亮块贴左边、宽度跟着文字伸缩（left 固定 0）
+  positionPill(els.nav, els.navPill, '.nav__item', { left: 0 });
+  // 移动端停靠栏是横排：高亮块跟着项横向滑动（断点由 CSS 决定，JS 不判断视口宽度）
+  positionPill(els.dock, els.dockPill, '.dock__item', {});
+}
+
+/**
+ * 把高亮块量到激活项的位置。
+ * 四个尺寸全部写成行内 style：CSS 无论按 top/height 还是 left/width 做过渡都能对上。
+ * `options.left` 用于竖排导航——宽度跟着文字伸缩，左边距恒定，不需要每帧量。
+ */
+function positionPill(container, pill, selector, options = {}) {
+  if (!container || !pill) return;
+  const active = container.querySelector(`${selector}.is-active`);
+  if (!active) {
+    pill.classList.add('is-hidden');
+    // 尺寸也清掉，下次显示时不会从上一个位置「跳」过来
+    pill.style.top = '';
+    pill.style.height = '';
+    pill.style.left = '';
+    pill.style.width = '';
+    return;
+  }
+
+  // offsetTop / offsetLeft 只有在 offsetParent 就是容器时才表示「相对容器」；
+  // CSS 若换了定位方式 offsetParent 会变，这里用 rect 差值兜底，避免高亮块整体跑偏
+  const relative = (edge) => {
+    const offset = edge === 'top' ? active.offsetTop : active.offsetLeft;
+    if (!active.offsetParent || active.offsetParent === container) return offset;
+    return active.getBoundingClientRect()[edge] - container.getBoundingClientRect()[edge];
+  };
+  const left = typeof options.left === 'number' ? options.left : relative('left');
+
+  pill.classList.remove('is-hidden');
+  pill.style.top = `${relative('top')}px`;
+  pill.style.height = `${active.offsetHeight}px`;
+  pill.style.left = `${left}px`;
+  pill.style.width = `${active.offsetWidth}px`;
+}
+
+function scheduleNavPill() {
+  if (navPillFrame) return;
+  navPillFrame = requestAnimationFrame(() => {
+    navPillFrame = 0;
+    positionNavPill();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 命令面板
+// ---------------------------------------------------------------------------
+
+/** 命令一律现算：数据变了（平台增减、刷新后状态变化），命令清单跟着变 */
+function buildCommands() {
+  const items = [
+    { label: '跳转到总览', hint: '跳转', run: () => scrollToSection('summary') },
+    { label: '跳转到额度卡片', hint: '跳转', run: () => scrollToSection('providers') },
+    { label: '跳转到到期时间线', hint: '跳转', run: () => scrollToSection('timeline-panel') },
+    { label: '跳转到诊断', hint: '跳转', run: () => scrollToSection('diagnostics-panel') },
+    { label: '立即刷新数据', hint: '操作', run: () => void load(true) },
+    { label: '打开平台与账号', hint: '操作', run: () => openPlatformsDialog() },
+    { label: '切换自动刷新', hint: '操作', run: () => toggleAutoRefresh() },
+  ];
+  for (const provider of state.data?.providers ?? []) {
+    items.push({
+      label: `查看 ${provider.displayName}`,
+      hint: '平台',
+      run: () => filterByProvider(provider.displayName),
+    });
+  }
+  return items;
+}
+
+/** 命令面板里的「切换自动刷新」：必须与勾选框共用同一份状态，不能各存各的 */
+function toggleAutoRefresh() {
+  const next = !state.autoRefresh;
+  state.autoRefresh = next;
+  if (els.autoRefresh) els.autoRefresh.checked = next;
+  scheduleAutoRefresh();
+}
+
+/** 按输入框关键词重建列表（label + hint 小写 includes；中文直接 includes） */
+function rebuildCommandList() {
+  if (!els.cmdList) return;
+  const keyword = (els.cmdInput?.value ?? '').trim().toLowerCase();
+  const all = buildCommands();
+  const matched = keyword
+    ? all.filter((item) => `${item.label} ${item.hint}`.toLowerCase().includes(keyword))
+    : all;
+
+  state.commands = matched;
+  state.cmdIndex = matched.length > 0 ? 0 : -1;
+
+  els.cmdList.replaceChildren();
+  matched.forEach((item, index) => {
+    const li = element('li', 'cmd__item');
+    li.setAttribute('role', 'option');
+    li.setAttribute('aria-selected', 'false');
+    li.id = `cmd-item-${index}`;
+    li.append(
+      element('span', 'cmd__item-label', item.label),
+      element('span', 'cmd__item-hint', item.hint),
+    );
+    // 鼠标滑过与键盘共用同一个 state.cmdIndex，选中态永远只有一处
+    li.addEventListener('mouseenter', () => setCommandIndex(index));
+    li.addEventListener('click', () => {
+      setCommandIndex(index);
+      runCommand();
+    });
+    els.cmdList.append(li);
+  });
+
+  if (els.cmdEmpty) els.cmdEmpty.hidden = matched.length > 0;
+  if (els.cmdHint) els.cmdHint.textContent = `共 ${matched.length} 条命令`;
+  syncCommandSelection();
+}
+
+/** 选中态同步：is-active 与 aria-selected 必须一起改（可访问性） */
+function syncCommandSelection() {
+  if (!els.cmdList) return;
+  const items = [...els.cmdList.querySelectorAll('.cmd__item')];
+  items.forEach((node, index) => {
+    const active = index === state.cmdIndex;
+    node.classList.toggle('is-active', active);
+    node.setAttribute('aria-selected', String(active));
+  });
+  const activeNode = items[state.cmdIndex];
+  if (els.cmdInput) {
+    if (activeNode?.id) els.cmdInput.setAttribute('aria-activedescendant', activeNode.id);
+    else els.cmdInput.removeAttribute('aria-activedescendant');
+  }
+  if (activeNode) activeNode.scrollIntoView({ block: 'nearest' });
+}
+
+/** 设置选中项（越界时循环）；没有结果时置 -1 */
+function setCommandIndex(index) {
+  if (state.commands.length === 0) {
+    state.cmdIndex = -1;
+    syncCommandSelection();
+    return;
+  }
+  const total = state.commands.length;
+  state.cmdIndex = ((index % total) + total) % total;
+  syncCommandSelection();
+}
+
+function moveCommand(delta) {
+  // cmdIndex 为 -1 只出现在「没有匹配结果」时（重建列表会选中第一项）；
+  // 此时按方向键不改选中态，交给 setCommandIndex 处理空列表
+  if (state.cmdIndex < 0) {
+    setCommandIndex(0);
+    return;
+  }
+  setCommandIndex(state.cmdIndex + delta);
+}
+
+/** 执行当前选中项：一律先关面板再执行（命令可能要开另一个 dialog） */
+function runCommand() {
+  const item = state.commands[state.cmdIndex];
+  if (!item) return;
+  closeCommandPalette();
+  item.run();
+}
+
+function openCommandPalette() {
+  if (!els.cmd) return;
+  if (!els.cmd.open) els.cmd.showModal();
+  if (els.cmdInput) {
+    els.cmdInput.value = '';
+    els.cmdInput.focus();
+  }
+  rebuildCommandList();
+}
+
+function closeCommandPalette() {
+  if (els.cmd?.open) els.cmd.close();
+}
+
+/** ⌘K / Ctrl+K 是全局唤起键：在 #search、凭证输入框里也要生效（这里只认修饰键组合） */
+function isCommandHotkey(event) {
+  return (
+    (event.metaKey || event.ctrlKey) &&
+    !event.altKey &&
+    typeof event.key === 'string' &&
+    event.key.toLowerCase() === 'k'
+  );
+}
+
+function toggleCommandPalette() {
+  if (els.cmd?.open) closeCommandPalette();
+  else openCommandPalette();
+}
+
+// ---------------------------------------------------------------------------
+// 外壳事件绑定（一次性）
+// ---------------------------------------------------------------------------
+
+/**
+ * 把导航、子菜单、命令面板、停靠栏、scrollspy 一次绑好。
+ * 所有元素都按「可能不存在」处理：旧版 HTML 缺某个 id 时只丢对应交互，不拖垮整页脚本。
+ */
+function bindShell() {
+  // 导航项 / 停靠栏项：平滑滚动 + 立即点亮
+  for (const item of document.querySelectorAll('#nav .nav__item[data-target]')) {
+    item.addEventListener('click', (event) => {
+      event.preventDefault();
+      scrollToSection(item.dataset.target);
+    });
+  }
+  for (const item of document.querySelectorAll('#dock .dock__item[data-target]')) {
+    item.addEventListener('click', () => scrollToSection(item.dataset.target));
+  }
+
+  els.navGroupPlatforms?.addEventListener('click', toggleNavPlatforms);
+  els.dockCmd?.addEventListener('click', openCommandPalette);
+  els.cmdOpen?.addEventListener('click', openCommandPalette);
+  els.cmdBtn?.addEventListener('click', openCommandPalette);
+
+  // 命令面板
+  els.cmdInput?.addEventListener('input', rebuildCommandList);
+  // 点背景关闭：dialog 内部点击不会命中 dialog 自身
+  els.cmd?.addEventListener('click', (event) => {
+    if (event.target === els.cmd) closeCommandPalette();
+  });
+  // Esc 走原生 cancel → close；这里只清选中态，不拦默认关闭行为
+  els.cmd?.addEventListener('cancel', () => {
+    state.cmdIndex = -1;
+  });
+  els.cmd?.addEventListener('close', () => {
+    state.cmdIndex = -1;
+    els.cmdInput?.removeAttribute('aria-activedescendant');
+    // 面板里可能滚过页面，关掉后把激活项按真实滚动位置重新对齐
+    scheduleScrollSpy();
+  });
+
+  document.addEventListener('keydown', (event) => {
+    // ⌘K / Ctrl+K 优先：即便焦点在 #search、凭证输入框或 #cmd-input 里也要能唤起
+    if (isCommandHotkey(event)) {
+      // 只拦这一组组合键，普通输入照常落到输入框
+      event.preventDefault();
+      toggleCommandPalette();
+      return;
+    }
+    if (!els.cmd?.open) return;
+    // 输入法组合期间不抢键：中文候选词的回车 / 方向键要留给输入法
+    if (event.isComposing) return;
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      moveCommand(1);
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      moveCommand(-1);
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      runCommand();
+    }
+  });
+
+  // scrollspy：scroll 用 rAF 节流；resize 时区块位置全变了，重算激活项并重量高亮块
+  window.addEventListener('scroll', onWindowScroll, { passive: true });
+  window.addEventListener('resize', () => {
+    scheduleScrollSpy();
+    scheduleNavPill();
+  });
+  // 平滑滚动结束（支持的浏览器）提前解锁；不支持时靠 lockNavScroll 的静默计时兜底
+  window.addEventListener('scrollend', releaseNavScrollLock);
+  // 用户中途自己滚（滚轮 / 触摸 / 键盘）就立刻交还控制权，别让高亮卡在点击的目标上
+  window.addEventListener('wheel', releaseNavScrollLock, { passive: true });
+  window.addEventListener('touchstart', releaseNavScrollLock, { passive: true });
+  // 字体/图片加载完布局会变，再量一次高亮块
+  window.addEventListener('load', () => {
+    scheduleScrollSpy();
+    scheduleNavPill();
+  });
+
+  // 首屏先按当前滚动位置点亮一次（不是等第一次滚动才亮）
+  updateScrollSpy();
+  scheduleNavPill();
+
+  // 子菜单若用 CSS 过渡展开，期间量到的是动画中间态：展开结束后再校一次
+  els.navPlatforms?.addEventListener('transitionend', scheduleNavPill);
+}
+
 function scheduleAutoRefresh() {
   if (state.timer) clearInterval(state.timer);
   if (!state.autoRefresh) return;
@@ -1840,6 +2459,9 @@ document.addEventListener('visibilitychange', () => {
     scheduleLoginPoll(state.login.providerId);
   }
 });
+
+// 外壳交互先就位：即使 /api/summary 还没回来，导航、命令面板、停靠栏也能用
+bindShell();
 
 scheduleAutoRefresh();
 load(false);
