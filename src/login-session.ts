@@ -19,7 +19,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { landLoginAccount, type LandLoginResult } from './account-store.js';
-import type { ProbeContext, ProviderLogin } from './providers/base.js';
+import { resolveLoginMethod, type ProbeContext, type ProviderLogin } from './providers/base.js';
 import { resolveAdapter } from './providers/index.js';
 
 export type LoginSessionStatus =
@@ -34,6 +34,8 @@ export type LoginSessionStatus =
 export interface LoginSessionView {
   id: string;
   provider: string;
+  /** 登录方法标识（`ProviderLogin.id`，未声明方法的平台为 `default`） */
+  method: string;
   status: LoginSessionStatus;
   /** 授权页链接；`waiting` / `landing` 时才有值 */
   authUrl: string | null;
@@ -53,6 +55,7 @@ export interface LoginSessionView {
 interface LoginSession {
   id: string;
   provider: string;
+  method: string;
   status: LoginSessionStatus;
   authUrl: string | null;
   qr: boolean;
@@ -72,7 +75,7 @@ interface LoginSession {
 }
 
 const SESSIONS = new Map<string, LoginSession>();
-/** 每个 provider 当前活跃（非终态）的会话 id */
+/** 每个 `provider#method` 当前活跃（非终态）的会话 id——扫码与网页登录互不挤占 */
 const ACTIVE = new Map<string, string>();
 
 const TERMINAL: ReadonlySet<LoginSessionStatus> = new Set([
@@ -86,6 +89,7 @@ function view(session: LoginSession): LoginSessionView {
   return {
     id: session.id,
     provider: session.provider,
+    method: session.method,
     status: session.status,
     authUrl: session.status === 'waiting' || session.status === 'landing' ? session.authUrl : null,
     qr: session.qr,
@@ -105,13 +109,26 @@ function clearTimer(session: LoginSession): void {
   }
 }
 
-/** 终态后释放 secret（可能含设备私钥 / PKCE verifier） */
+/**
+ * 终态后释放 secret 与登录期资源。
+ *
+ * `cleanup` 先于置空调用：CDP 采集器这类挂在 secret 里的资源
+ * 必须在 secret 还可读时释放；释放失败静默，不影响状态上报。
+ */
 function settle(session: LoginSession, status: LoginSessionStatus, message: string | null): void {
   session.status = status;
   session.message = message;
+  if (session.secret !== null && session.login.cleanup) {
+    try {
+      void Promise.resolve(session.login.cleanup(session.secret)).catch(() => {});
+    } catch {
+      // 释放失败不阻断状态流转
+    }
+  }
   session.secret = null;
   clearTimer(session);
-  if (ACTIVE.get(session.provider) === session.id) ACTIVE.delete(session.provider);
+  const activeKey = `${session.provider}#${session.method}`;
+  if (ACTIVE.get(activeKey) === session.id) ACTIVE.delete(activeKey);
 }
 
 /** 清理过期会话：终态保留到 TTL，等待中的超时即 expired */
@@ -130,6 +147,8 @@ export function pruneLoginSessions(now = Date.now()): void {
 
 export interface StartLoginInput {
   provider: string;
+  /** 用哪个登录方法（`ProviderLogin.id`）；缺省 = 平台默认方法（`login`） */
+  method?: string;
   options?: Record<string, string>;
   /** 服务自身的回环基址（Trae 拼回调地址用） */
   callbackBase: string;
@@ -142,10 +161,11 @@ export type StartLoginResult =
   | { ok: false; status: number; error: string };
 
 /**
- * 发起登录：申请 authUrl、建会话、启动后台轮询。
+ * 发起登录：按 `method` 选方法、申请 authUrl、建会话、启动后台轮询。
  *
- * 同一平台已有活跃会话时先取消它（旧二维码随即失效）——
+ * 同一「平台 + 方法」已有活跃会话时先取消它（旧二维码随即失效）——
  * 用户重新点「获取二维码」时，旧码不应还能把账号登进来。
+ * 不同方法（扫码 vs 网页端）互不挤占，可同时各挂一个。
  */
 export async function startLogin(input: StartLoginInput): Promise<StartLoginResult> {
   pruneLoginSessions();
@@ -153,11 +173,14 @@ export async function startLogin(input: StartLoginInput): Promise<StartLoginResu
   if (!adapter) {
     return { ok: false, status: 404, error: `未知平台「${input.provider}」。` };
   }
-  if (!adapter.login) {
+  const method = resolveLoginMethod(adapter, input.method);
+  if (!method) {
     return { ok: false, status: 403, error: `平台「${adapter.id}」未声明登录能力。` };
   }
+  const methodId = method.id ?? 'default';
 
-  const previousId = ACTIVE.get(adapter.id);
+  const activeKey = `${adapter.id}#${methodId}`;
+  const previousId = ACTIVE.get(activeKey);
   if (previousId) {
     const previous = SESSIONS.get(previousId);
     if (previous) settle(previous, 'cancelled', '已被同一平台的新登录请求取代。');
@@ -170,7 +193,7 @@ export async function startLogin(input: StartLoginInput): Promise<StartLoginResu
 
   let started;
   try {
-    started = await adapter.login.start({
+    started = await method.start({
       now,
       timeoutMs,
       sessionId,
@@ -185,23 +208,24 @@ export async function startLogin(input: StartLoginInput): Promise<StartLoginResu
   const session: LoginSession = {
     id: sessionId,
     provider: adapter.id,
+    method: methodId,
     status: 'waiting',
     authUrl: started.authUrl,
-    qr: started.qr && adapter.login.qr,
-    hint: started.hint ?? adapter.login.hint,
+    qr: started.qr && method.qr,
+    hint: started.hint ?? method.hint,
     message: '等待扫码 / 授权…',
     createdAt: now,
     expiresAt: now + (started.ttlMs > 0 ? started.ttlMs : 5 * 60 * 1000),
     secret: started.secret,
-    login: adapter.login,
+    login: method,
     timer: null,
     polling: false,
     account: null,
     site: (input.options?.site ?? '').trim().toLowerCase() || null,
   };
   SESSIONS.set(sessionId, session);
-  ACTIVE.set(adapter.id, sessionId);
-  schedulePoll(session, adapter.login.intervalMs ?? 2_000, timeoutMs, log);
+  ACTIVE.set(activeKey, sessionId);
+  schedulePoll(session, method.intervalMs ?? 2_000, timeoutMs, log);
   return { ok: true, session: view(session) };
 }
 

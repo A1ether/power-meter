@@ -516,19 +516,27 @@ const server = createServer(async (req, res) => {
         sendJson(res, guard.status, { error: guard.error });
         return;
       }
-      const body = (await readBody(req)) as { provider?: unknown; options?: unknown };
+      const body = (await readBody(req)) as {
+        provider?: unknown;
+        method?: unknown;
+        options?: unknown;
+      };
       const provider = typeof body.provider === 'string' ? body.provider : '';
       const adapter = resolveAdapter(provider);
       if (!adapter) {
         sendJson(res, 404, { error: `未知平台「${provider}」。` });
         return;
       }
-      if (!adapter.login) {
+      // 方法选择交给会话层的 resolveLoginMethod：缺省 → login，
+      // 带 method → 在 loginMethods 里按 id 查（查不到也会给 403）。
+      // 这里只挡「完全没声明登录能力」的平台。
+      if (!adapter.login && !(adapter.loginMethods?.length ?? 0)) {
         sendJson(res, 403, { error: `平台「${adapter.id}」未开放登录。` });
         return;
       }
       const outcome = await startLogin({
         provider: adapter.id,
+        method: typeof body.method === 'string' ? body.method : undefined,
         options: stringRecord(body.options),
         callbackBase: `http://${bootstrap.server.host}:${bootstrap.server.port}`,
         timeoutMs: bootstrap.settings.requestTimeoutMs + 6_000,

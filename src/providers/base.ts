@@ -78,6 +78,11 @@ export interface LoginStartInput {
   callbackBase: string;
   /** 非敏感选项（目前只用于站点选择，登录固定 cn） */
   options: Record<string, string>;
+  /**
+   * 用哪个登录方法（`ProviderLogin.id`）。缺省 = 平台的默认方法（`login`）。
+   * 只有声明了 `loginMethods` 的平台才有多个可选值。
+   */
+  method?: string;
   log: (message: string) => void;
 }
 
@@ -111,11 +116,21 @@ export type LoginPollResult =
  * 未声明的平台行为完全不变（继续用手工 Cookie 表单）。
  */
 export interface ProviderLogin {
+  /**
+   * 方法标识（如 Qoder 的 `'web'`）。同一平台声明多个方法时用它区分会话；
+   * 只有一个方法的平台可省略，此时 `login` 即默认方法。
+   */
+  id?: string;
   /** 按钮文案，如「扫码登录」 */
   label: string;
   hint: string;
   /** 该链接是否支持手机扫码（Trae 为 false） */
   qr: boolean;
+  /**
+   * 方法形态，仅用于前端文案/图标。缺省按 `qr` 推导（true → scan，false → link）。
+   * `web` = 由服务端驱动本机浏览器抓取登录态（无二维码、无跨设备链接）。
+   */
+  kind?: 'scan' | 'link' | 'web';
   /** 服务端轮询上游的间隔，默认 2000ms */
   intervalMs?: number;
   start(input: LoginStartInput): Promise<LoginStartResult>;
@@ -125,6 +140,36 @@ export interface ProviderLogin {
    * 收到的内容由适配器自己存进 `secret`，供后续 `poll()` 消费。
    */
   handleCallback?(secret: unknown, query: URLSearchParams): boolean | Promise<boolean>;
+  /**
+   * 会话终结（ready / failed / expired / cancelled）后释放登录期占用的资源。
+   *
+   * 「网页端登录」的 CDP 标签页与 WebSocket 连接挂在 secret 里，
+   * 不释放会一直占用调试 Chrome；没有这类资源的平台不必声明。
+   * 由登录会话层在 settle() 里调用；释放失败静默，不影响状态上报。
+   */
+  cleanup?(secret: unknown): void | Promise<void>;
+}
+
+/**
+ * 取某个平台可用的登录方法。
+ *
+ * 规则（保持向后兼容）：
+ *   - 声明了 `loginMethods` 时，按 `method` 在其中按 `id` 查；`method` 缺省 → 取第一个；
+ *   - 未声明 `loginMethods` 时，`login` 就是唯一的默认方法，`method` 一律忽略。
+ *
+ * 放在适配器层：会话层与路由都要用同一份判定，避免各写一套。
+ */
+export function resolveLoginMethod(
+  adapter: ProviderAdapter,
+  method?: string | null,
+): ProviderLogin | null {
+  const methods = adapter.loginMethods?.length ? adapter.loginMethods : null;
+  if (methods) {
+    const wanted = (method ?? '').trim();
+    if (!wanted) return methods[0] ?? null;
+    return methods.find((item) => (item.id ?? '') === wanted) ?? null;
+  }
+  return adapter.login ?? null;
 }
 
 /**
@@ -184,6 +229,15 @@ export interface ProviderAdapter {
    * 手工凭证表单折叠为兜底；未声明则只显示原表单。
    */
   login?: ProviderLogin;
+  /**
+   * 多个登录方法的完整清单。声明后卡片登录区会出现多个按钮（如 Qoder 的
+   * 「扫码登录」+「网页端登录」），每个按钮对应一个方法。
+   *
+   * 与 `login` 的关系：`login` 仍是默认方法（不传 `method` 时用它），
+   * `loginMethods` 只是把可选方法列全；只声明 `login` 的平台行为完全不变。
+   * 用 `resolveLoginMethod(adapter, method)` 取方法，不要各处自己判断。
+   */
+  loginMethods?: ProviderLogin[];
   /**
    * credentials 的键 → .env 变量名前缀。
    * 默认推导为 `${PROVIDER_ID}_${KEY}`（如 codebuddy 的 cookie → CODEBUDDY_COOKIE），

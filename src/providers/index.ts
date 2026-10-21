@@ -94,24 +94,47 @@ export function describeRegistry(): Array<{
   manageHint: string;
   /** 「扫码 / 打开链接登录」入口；未声明为 null（前端据此决定是否渲染） */
   login: { label: string; hint: string; qr: boolean } | null;
+  /**
+   * 登录方法完整清单（带 `id` / `kind`），前端据此渲染 N 个登录按钮。
+   * 未声明 `loginMethods` 的平台回退为 `login` 单方法清单（id 缺省），
+   * 因此前端可以只按 `loginMethods` 渲染，不必两处判断。
+   */
+  loginMethods: Array<{ id: string; label: string; hint: string; qr: boolean; kind: string }>;
 }> {
   return listAdapters()
-    .map((adapter) => ({
-      id: adapter.id,
-      displayName: adapter.displayName,
-      region: adapter.region,
-      dashboardUrl: adapter.dashboardUrl,
-      credentialHint: adapter.credentialHint,
-      requiredCredentialKeys: adapter.requiredCredentialKeys,
-      isDemo: adapter.id.startsWith('demo:'),
-      groupAccounts: adapter.groupAccounts === true,
-      manageAccounts: adapter.manageAccounts === true,
-      manageFields: adapter.manageFields ?? [],
-      manageHint: adapter.manageHint ?? '',
-      login: adapter.login
-        ? { label: adapter.login.label, hint: adapter.login.hint, qr: adapter.login.qr }
-        : null,
-    }))
+    .map((adapter) => {
+      const describeLogin = (login: NonNullable<ProviderAdapter['login']>, id: string) => ({
+        id,
+        label: login.label,
+        hint: login.hint,
+        qr: login.qr,
+        kind: login.kind ?? (login.qr ? 'scan' : 'link'),
+      });
+      return {
+        id: adapter.id,
+        displayName: adapter.displayName,
+        region: adapter.region,
+        dashboardUrl: adapter.dashboardUrl,
+        credentialHint: adapter.credentialHint,
+        requiredCredentialKeys: adapter.requiredCredentialKeys,
+        isDemo: adapter.id.startsWith('demo:'),
+        groupAccounts: adapter.groupAccounts === true,
+        manageAccounts: adapter.manageAccounts === true,
+        manageFields: adapter.manageFields ?? [],
+        manageHint: adapter.manageHint ?? '',
+        login: adapter.login
+          ? { label: adapter.login.label, hint: adapter.login.hint, qr: adapter.login.qr }
+          : null,
+        loginMethods: (adapter.loginMethods?.length
+          ? adapter.loginMethods
+          : adapter.login
+            ? [adapter.login]
+            : []
+        ).map((method, index) =>
+          describeLogin(method, method.id ?? (index === 0 ? 'default' : `method-${index}`)),
+        ),
+      };
+    })
     .sort((a, b) => Number(a.isDemo) - Number(b.isDemo) || a.id.localeCompare(b.id));
 }
 
