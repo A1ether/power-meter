@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { ensureDebugChrome, openCookieCollector, type CookieCollector } from '../lib/cdp.js';
-import { assertBusinessOk, fetchJson, HttpError } from '../lib/http.js';
+import { assertBusinessOk, directRetryEnabled, fetchJson, HttpError } from '../lib/http.js';
 import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
 import { startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
 import type { AccountConfig } from '../config.js';
@@ -703,6 +703,7 @@ async function qoderCookieIdentity(
     const { body } = await fetchJson(`${site.origin}${QODER_WEB_IDENTITY_PATH}`, {
       headers: headersForSite(site, cookie),
       timeoutMs: Math.min(timeoutMs || QODER_TIMEOUT_FALLBACK, 8_000),
+      log: (message) => ctx.log(`Qoder ${site.label}${message}`),
     });
     const identity = parseQoderIdentity(body);
     return identity.name || identity.id ? identity : null;
@@ -725,7 +726,12 @@ async function fetchUsageAtSite(
   timeoutMs: number,
 ): Promise<QoderSiteUsage> {
   const headers = headersForSite(site, cookie);
-  const usage = await fetchJson(`${site.origin}${QODER_PATHS.usage}`, { headers, timeoutMs });
+  const log = (message: string) => ctx.log(`Qoder ${site.label}${message}`);
+  const usage = await fetchJson(`${site.origin}${QODER_PATHS.usage}`, {
+    headers,
+    timeoutMs,
+    log,
+  });
   assertBusinessOk(usage.body);
   const parsed = parseQoderUsage(usage.body);
 
@@ -734,6 +740,7 @@ async function fetchUsageAtSite(
     const planResponse = await fetchJson(`${site.origin}${QODER_PATHS.plan}`, {
       headers,
       timeoutMs: Math.min(timeoutMs, 6_000),
+      log,
     });
     plan = parsePlanLabel(planResponse.body);
   } catch (error) {
@@ -756,6 +763,7 @@ async function fetchLedgerAtSite(
   timeoutMs: number,
 ): Promise<UsageLedger> {
   const headers = headersForSite(site, cookie);
+  const log = (message: string) => ctx.log(`Qoder ${site.label}${message}`);
 
   // 时间窗：昨日 00:00（本地时区）至今；用量数据量大，按页拉取（上限 5 页 × 200）
   const startMs = startOfDay(ctx.now) - 86_400_000;
@@ -765,7 +773,7 @@ async function fetchLedgerAtSite(
       `${site.origin}${QODER_PATHS.usageHistory}` +
         `?page=${page}&page_size=200&start_time=${startMs}&end_time=${ctx.now}` +
         `&order_by=begin_at&order=-1`,
-      { headers, timeoutMs },
+      { headers, timeoutMs, log },
     );
     assertBusinessOk(body);
     const list = isRecord(body) ? pick(body, 'data') : undefined;
@@ -790,7 +798,7 @@ async function fetchLedgerAtSite(
       `${site.origin}${QODER_PATHS.quotaHistory}` +
         `?page=${page}&page_size=100&start_time=${startMs}&end_time=${ctx.now}` +
         `&order_by=begin_at&order=-1`,
-      { headers, timeoutMs },
+      { headers, timeoutMs, log },
     );
     assertBusinessOk(body);
     const list = isRecord(body) ? pick(body, 'quota_histories', 'quotaHistories') : undefined;
@@ -812,13 +820,26 @@ async function fetchLedgerAtSite(
   return { records, covers: { use: true, grant: true } };
 }
 
-/** 全站点失败的合并文案：逐站原因 + 可操作的下一步（站点不匹配 / 非法取值各给专项提示） */
+/**
+ * 网络层失败的特征：没有任何 HTTP 响应（`HttpError.status === 0`），
+ * 或错误链里带出连接类原生错误码。这类失败与 Cookie / 站点归属无关，
+ * 不能提示「把 site 改成 auto」——那会让用户去改一个无关配置。
+ */
+function isNetworkFailure(error: Error): boolean {
+  if (error instanceof HttpError && error.status === 0) return true;
+  return /ECONNRESET|ETIMEDOUT|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|EPIPE|fetch failed|socket disconnected|TLS/i.test(
+    error.message,
+  );
+}
+
+/** 全站点失败的合并文案：逐站原因 + 可操作的下一步（网络层 / 站点不匹配 / 非法取值各给专项提示） */
 function buildFailureMessage(
   sitePlan: QoderSitePlan,
   failures: Array<{ site: QoderSiteMeta; error: Error }>,
 ): string {
   const causes = failures.map(({ site, error }) => `${site.label}：${error.message}`);
   const shapeMismatch = failures.some(({ error }) => /缺少 total_quota/.test(error.message));
+  const networkFailure = failures.some(({ error }) => isNetworkFailure(error));
   const primary = sitePlan.candidates[0];
 
   let hint: string | null = null;
@@ -826,11 +847,30 @@ function buildFailureMessage(
     hint =
       `options.site 取值「${sitePlan.invalidSetting}」无法识别（可用 cn / global / auto），` +
       '本次按国内站处理';
+  } else if (networkFailure) {
+    // 连不上就别说「Cookie 属于另一站点」：那是把网络问题说成配置问题
+    const directState = directRetryEnabled()
+      ? '自动直连重试已尝试，仍失败说明该主机从本机两条出网路径都不通'
+      : '直连重试当前被关闭（.env 的 DIRECT_EGRESS_RETRY=off），打开它可让请求改走物理网卡直连';
+    hint =
+      '本次是网络层失败（没拿到任何 HTTP 响应，与 Cookie / 站点归属无关）：' +
+      `若本机在用代理（TUN / 系统代理），请在代理里放行该站点或换一个节点；${directState}`;
   } else if (!sitePlan.allowFallback) {
     hint = shapeMismatch
       ? '站点可能与 Cookie 不匹配：请把 options.site 改为 "auto"，' +
         `或改为 ${primary.id === 'cn' ? '"global"' : '"cn"'} 后重试`
       : '若该 Cookie 属于另一站点，可把 options.site 改为 "auto" 自动探测，或加 "fallbackSite": true 开启回退';
+  }
+  // 401/403：站点归属或登录态问题，两者提示合并成一条可操作的说明
+  const authFailure = failures.some(({ error }) => {
+    const status = error instanceof HttpError ? error.status : 0;
+    return status === 401 || status === 403;
+  });
+  if (authFailure && !sitePlan.invalidSetting) {
+    hint =
+      '上游判定登录态无效（401/403）：Cookie 可能已过期，请重新登录后执行 ' +
+      `\`npm run capture -- qoder${primary.id === 'global' ? ' --site global' : ''}\`；` +
+      '若这份 Cookie 其实属于另一站点，把 options.site 改成 "auto" 即可自动探测';
   }
   return joinNotes(...causes, hint) ?? '取数失败';
 }
