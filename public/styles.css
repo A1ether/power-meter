@@ -3,6 +3,11 @@
  *
  * 设计参考抖音教程《6种高级Dashboard菜单》（叨叨AI）：
  *   滑动高亮块 / 就地展开子菜单 / 状态点与计数微标 / 命令面板 / 底部停靠栏。
+ * 以及《5个小细节让AI设计的界面看着更舒服》（费纸张）：
+ *   等宽数字 / 同心圆角 / 错开入场 / 平衡标题换行 / 阴影代替边框。
+ *   对应实现：font-variant-numeric: tabular-nums（数字）、--r-in-* 派生半径、
+ *   [data-enter='stagger'] + --i（入场）、text-wrap: balance/pretty、
+ *   0 0 0 1px <ring> 影子代替 border（含 --ring-color / --elev 两态切换）。
  * 配色走「石墨黑 + 薄荷绿」，用极细描边与分层阴影做高级感，
  * 告警不再整块铺色，只保留左侧细色条 + 小徽标。
  *
@@ -40,12 +45,26 @@
   --warn: #ffc24b;
   --info: #b8a2ff;
 
-  /* 圆角梯度与阴影 */
+  /*
+   * 圆角梯度。
+   * 同心圆角：内层块若与它的外层容器「贴合」，半径必须等于 外层半径 − 内边距，
+   * 否则两条弧线不平行，眼睛会觉得嵌套关系「错一档」。
+   * 这里把口径固化成 token，内层块一律引用 --r-in-*，改内边距时只改 --pad-*。
+   */
   --r-lg: 20px;
   --r-md: 14px;
   --r-sm: 10px;
-  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --shadow-2: 0 18px 40px -24px rgba(0, 0, 0, 0.9);
+  --r-xs: 7px;
+  --pad-card: 17px;
+  --pad-card-x: 18px;
+  --r-in-card: max(6px, calc(var(--r-lg) - var(--pad-card-x)));
+
+  /* 阴影代替边框：1px 轮廓用 ring 影子画，不占布局宽度，也不吃内容盒 */
+  --hi: inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent);
+  --elev-1: 0 1px 2px rgba(0, 0, 0, 0.22), 0 6px 14px -10px rgba(0, 0, 0, 0.5);
+  --elev-2: 0 2px 4px rgba(0, 0, 0, 0.26), 0 24px 48px -26px rgba(0, 0, 0, 0.9);
+  --shadow-1: var(--elev-1);
+  --shadow-2: var(--elev-2);
 
   font-family: 'SF Pro Text', -apple-system, BlinkMacSystemFont, 'Segoe UI',
     'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', system-ui, sans-serif;
@@ -70,8 +89,9 @@
     --danger: #d6453a;
     --warn: #a9711a;
     --info: #6b4fd0;
-    --shadow-1: 0 1px 2px rgba(20, 23, 29, 0.06);
-    --shadow-2: 0 18px 40px -28px rgba(20, 23, 29, 0.22);
+    --hi: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    --elev-1: 0 1px 2px rgba(20, 23, 29, 0.06), 0 6px 14px -10px rgba(20, 23, 29, 0.12);
+    --elev-2: 0 2px 4px rgba(20, 23, 29, 0.08), 0 24px 48px -26px rgba(20, 23, 29, 0.24);
   }
 
   /* 浅色下描边 / 填充要更实一些，否则卡片边界几乎看不见 */
@@ -95,6 +115,35 @@
  */
 [hidden] {
   display: none !important;
+}
+
+/*
+ * 平衡标题换行：标题在窄容器里折行时，让各行尽量等长，避免末行只剩一两个字；
+ * 正文用 pretty，优先不留下孤字（不支持该属性的浏览器按普通换行处理）。
+ */
+:is(h1, h2, h3, .stat__label, .empty__title) {
+  text-wrap: balance;
+}
+
+:is(p, li, .card__note, .login__status, .alert__body p, .empty__hint) {
+  text-wrap: pretty;
+}
+
+/*
+ * 错开入场：容器首次渲染时由 app.js 打上 data-enter="stagger"，并给每个子项写 --i，
+ * 这里只负责按序号延迟。刷新（自动 / 手动）重渲染时容器是 data-enter="instant"，
+ * 不会重放动画。
+ */
+@keyframes riseIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+}
+
+[data-enter='stagger'] > * {
+  animation: riseIn 0.46s cubic-bezier(0.22, 0.68, 0, 1) backwards;
+  animation-delay: calc(var(--i, 0) * 45ms);
 }
 
 html {
@@ -195,7 +244,8 @@ body {
   flex-direction: column;
   height: 100vh;
   padding: 22px 14px 16px;
-  border-right: 1px solid var(--line);
+  /* 描边改影子：1px 不占布局，也不会在 sticky 层里影响内容宽度 */
+  box-shadow: inset -1px 0 0 var(--line);
   background: linear-gradient(
     180deg,
     color-mix(in srgb, var(--surface) 62%, transparent),
@@ -286,8 +336,10 @@ body {
     color-mix(in srgb, var(--mint) 20%, transparent),
     color-mix(in srgb, var(--mint) 6%, transparent)
   );
-  border: 1px solid color-mix(in srgb, var(--mint) 30%, transparent);
-  box-shadow: 0 6px 18px -12px color-mix(in srgb, var(--mint) 80%, transparent);
+  /* 内描边而不是 border：pill 的宽高由 app.js 按导航项量出来写行内，
+     真边框会把内容顶进去 1px，滑块和文字就对不齐了 */
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--mint) 30%, transparent),
+    0 6px 18px -12px color-mix(in srgb, var(--mint) 80%, transparent);
   pointer-events: none;
   z-index: 0;
   opacity: 1;
@@ -470,19 +522,19 @@ body {
   gap: 8px;
   width: 100%;
   padding: 8px 11px;
-  border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--fill-1);
+  box-shadow: 0 0 0 1px var(--line);
   color: var(--text-3);
   font: inherit;
   font-size: 11.5px;
   cursor: pointer;
-  transition: color 0.16s ease, border-color 0.16s ease, background 0.16s ease;
+  transition: color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
 }
 
 .rail__cmd:hover {
   color: var(--text);
-  border-color: var(--line-strong);
+  box-shadow: 0 0 0 1px var(--line-strong);
   background: var(--fill-2);
 }
 
@@ -498,7 +550,7 @@ body {
   justify-content: space-between;
   gap: 14px;
   padding: 14px clamp(18px, 2.4vw, 28px);
-  border-bottom: 1px solid var(--line);
+  box-shadow: inset 0 -1px 0 var(--line);
   background: color-mix(in srgb, var(--bg) 76%, transparent);
   backdrop-filter: blur(20px) saturate(150%);
   -webkit-backdrop-filter: blur(20px) saturate(150%);
@@ -530,9 +582,9 @@ body {
   align-items: center;
   gap: 7px;
   padding: 5px 11px;
-  border: 1px solid var(--line);
   border-radius: 999px;
   background: var(--fill-1);
+  box-shadow: 0 0 0 1px var(--line);
   color: var(--text-2);
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
@@ -629,17 +681,17 @@ kbd {
   align-items: center;
   gap: 6px;
   padding: 5px 11px 5px 9px;
-  border: 1px solid var(--line);
   border-radius: 999px;
+  box-shadow: 0 0 0 1px var(--line);
   color: var(--text-2);
   font-size: 11.5px;
   cursor: pointer;
   user-select: none;
-  transition: border-color 0.16s ease, background 0.16s ease;
+  transition: box-shadow 0.16s ease, background 0.16s ease;
 }
 
 .switch:hover {
-  border-color: var(--line-strong);
+  box-shadow: 0 0 0 1px var(--line-strong);
   background: var(--fill-1);
 }
 
@@ -673,28 +725,19 @@ kbd {
 .stat {
   position: relative;
   overflow: hidden;
-  padding: 16px 18px;
-  border: 1px solid var(--line);
+  padding: var(--pad-card) var(--pad-card-x);
   border-radius: var(--r-lg);
   background:
     linear-gradient(165deg, var(--fill-1), transparent 62%),
     var(--surface);
-  box-shadow: var(--shadow-1);
-  transition: border-color 0.2s ease, transform 0.2s ease;
-}
-
-.stat::after {
-  content: '';
-  position: absolute;
-  inset: 0 auto auto 0;
-  width: 100%;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--text) 10%, transparent), transparent);
+  box-shadow: 0 0 0 1px var(--ring-color, var(--line)), var(--hi), var(--elev, var(--elev-1));
+  transition: box-shadow 0.22s ease, transform 0.2s ease;
 }
 
 .stat:hover {
-  border-color: var(--line-strong);
-  transform: translateY(-1px);
+  --ring-color: var(--line-strong);
+  --elev: var(--elev-2);
+  transform: translateY(-2px);
 }
 
 .stat__label {
@@ -755,6 +798,8 @@ kbd {
   margin-top: 8px;
   font-size: 11px;
   color: var(--text-3);
+  /* 提示里带数字（如「30~60 天内还有 2 笔」）：等宽，刷新时不自抖 */
+  font-variant-numeric: tabular-nums;
 }
 
 /* 告警条：只留一条左侧色条 + 淡渐变，不再整块粉底 */
@@ -764,14 +809,13 @@ kbd {
   align-items: center;
   gap: 12px;
   padding: 13px 16px 13px 18px;
-  border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
   border-radius: var(--r-md);
   background: linear-gradient(
     90deg,
     color-mix(in srgb, var(--danger) 11%, transparent),
     color-mix(in srgb, var(--danger) 2%, transparent) 62%
   );
-  box-shadow: var(--shadow-1);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--danger) 30%, transparent), var(--elev-1);
 }
 
 .alert::before {
@@ -786,12 +830,12 @@ kbd {
 }
 
 .alert--warning {
-  border-color: color-mix(in srgb, var(--warn) 30%, transparent);
   background: linear-gradient(
     90deg,
     color-mix(in srgb, var(--warn) 10%, transparent),
     color-mix(in srgb, var(--warn) 2%, transparent) 62%
   );
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 30%, transparent), var(--elev-1);
 }
 
 .alert--warning::before {
@@ -822,8 +866,8 @@ kbd {
   align-items: center;
   gap: 14px;
   padding: 9px 13px;
-  border: 1px solid var(--line);
   border-radius: var(--r-md);
+  box-shadow: 0 0 0 1px var(--line), var(--elev-1);
   background: color-mix(in srgb, var(--surface) 55%, transparent);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
@@ -893,19 +937,18 @@ kbd {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 17px 18px;
-  border: 1px solid var(--line);
+  padding: var(--pad-card) var(--pad-card-x);
   border-radius: var(--r-lg);
   background: linear-gradient(180deg, var(--fill-1), transparent 46%), var(--surface);
-  box-shadow: var(--shadow-1);
-  transition: transform 0.22s cubic-bezier(0.32, 0.72, 0, 1), border-color 0.22s ease,
-    box-shadow 0.22s ease;
+  /* --ring-color 由告警态覆盖，--elev 由 hover 覆盖：一处声明，多态复用 */
+  box-shadow: 0 0 0 1px var(--ring-color, var(--line)), var(--hi), var(--elev, var(--elev-1));
+  transition: transform 0.22s cubic-bezier(0.32, 0.72, 0, 1), box-shadow 0.22s ease;
 }
 
 .card:hover {
+  --ring-color: var(--line-strong);
+  --elev: var(--elev-2);
   transform: translateY(-2px);
-  border-color: var(--line-strong);
-  box-shadow: var(--shadow-2);
 }
 
 /* 顶部 1px 渐变发丝线：正常薄荷绿，告警转色，取代旧版 3px 色块 */
@@ -931,11 +974,11 @@ kbd {
 }
 
 .card[data-urgency='critical'] {
-  border-color: color-mix(in srgb, var(--danger) 26%, transparent);
+  --ring-color: color-mix(in srgb, var(--danger) 26%, transparent);
 }
 
 .card[data-urgency='warning'] {
-  border-color: color-mix(in srgb, var(--warn) 22%, transparent);
+  --ring-color: color-mix(in srgb, var(--warn) 22%, transparent);
 }
 
 .card[data-urgency='critical'] .dot {
@@ -1066,8 +1109,8 @@ kbd {
 .usage {
   display: block;
   padding: 10px 11px;
-  border: 1px solid transparent;
-  border-radius: var(--r-sm);
+  border-radius: var(--r-in-card);
+  box-shadow: 0 0 0 1px transparent;
   background: var(--fill-1);
   color: inherit;
   text-decoration: none;
@@ -1080,13 +1123,13 @@ kbd {
 
 .usage--link {
   cursor: pointer;
-  transition: background 0.16s ease, border-color 0.16s ease;
+  transition: background 0.16s ease, box-shadow 0.16s ease;
 }
 
 .usage--link:hover,
 .usage--link:focus-visible {
   background: color-mix(in srgb, var(--mint) 8%, transparent);
-  border-color: color-mix(in srgb, var(--mint) 26%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--mint) 26%, transparent);
 }
 
 .usage__grid {
@@ -1201,7 +1244,7 @@ kbd {
   gap: 3px 10px;
   padding: 8px 10px;
   border-left: 2px solid var(--line-strong);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  border-radius: 0 var(--r-in-card) var(--r-in-card) 0;
   background: var(--fill-1);
 }
 
@@ -1275,7 +1318,7 @@ kbd {
   margin-top: 7px;
   padding: 6px 10px;
   border: 1px dashed var(--line-strong);
-  border-radius: var(--r-sm);
+  border-radius: var(--r-in-card);
   background: transparent;
   color: var(--text-3);
   font: inherit;
@@ -1309,7 +1352,7 @@ kbd {
   gap: 6px;
   padding: 9px 10px;
   border-left: 2px solid var(--info);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  border-radius: 0 var(--r-in-card) var(--r-in-card) 0;
   background: var(--fill-1);
 }
 
@@ -1400,7 +1443,7 @@ kbd {
 .secret {
   padding: 9px 10px;
   border-left: 2px solid color-mix(in srgb, var(--info) 70%, transparent);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  border-radius: 0 var(--r-in-card) var(--r-in-card) 0;
   background: color-mix(in srgb, var(--info) 7%, transparent);
 }
 
@@ -1494,8 +1537,8 @@ kbd {
 .card__note {
   margin: 0;
   padding: 8px 10px;
-  border: 1px solid color-mix(in srgb, var(--warn) 22%, transparent);
-  border-radius: var(--r-sm);
+  border-radius: var(--r-in-card);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 22%, transparent);
   background: color-mix(in srgb, var(--warn) 7%, transparent);
   color: color-mix(in srgb, var(--warn) 82%, var(--text));
   font-size: 11px;
@@ -1505,7 +1548,7 @@ kbd {
 .card__error {
   margin: 0;
   padding: 9px 11px;
-  border-radius: var(--r-sm);
+  border-radius: var(--r-in-card);
   background: color-mix(in srgb, var(--danger) 9%, transparent);
   color: var(--danger);
   font-size: 11.5px;
@@ -1522,6 +1565,7 @@ kbd {
   padding-top: 10px;
   border-top: 1px solid var(--line);
   font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 .card__link {
@@ -1542,9 +1586,9 @@ kbd {
 /* ------------------------------ 面板 ------------------------------ */
 
 .panel {
-  padding: 17px 18px;
-  border: 1px solid var(--line);
+  padding: var(--pad-card) var(--pad-card-x);
   border-radius: var(--r-lg);
+  box-shadow: 0 0 0 1px var(--line), var(--hi), var(--elev-1);
   background: color-mix(in srgb, var(--surface) 48%, transparent);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
@@ -1589,7 +1633,7 @@ kbd {
   gap: 12px;
   padding: 9px 11px;
   border-left: 2px solid transparent;
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  border-radius: 0 var(--r-in-card) var(--r-in-card) 0;
   background: var(--fill-1);
   font-size: 12px;
   transition: background 0.16s ease;
@@ -1631,6 +1675,7 @@ kbd {
   color: var(--text-3);
   font-size: 10.5px;
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
   text-align: right;
 }
 
@@ -1653,7 +1698,7 @@ kbd {
 .diag {
   padding: 10px 12px;
   border-left: 2px solid color-mix(in srgb, var(--info) 65%, transparent);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  border-radius: 0 var(--r-in-card) var(--r-in-card) 0;
   background: color-mix(in srgb, var(--info) 6%, transparent);
   color: var(--text-2);
   white-space: pre-wrap;
@@ -1719,8 +1764,8 @@ kbd {
 .login {
   margin-top: 10px;
   padding: 11px;
-  border: 1px solid color-mix(in srgb, var(--mint) 18%, transparent);
-  border-radius: var(--r-md);
+  border-radius: var(--r-in-card);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--mint) 18%, transparent);
   background: color-mix(in srgb, var(--mint) 4%, transparent);
 }
 
@@ -1814,7 +1859,7 @@ kbd {
   min-width: 156px;
   min-height: 116px;
   padding: 8px;
-  border-radius: var(--r-sm);
+  border-radius: var(--r-xs);
   background: #fff;
 }
 
@@ -1985,7 +2030,7 @@ kbd {
 .manage__result {
   margin: 10px 0 0;
   padding: 8px 10px;
-  border-radius: var(--r-sm);
+  border-radius: var(--r-in-card);
   font-size: 11.5px;
   word-break: break-word;
 }
@@ -2022,7 +2067,7 @@ kbd {
   gap: 8px;
   padding: 7px 10px;
   border-left: 2px solid var(--text-3);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  border-radius: 0 var(--r-in-card) var(--r-in-card) 0;
   background: var(--fill-1);
   font-size: 11.5px;
 }
@@ -2047,11 +2092,12 @@ kbd {
   width: min(720px, calc(100vw - 32px));
   max-height: min(84vh, 760px);
   padding: 0;
-  border: 1px solid var(--line-strong);
+  /* 描边改影子后必须显式清掉 border：<dialog> 的 UA 默认是 3px currentColor */
+  border: 0;
   border-radius: var(--r-lg);
   background: var(--surface);
   color: var(--text);
-  box-shadow: 0 40px 90px -40px rgba(0, 0, 0, 0.9);
+  box-shadow: 0 0 0 1px var(--line-strong), 0 40px 90px -40px rgba(0, 0, 0, 0.9);
   overflow: hidden;
 }
 
@@ -2138,8 +2184,8 @@ kbd {
 
 .dialog__issues {
   padding: 10px 12px;
-  border: 1px solid color-mix(in srgb, var(--warn) 26%, transparent);
-  border-radius: var(--r-sm);
+  border-radius: var(--r-in-card);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 26%, transparent);
   background: color-mix(in srgb, var(--warn) 6%, transparent);
 }
 
@@ -2168,8 +2214,8 @@ kbd {
   flex-direction: column;
   gap: 8px;
   padding: 11px 13px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
+  border-radius: var(--r-in-card);
+  box-shadow: 0 0 0 1px var(--line);
   background: var(--fill-1);
 }
 
@@ -2196,6 +2242,7 @@ kbd {
 .platform__count {
   color: var(--text-3);
   font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 .platform__count--empty {
@@ -2235,6 +2282,7 @@ kbd {
   padding: 0 clamp(18px, 2.4vw, 28px) 30px;
   color: var(--text-3);
   font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ------------------------------ 命令面板 ------------------------------ */
@@ -2242,11 +2290,13 @@ kbd {
 .cmd {
   width: min(620px, calc(100vw - 32px));
   padding: 0;
-  border: 1px solid var(--line-strong);
+  /* 同 .dialog：<dialog> 的 UA 默认边框会以 currentColor 画 3px，必须清掉 */
+  border: 0;
   border-radius: 18px;
   background: color-mix(in srgb, var(--surface) 94%, var(--bg));
   color: var(--text);
-  box-shadow: 0 50px 110px -50px rgba(0, 0, 0, 0.95);
+  /* 18px 外层 + 6px 列表内边距 → 条目用 12px，弧线与面板外沿同心 */
+  box-shadow: 0 0 0 1px var(--line-strong), 0 50px 110px -50px rgba(0, 0, 0, 0.95);
   overflow: hidden;
 }
 
@@ -2318,7 +2368,7 @@ kbd {
   justify-content: space-between;
   gap: 12px;
   padding: 9px 11px;
-  border-radius: 9px;
+  border-radius: 12px;
   color: var(--text-2);
   font-size: 12.5px;
   cursor: pointer;
@@ -2376,10 +2426,9 @@ kbd {
   left: 50%;
   z-index: 40;
   padding: 5px;
-  border: 1px solid var(--line-strong);
   border-radius: 999px;
   background: color-mix(in srgb, var(--surface) 82%, transparent);
-  box-shadow: 0 24px 50px -22px rgba(0, 0, 0, 0.95);
+  box-shadow: 0 0 0 1px var(--line-strong), 0 24px 50px -22px rgba(0, 0, 0, 0.95);
   backdrop-filter: blur(20px) saturate(150%);
   -webkit-backdrop-filter: blur(20px) saturate(150%);
   transform: translateX(-50%);
@@ -2393,7 +2442,7 @@ kbd {
   height: 0;
   border-radius: 999px;
   background: color-mix(in srgb, var(--mint) 18%, transparent);
-  border: 1px solid color-mix(in srgb, var(--mint) 28%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--mint) 28%, transparent);
   pointer-events: none;
   z-index: 0;
   transition:

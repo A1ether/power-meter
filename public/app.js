@@ -248,6 +248,25 @@ function element(tag, className, text) {
   return node;
 }
 
+/*
+ * 错开入场：容器首次渲染时给子项写 --i（样式里按 45ms × 序号延迟），
+ * 并标记 data-enter="stagger"；之后每次刷新重渲染都标 "instant"，
+ * 避免自动刷新（5 分钟一次）把整个看板重新「飘」一遍。
+ * 只写 --i 这一个自定义属性，不碰子项其它内联样式。
+ */
+const entered = new Set();
+
+function applyStagger(container, key) {
+  const items = Array.from(container.children);
+  if (entered.has(key)) {
+    container.dataset.enter = 'instant';
+    return;
+  }
+  entered.add(key);
+  container.dataset.enter = 'stagger';
+  items.forEach((item, index) => item.style.setProperty('--i', String(index)));
+}
+
 async function load(force = false) {
   if (state.loading) return;
   state.loading = true;
@@ -352,6 +371,7 @@ function renderSummary(data) {
     card.append(element('span', 'stat__hint', stat.hint));
     els.summary.append(card);
   }
+  applyStagger(els.summary, 'summary');
 }
 
 function renderAlert(data) {
@@ -561,6 +581,7 @@ function renderGrid(data) {
   if (providers.length === 0) {
     if (state.query) {
       els.grid.append(element('div', 'empty', '没有匹配的平台'));
+      els.grid.dataset.enter = 'instant';
       return;
     }
     // 空看板是「第一次使用」的常态：给出直达添加入口，而不是让用户去翻文档
@@ -574,6 +595,7 @@ function renderGrid(data) {
     addBtn.addEventListener('click', () => openPlatformsDialog());
     empty.append(addBtn);
     els.grid.append(empty);
+    els.grid.dataset.enter = 'instant';
     return;
   }
 
@@ -584,6 +606,7 @@ function renderGrid(data) {
     fragment.append(buildCard(provider, thresholds, crossRegion));
   }
   els.grid.append(fragment);
+  applyStagger(els.grid, 'grid');
 }
 
 function buildCard(provider, thresholds, crossRegion = new Set()) {
@@ -2138,6 +2161,7 @@ function renderTimeline(data) {
   els.timeline.replaceChildren();
   if (hits.length === 0) {
     els.timeline.append(element('li', 'muted', '暂无可用的到期信息'));
+    els.timeline.dataset.enter = 'instant';
     return;
   }
 
@@ -2155,6 +2179,7 @@ function renderTimeline(data) {
     fragment.append(item);
   }
   els.timeline.append(fragment);
+  applyStagger(els.timeline, 'timeline');
 }
 
 function renderDiagnostics(data) {
