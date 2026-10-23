@@ -1,4 +1,5 @@
 import { isRecord } from './json.js';
+import { describeNetworkError, directFetch } from './direct-egress.js';
 
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
@@ -50,6 +51,8 @@ export interface JsonRequestInit {
   headers?: Record<string, string>;
   body?: string | null;
   timeoutMs?: number;
+  /** 排查用：直连兜底被触发时写日志（不传则不产生任何日志） */
+  log?: (message: string) => void;
 }
 
 export interface JsonResult {
@@ -60,31 +63,133 @@ export interface JsonResult {
 }
 
 /**
+ * 直连兜底开关（`DIRECT_EGRESS_RETRY`）：
+ *   - `auto`（默认）：`fetch` 因网络层原因失败（没有任何 HTTP 响应）时，
+ *     用「物理网卡源地址 + DoH 真实 IP」再发一次同样的请求；
+ *   - `off`：完全关闭，行为与引入本开关前一致。
+ *
+ * 为什么需要它：本机以 TUN 代理出网时，个别站点会被出口节点在 TLS 握手阶段
+ * 重置（`fetch failed` / `ECONNRESET`），而物理网卡直连同一站点正常。
+ * 详见 docs/fixes/Qoder-国际站fetch-failed-修复方案.md。
+ */
+export function directRetryEnabled(): boolean {
+  const raw = (process.env.DIRECT_EGRESS_RETRY || 'auto').trim().toLowerCase();
+  return !['off', '0', 'false', 'no', 'disable', 'disabled'].includes(raw);
+}
+
+/**
+ * 记住「默认出口会失败」的主机（10 分钟）：
+ * 命中后**先**走直连、不再白等一次必败的 `fetch`。
+ * 这对每轮刷新都要打 5+ 次历史明细的站点意义很大——
+ * 否则每次刷新都要先吃一遍 TLS 重置（每次约 100~300ms）。
+ */
+const directOnlyHosts = new Map<string, number>();
+const DIRECT_ONLY_TTL_MS = 10 * 60_000;
+
+function markDirectOnly(host: string): void {
+  directOnlyHosts.set(host, Date.now() + DIRECT_ONLY_TTL_MS);
+}
+
+function preferDirect(host: string): boolean {
+  const expires = directOnlyHosts.get(host);
+  if (!expires) return false;
+  if (expires > Date.now()) return true;
+  directOnlyHosts.delete(host);
+  return false;
+}
+
+/** 每台主机只记一次兜底日志：调用方每轮会发多条请求，逐条记录只会把日志刷满 */
+const directLoggedHosts = new Set<string>();
+
+/** 该 URL 是否值得尝试直连：只处理 https 域名，本机/ IP 字面量没意义 */
+function directEligible(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return false;
+    const host = parsed.hostname.toLowerCase();
+    if (!host || host === 'localhost' || host.endsWith('.local')) return false;
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(':')) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 带超时与统一错误映射的 JSON 请求。
  * 用 AbortSignal.timeout 实现硬截止，避免慢接口拖垮整个看板刷新。
+ *
+ * 网络层失败（没有拿到 Response）时，若直连兜底开启则换通道重发一次；
+ * 拿到任意 HTTP 状态都不重试——业务 4xx/5xx 换通道重放既无意义也会掩盖真实原因。
  */
 export async function fetchJson(
   url: string,
   init: JsonRequestInit = {},
 ): Promise<JsonResult> {
   const timeoutMs = init.timeoutMs ?? 12_000;
+  const headers: Record<string, string> = {
+    Accept: 'application/json, text/plain, */*',
+    'User-Agent': browserUserAgent(),
+    ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+    ...(init.headers ?? {}),
+  };
+
+  const host = new URL(url).hostname.toLowerCase();
+  const canFallBack = directRetryEnabled() && directEligible(url);
+
+  /** 用直连通道重发；成功返回 Response，失败抛原给调用方的 HttpError */
+  const viaDirect = async (defaultFailure: string | null): Promise<Response> => {
+    try {
+      const direct = await directFetch(url, {
+        method: init.method ?? 'GET',
+        headers,
+        body: init.body ?? null,
+        timeoutMs,
+      });
+      // 每台主机只留一条日志：调用方一轮会发多条请求，逐条记录只会刷屏
+      if (!directLoggedHosts.has(host)) {
+        directLoggedHosts.add(host);
+        init.log?.(
+          (defaultFailure ? `请求失败（${defaultFailure}），` : '') +
+            `已改直连（${direct.via}）→ HTTP ${direct.status}` +
+            (defaultFailure ? '；后续同类请求优先走直连（10 分钟）' : ''),
+        );
+      }
+      if (defaultFailure) markDirectOnly(host);
+      // 204/205/304 属于「无正文状态」，Response 构造器不接受非 null body
+      const nullBodyStatus = direct.status === 204 || direct.status === 205 || direct.status === 304;
+      return new Response(nullBodyStatus ? null : direct.text, {
+        status: direct.status,
+        statusText: direct.statusText,
+      });
+    } catch (directError) {
+      throw new HttpError(
+        defaultFailure
+          ? `请求失败：${defaultFailure}；直连重试也失败：${(directError as Error).message}`
+          : `请求失败：${(directError as Error).message}`,
+        0,
+      );
+    }
+  };
+
   let response: Response;
-  try {
-    response = await fetch(url, {
-      method: init.method ?? 'GET',
-      headers: {
-        Accept: 'application/json, text/plain, */*',
-        'User-Agent': browserUserAgent(),
-        ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-        ...(init.headers ?? {}),
-      },
-      body: init.body ?? undefined,
-      redirect: 'follow',
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new HttpError(`请求失败：${reason}`, 0);
+  if (canFallBack && preferDirect(host)) {
+    // 该主机已确认默认出口不通：直接走直连，不再白等一次必败的 fetch
+    response = await viaDirect(null);
+  } else {
+    try {
+      response = await fetch(url, {
+        method: init.method ?? 'GET',
+        headers,
+        body: init.body ?? undefined,
+        redirect: 'follow',
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (error) {
+      const reason = describeNetworkError(error);
+      if (!canFallBack) throw new HttpError(`请求失败：${reason}`, 0);
+      response = await viaDirect(reason);
+    }
   }
 
   const text = await response.text();
