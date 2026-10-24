@@ -461,6 +461,14 @@ export const codeartsAdapter: ProviderAdapter = {
   dashboardUrl: 'https://codearts.huaweicloud.com/portal/settings/personal-usage',
   usageUrl: 'https://codearts.huaweicloud.com/portal/settings/personal-usage?locale=zh-cn',
   requiredCredentialKeys: ['cookie'],
+  /**
+   * AK/SK 或 Cookie 任一齐全即可取数（`requiredCredentialKeys` 表达不了「A 或 B」）。
+   * AK/SK 的全局兜底（.env 的 CODEARTS_AK/SK）同样算已配置——老用户是不写 accounts.json 的。
+   */
+  isConfigured: (account) =>
+    Boolean(readCodeArtsAkSk(account)) ||
+    Boolean(account.credentials.cookie || account.credentials.cookieHeader) ||
+    Boolean(process.env.CODEARTS_AK || process.env.CODEARTS_CLI_AK),
   credentialHint:
     '三种凭证方式任选其一：① 推荐「网页端登录」——卡片上点按钮自动打开华为云用量页，' +
     '登录后自动完成添加（Cookie 自动落 CODEARTS_COOKIE，配合 npm run codearts:refresh 定时续期）；' +
@@ -475,6 +483,42 @@ export const codeartsAdapter: ProviderAdapter = {
    * 见 docs/fixes/CodeArts-华为云登录态频繁失效-修复方案.md §3.1 选项 C/E）。
    */
   login: codeartsWebLogin,
+  /**
+   * 增删账号走通用实现（src/account-store.ts），表单字段见 manageFields。
+   *
+   * AK/SK 表单是兜底与多账号路径（长期有效，不会像登录态那样一小时就失效）；
+   * Cookie 是可选附加项——填了就能把活动福利展开成逐笔明细（见 probe 的混合增强），
+   * 不填则退回聚合口径，余额仍由 AK/SK 权威给出。
+   */
+  manageAccounts: true,
+  manageFields: [
+    {
+      key: 'accessKey',
+      label: 'AccessKey',
+      placeholder: '华为云控制台 → 我的凭证 → 访问密钥 → Access Key Id（AK）',
+      hint: '长期有效。IAM 账号需具备费用中心查看权限（billing:resourcePackages:view）。',
+      secret: false,
+    },
+    {
+      key: 'secretKey',
+      label: 'SecretKey',
+      placeholder: '与 AccessKey 配对的 Secret Access Key（SK）',
+      hint: '与 AccessKey 成对保存；写入 .env 后页面不再回显。',
+      pairedWith: 'accessKey',
+    },
+    {
+      key: 'cookie',
+      label: 'Cookie（可选）',
+      placeholder: '登录 codearts.huaweicloud.com → DevTools → 任意 /portal/ 请求 → 复制 Cookie 整段值',
+      hint: '填了会把活动福利展开成逐笔明细；登录态约一小时过期，过期只影响活动明细，不影响余额。',
+      required: false,
+      multiline: true,
+    },
+  ],
+  manageHint:
+    '会用这组 AK/SK 真实调用一次华为云 snap-access 网关（签名验证），通过后才写入本机 .env 新槽位与 accounts.json；写入前自动备份到 .run/。' +
+    '提示：若已有「网页端登录」添加的账号且未单独配置 AK/SK，本机 .env 的 CODEARTS_AK/SK 全局兜底会与它同时生效，' +
+    '卡片可能重复计余额——二选一即可（删除网页登录账号，或清空全局 CODEARTS_AK/SK 并给该账号补 AK/SK）。',
   /**
    * 用量 + 获取明细（v2）：
    *   - 用量：按天图表（`xDimension=DATE_DAY` + `TOTAL_CREDITS`，取昨日/今日两天），
