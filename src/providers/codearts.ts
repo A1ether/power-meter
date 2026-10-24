@@ -624,18 +624,15 @@ export const codeartsAdapter: ProviderAdapter = {
     // 凭证优先级：AK/SK（长期有效，走 snap-access 网关）→ 控制台 Cookie（会话过期需重抓）
     // options.authMode: 'auto'（默认）| 'aksk'（只用 AK/SK）| 'cookie'（只用登录态）
     const authMode = (optString(account, 'authMode') || 'auto').toLowerCase();
-    const aksk = authMode === 'cookie' ? null : readCodeArtsAkSk(account);
+    const aksk = authMode === 'cookie' ? null : readCodeArtsAkSk(account, ctx);
     if (aksk) {
+      const timeoutMs = ctx.timeoutMs || CA_TIMEOUT_FALLBACK;
+      // auto 模式下登录态是否可用决定要不要做活动逐笔（混合增强）；
+      // 没有 Cookie 就不存在「回退登录态」这一步，AK/SK 成败即最终结果——
+      // 否则纯 AK/SK 账号会掉到下面的 notConfigured，看板添加账号的预校验也会误判。
+      const cookie = authMode === 'aksk' ? '' : normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
       try {
-        const timeoutMs = ctx.timeoutMs || CA_TIMEOUT_FALLBACK;
         const subscription = await fetchCodeArtsSubscription(aksk, timeoutMs);
-        if (authMode === 'aksk') {
-          return buildCodeArtsSnapshot(codeartsAdapter, account, ctx, subscription, null);
-        }
-
-        // auto（混合增强）：余额/额度窗口用 AK/SK 的权威口径；登录态可用时，
-        // 活动福利批次改用控制台逐笔明细（每笔独立到期），明细缺失只降级活动批次。
-        const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
         if (!cookie) {
           return buildCodeArtsSnapshot(
             codeartsAdapter,
@@ -643,10 +640,12 @@ export const codeartsAdapter: ProviderAdapter = {
             ctx,
             subscription,
             null,
-            '未配置登录态 Cookie，活动福利按聚合口径展示',
+            authMode === 'aksk' ? null : '未配置登录态 Cookie，活动福利按聚合口径展示',
           );
         }
 
+        // auto（混合增强）：余额/额度窗口用 AK/SK 的权威口径；登录态可用时，
+        // 活动福利批次改用控制台逐笔明细（每笔独立到期），明细缺失只降级活动批次。
         try {
           const detail = await fetchCampaignBenefits(consoleHeaders(account, cookie), timeoutMs, ctx);
           if (detail.lots.length === 0) {
@@ -664,7 +663,7 @@ export const codeartsAdapter: ProviderAdapter = {
         }
       } catch (error) {
         const message = (error as Error).message;
-        if (authMode === 'aksk') {
+        if (authMode === 'aksk' || !cookie) {
           return failure(
             codeartsAdapter,
             account,
@@ -678,7 +677,18 @@ export const codeartsAdapter: ProviderAdapter = {
     }
 
     const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
-    if (!cookie) return notConfigured(codeartsAdapter, account, ctx, ['cookie 或 accessKey/secretKey']);
+    if (!cookie) {
+      // 走到这里说明没有可用的 AK/SK（配齐了上面就会返回）也没有 Cookie。
+      return notConfigured(
+        {
+          ...codeartsAdapter,
+          credentialHint: '若用 AK/SK，accessKey 与 secretKey 必须成对填写；只填一个会被忽略。',
+        },
+        account,
+        ctx,
+        ['AK/SK（accessKey + secretKey）或 Cookie'],
+      );
+    }
 
     const timeoutMs = ctx.timeoutMs || CA_TIMEOUT_FALLBACK;
     const headers = consoleHeaders(account, cookie);

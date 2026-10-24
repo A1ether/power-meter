@@ -7,6 +7,7 @@ import {
   buildSnapshot,
   hiddenLotsNote,
   joinNotes,
+  cred,
   makeLot,
   makeWindow,
   optString,
@@ -76,15 +77,16 @@ export interface CodeArtsCampaignDetail {
 
 /**
  * 读取 AK/SK。优先级：accounts.json 的 credentials.accessKey/secretKey
- * → options.accessKey/secretKey → 进程环境变量（CODEARTS_AK/CODEARTS_SK，
- * 兼容 CLI 官方的 CODEARTS_CLI_AK/CODEARTS_CLI_SK）。
+ * → ctx 凭证解析（`cred()`，含进程环境变量的全局兜底与看板校验时的临时账号）
+ * → 直接读进程环境变量（CODEARTS_AK/CODEARTS_SK，兼容 CLI 官方的 CODEARTS_CLI_AK/CODEARTS_CLI_SK）。
  *
  * 支持环境变量兜底是为了让「只往 .env 里加两个变量」就能切换到 AK/SK，
  * 不必再改 accounts.json（凭证明文始终只落在 .env）。
  */
-export function readCodeArtsAkSk(account: AccountConfig): CodeArtsAkSk | null {
+export function readCodeArtsAkSk(account: AccountConfig, ctx?: ProbeContext): CodeArtsAkSk | null {
   const accessKey = (
     account.credentials.accessKey ||
+    (ctx ? cred(account, ctx, ['accessKey']) : '') ||
     optString(account, 'accessKey') ||
     process.env.CODEARTS_AK ||
     process.env.CODEARTS_CLI_AK ||
@@ -92,6 +94,7 @@ export function readCodeArtsAkSk(account: AccountConfig): CodeArtsAkSk | null {
   ).trim();
   const secretKey = (
     account.credentials.secretKey ||
+    (ctx ? cred(account, ctx, ['secretKey']) : '') ||
     optString(account, 'secretKey') ||
     process.env.CODEARTS_SK ||
     process.env.CODEARTS_CLI_SK ||
@@ -164,7 +167,16 @@ export async function fetchCodeArtsSubscription(
 
   if (!result.ok) {
     const detail = result.text.replace(/\s+/g, ' ').trim().slice(0, 160);
-    throw new HttpError(`snap-access 返回 HTTP ${result.status}：${detail}`, result.status);
+    // APIG.0613：网关能连上，但下游 IAM 校验 AK/SK 时报系统错误——实测对错误的
+    // AK/SK 也返回它（不是 401），因此按「凭证验证失败」而不是「服务不可用」上报，
+    // 否则看板添加账号时会让人以为等一会儿就好。
+    const iamCheckFailed = /APIG\.0613/.test(result.text);
+    throw new HttpError(
+      `snap-access 返回 HTTP ${result.status}：${detail}` +
+        (iamCheckFailed ? '（网关无法完成 AK/SK 签名校验，请确认密钥正确且未被停用）' : ''),
+      // 401 = 凭证不对（HTTP 本身可能仍是 5xx），401 映射为 unauthorized，区别于服务不可用
+      iamCheckFailed ? 401 : result.status,
+    );
   }
   return parseStatisticsPlugin(result.json);
 }
