@@ -22,7 +22,9 @@ import {
   splitByExpiry,
   type ProbeContext,
   type ProviderAdapter,
+  type ProviderLogin,
 } from './base.js';
+import { ensureDebugChrome, openCookieCollector, type CookieCollector } from '../lib/cdp.js';
 
 /**
  * CodeArts 华为云（codearts.huaweicloud.com，码道代码智能体）
@@ -135,6 +137,29 @@ const CFTK_COOKIE_NAME = 'devclouddevuibjtcftk';
 const DEFAULT_RESOURCE_TYPE = 'hws.resource.type.codearts.snap';
 /** 活动数量上限，避免异常账号拉出几百个请求 */
 const MAX_CAMPAIGNS = 20;
+
+/* ------------------------------------------------------------------ *
+ * 「网页端登录」（kind: 'web'）：与 Qoder 同构的登录方法。
+ * 服务端只做编排——拉起调试 Chrome 打开用量页，登录动作由人工在该窗口完成
+ * （华为云账号级登录态长期有效，多数情况 SSO 静默完成）；我们只旁听浏览器
+ * 真实发出的请求头抓 Cookie，再走登录会话层 probe 验证落库。
+ * 设计：docs/plans/账号管理-CodeArts网页端增删账号-开发设计方案.md §10。
+ * ------------------------------------------------------------------ */
+
+/** 登录判据：会话级 Cookie 名（credentialHint 要求的同一凭证形态） */
+const CA_SESSION_COOKIE_NAME = 'devclouddevuibjJ_SESSION_ID';
+/** 打开的页面：与 tools/codearts-refresh.sh 的 LOGIN_URL 同址（触发 SSO 与 /portal/ 请求） */
+const CA_LOGIN_URL = 'https://codearts.huaweicloud.com/portal/settings/personal-usage?locale=zh-cn';
+/** 登录会话时长上限（对齐 Qoder 网页登录；华为云 MFA 登录耗时可控） */
+const CA_WEB_LOGIN_TTL_MS = 10 * 60 * 1000;
+/** 后台轮询间隔（对齐 Qoder） */
+const CA_WEB_POLL_INTERVAL_MS = 2_000;
+/** 页面空闲多久才允许自动刷新（避免重置用户正在填写的登录表单，Qoder 的教训） */
+const CA_WEB_RELOAD_IDLE_MS = 20_000;
+/** 两次自动刷新的最小间隔 */
+const CA_WEB_RELOAD_MIN_INTERVAL_MS = 15_000;
+/** 自动刷新次数上限 */
+const CA_WEB_RELOAD_MAX = 2;
 
 /** 从拼好的 Cookie 头里取某个 cookie 的值（华为云的 CSRF token 就放在 cookie 里） */
 export function cookieValue(cookieHeader: string, name: string): string {
@@ -299,6 +324,136 @@ export function parseCountdownExpiry(body: unknown): string | null {
   return times[times.length - 1] ?? null;
 }
 
+/**
+ * 「网页端登录」实现：与 Qoder 的 qoderWebLogin 同构（src/providers/qoder.ts）。
+ *
+ * 去重键刻意用**平台级常量 `'web'`** 而不是 Cookie 指纹：华为云每次登录都会换发
+ * 会话 Cookie（Session ID 变化），指纹去重必然「重新登录 → 新建卡片」；调试 Chrome
+ * 单 profile 同一时刻也只有一个华为云登录态，多账号本就应走 AK/SK 表单多槽位。
+ * 固定 id 让重新登录命中 landLoginAccount 的 loginAccountId 去重（account-store.ts），
+ * 原地更新同一条目并刷新 CODEARTS_COOKIE。
+ *
+ * 登录判据：codearts.huaweicloud.com 请求头里出现会话 Cookie 名（与 credentialHint
+ * 要求的同一凭证形态）。匿名态误判由落库前的 probe 真实验证兜住——华为云失效会话
+ * 返回「200 + 空响应」，probe 必然解析失败，报 failed 不写盘。
+ */
+const codeartsWebLogin: ProviderLogin = {
+  id: 'web',
+  kind: 'web',
+  label: '网页端登录',
+  hint:
+    '自动打开调试 Chrome 的华为云用量页，登录后自动完成添加。首次登录建议让 Chrome 保存密码' +
+    '（或用华为云 App 扫码 / Touch ID 通行密钥）——该窗口的配置持久保存，之后基本无需再输密码。',
+  qr: false,
+  intervalMs: CA_WEB_POLL_INTERVAL_MS,
+  async start(input) {
+    // ① 确保调试 Chrome 在跑（没跑则按 tools/chrome-debug.sh 同款参数拉起）
+    const chrome = await ensureDebugChrome();
+    input.log(
+      `CodeArts 调试 Chrome 已就绪（${chrome.browser}${chrome.started ? '，本次已拉起' : '，复用已运行的实例'}）`,
+    );
+
+    // ② 打开用量页并旁听请求头；采集器挂在 secret 里，cleanup 时释放
+    const collector = await openCookieCollector({ url: CA_LOGIN_URL });
+    input.log('CodeArts 用量页已打开，等待登录（已有华为云账号登录态时通常静默完成）');
+
+    return {
+      authUrl: CA_LOGIN_URL,
+      qr: false,
+      ttlMs: CA_WEB_LOGIN_TTL_MS,
+      hint: '请在刚打开的 Chrome 窗口里登录华为云：可让 Chrome 保存密码、用 App 扫码或 Touch ID 通行密钥（只需一次，之后自动填充 / SSO 静默续期）；登录后本页面会自动完成添加。',
+      secret: { collector, startedAt: Date.now(), reloads: 0, lastReloadAt: 0 },
+    };
+  },
+  async poll(secret) {
+    if (!isRecord(secret)) return { status: 'failed', message: '登录会话缺少采集器参数，请重新发起。' };
+    const collector = pick(secret, 'collector') as CookieCollector | undefined;
+    const startedAt = Number(pick(secret, 'startedAt')) || Date.now();
+    if (!collector || typeof collector.cookieFor !== 'function') {
+      return { status: 'failed', message: '登录会话缺少采集器，请重新发起。' };
+    }
+
+    const hosts = ['codearts.huaweicloud.com'];
+    const raw = collector.cookieFor(hosts);
+    const names = collector.cookieNamesFor(hosts);
+    const loggedIn = Boolean(raw) && names.includes(CA_SESSION_COOKIE_NAME);
+
+    if (!loggedIn) {
+      // 刷新策略与 Qoder 一致：只在页面确实空闲时刷新，限次 + 最小间隔，
+      // 避免重置用户正在填写的登录表单。
+      const reloads = Number(pick(secret, 'reloads')) || 0;
+      const lastReloadAt = Number(pick(secret, 'lastReloadAt')) || 0;
+      const now = Date.now();
+      const idle = collector.idleMs();
+      const idleLongEnough = idle >= CA_WEB_RELOAD_IDLE_MS || idle === 0;
+      if (
+        reloads < CA_WEB_RELOAD_MAX &&
+        idleLongEnough &&
+        now - lastReloadAt >= CA_WEB_RELOAD_MIN_INTERVAL_MS
+      ) {
+        await collector.reload();
+        if (isRecord(secret)) {
+          secret.reloads = reloads + 1;
+          secret.lastReloadAt = now;
+        }
+      }
+      const waitedSec = Math.round((now - startedAt) / 1000);
+      return {
+        status: 'waiting',
+        message: raw
+          ? `已抓到华为云页面的 Cookie，但尚未检测到登录态，请在该 Chrome 窗口完成登录（已等待 ${waitedSec} 秒）…`
+          : `正在等待你在调试 Chrome 窗口里登录华为云（已等待 ${waitedSec} 秒）…`,
+      };
+    }
+
+    const cookie = normalizeCookieHeader(raw ?? '') ?? '';
+    if (!cookie) return { status: 'waiting', message: '抓到的 Cookie 头为空，继续等待页面发起新请求…' };
+
+    // 昵称：/portal/rest/me 的 name/projectName 字段可得则用之（取证前允许为空，
+    // 落库层回退占位名「平台 · 登录账号」；isPlaceholderLoginName 支持日后补改名）
+    const name = await codeartsCookieIdentity(cookie);
+
+    return {
+      status: 'ready',
+      account: { id: 'web', name },
+      credentials: { cookie },
+      options: {},
+      message: '已抓到登录 Cookie，正在验证取数并写入本机配置…',
+    };
+  },
+  async cleanup(secret) {
+    // 释放我们开出的标签页与 WebSocket；浏览器本体不关（用户可能还在用）
+    const collector = isRecord(secret)
+      ? (pick(secret, 'collector') as CookieCollector | undefined)
+      : undefined;
+    await collector?.close().catch(() => {});
+  },
+};
+
+/** 从 /portal/rest/me 提取显示名（取不到返回空串，落库层用占位名） */
+async function codeartsCookieIdentity(cookie: string): Promise<string> {
+  try {
+    const { body } = await fetchJson(`${CA_BASE}/portal/rest/me`, {
+      headers: consoleHeaders(SHELL_ACCOUNT_FOR_IDENTITY, cookie),
+      timeoutMs: 8_000,
+    });
+    if (!isRecord(body)) return '';
+    return firstString(pick(body, 'name', 'userName', 'projectName')) ?? '';
+  } catch {
+    // 身份接口失败不阻断登录（去重不依赖它）
+    return '';
+  }
+}
+
+/** consoleHeaders 只用 options.cftk（Cookie 里推导），这里给一个最小账号壳 */
+const SHELL_ACCOUNT_FOR_IDENTITY: AccountConfig = {
+  provider: 'codearts',
+  enabled: true,
+  displayName: null,
+  credentials: {},
+  options: {},
+};
+
 export const codeartsAdapter: ProviderAdapter = {
   id: 'codearts',
   displayName: 'CodeArts 华为云',
@@ -307,10 +462,19 @@ export const codeartsAdapter: ProviderAdapter = {
   usageUrl: 'https://codearts.huaweicloud.com/portal/settings/personal-usage?locale=zh-cn',
   requiredCredentialKeys: ['cookie'],
   credentialHint:
-    '两种凭证任选其一：① 推荐 AK/SK（credentials.accessKey/secretKey，或 .env 的 ' +
-    'CODEARTS_AK/CODEARTS_SK）——走 snap-access 网关、长期有效，不会像登录态那样过期；' +
-    '② 兼容旧方式：登录 codearts.huaweicloud.com 后复制 Cookie（需含 devclouddevuibjJ_SESSION_ID ' +
-    '与 devclouddevuibjtcftk，可用 npm run capture 抓取），会话过期后需重新抓取。',
+    '三种凭证方式任选其一：① 推荐「网页端登录」——卡片上点按钮自动打开华为云用量页，' +
+    '登录后自动完成添加（Cookie 自动落 CODEARTS_COOKIE，配合 npm run codearts:refresh 定时续期）；' +
+    '② AK/SK（credentials.accessKey/secretKey，或 .env 的 CODEARTS_AK/CODEARTS_SK）——走 snap-access ' +
+    '网关、长期有效，适合多账号；③ 兼容旧方式：登录 codearts.huaweicloud.com 后复制 Cookie（需含 ' +
+    'devclouddevuibjJ_SESSION_ID 与 devclouddevuibjtcftk，可用 npm run capture 抓取），会话过期后需重新抓取。',
+  /**
+   * 「网页端登录」：点按钮 → 调试 Chrome 自动打开华为云用量页 → 人工在该窗口登录
+   * （账号级登录态长期有效，多数情况 SSO 静默完成）→ CDP 旁听请求头自动抓 Cookie →
+   * 登录会话层 probe 验证落库（写入 CODEARTS_COOKIE，与 codearts:refresh 工具链同名）。
+   * 服务端只做编排，不含任何自动登录动作（代填账密/过验证码的风控红线维持不变，
+   * 见 docs/fixes/CodeArts-华为云登录态频繁失效-修复方案.md §3.1 选项 C/E）。
+   */
+  login: codeartsWebLogin,
   /**
    * 用量 + 获取明细（v2）：
    *   - 用量：按天图表（`xDimension=DATE_DAY` + `TOTAL_CREDITS`，取昨日/今日两天），
