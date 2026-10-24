@@ -120,7 +120,14 @@ export function describeRegistry(): Array<{
         isDemo: adapter.id.startsWith('demo:'),
         groupAccounts: adapter.groupAccounts === true,
         manageAccounts: adapter.manageAccounts === true,
-        manageFields: adapter.manageFields ?? [],
+        // 成组语义（如 CodeArts 的 SecretKey 跟随 AccessKey）要在前端生效，必须显式透出；
+        // JSON 会丢掉 undefined，因此逐项落成具体值
+        manageFields: (adapter.manageFields ?? []).map((field) => ({
+          ...field,
+          required: field.required !== false,
+          pairedWith: field.pairedWith ?? '',
+          flagGroup: field.flagGroup ?? '',
+        })),
         manageHint: adapter.manageHint ?? '',
         login: adapter.login
           ? { label: adapter.login.label, hint: adapter.login.hint, qr: adapter.login.qr }

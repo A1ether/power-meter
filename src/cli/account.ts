@@ -14,7 +14,12 @@
  * 需要哪些凭证 flag：看适配器声明的 `manageFields`（如 codebuddy 是 `--cookie`，
  * a1etheropenai 是 `--apiKey` 与 `--paiApiKey`）；`--list` 会在提示里带出来。
  */
-import { addManagedAccount, listManagedAccounts, removeManagedAccount } from '../account-store.js';
+import {
+  addManagedAccount,
+  isFieldRequired,
+  listManagedAccounts,
+  removeManagedAccount,
+} from '../account-store.js';
 import type { ManageFieldDescriptor } from '../providers/base.js';
 import { listAdapters, resolveAdapter } from '../providers/index.js';
 
@@ -63,6 +68,9 @@ const USAGE = `
 
   # 带站点选择的平台（如 Qoder 的国内站 / 国际站）
   npm run account -- --provider qoder --cookie '<Cookie 值>' --site global
+
+  # 成组字段（CodeArts：AK/SK 必填成对，Cookie 可选）
+  npm run account -- --provider codearts --accessKey '<AK>' --secretKey '<SK>' [--cookie '<Cookie 值>']
 
   # 删除（会清掉不再被引用的 .env 变量，写入前自动备份）
   npm run account -- --provider codebuddy --remove "CodeBuddy · 账号 2"
@@ -215,8 +223,11 @@ async function main(): Promise<void> {
     else if (!options[field.key] && field.defaultValue) options[field.key] = field.defaultValue;
   }
 
+  const filledKeys = new Set(
+    credentialFields.filter((field) => credentials[field.key] || envRefs[field.key]).map((field) => field.key),
+  );
   const missing = credentialFields
-    .filter((field) => field.required !== false && !credentials[field.key] && !envRefs[field.key])
+    .filter((field) => isFieldRequired(field, filledKeys, credentialFields))
     .map((field) => field.label);
   if (missing.length > 0) {
     console.log(USAGE);

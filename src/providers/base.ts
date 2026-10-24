@@ -63,6 +63,15 @@ export interface ManageFieldDescriptor {
   choices?: string[];
   /** 下拉框的默认选中项，同时也是「未提供该选项时」写入 options 的值 */
   defaultValue?: string;
+  /**
+   * 成组字段（目前只用于 CodeArts 的 AccessKey / SecretKey）：
+   * `pairedWith` 指向组内另一个字段的 key，两者要么都填、要么都不填；
+   * 组内任一字段有值时，本字段即变为必填（除非本字段 `required: false`）。
+   * 未声明时沿用「逐字段必填」的旧语义。
+   */
+  pairedWith?: string;
+  /** 可选字段组：`required: false` + `flagGroup` 的字段彼此同进同退——全空不报错 */
+  flagGroup?: string;
 }
 
 /* ------------------------------------------------------------------ *

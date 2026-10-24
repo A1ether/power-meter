@@ -1970,6 +1970,11 @@ kbd {
   background: color-mix(in srgb, var(--mint) 6%, transparent);
 }
 
+/* 字段必填标记：成组字段（CodeArts 的 SecretKey）的括号文字会随配对字段切换 */
+.manage__required {
+  color: var(--text-3);
+}
+
 /* 字段级补充说明（如「必须含 www 子域 Cookie」） */
 .manage__field-hint {
   color: var(--text-3);

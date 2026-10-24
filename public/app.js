@@ -1510,9 +1510,41 @@ function renderManage(root, target, options = {}) {
       );
     }
     label.append(input);
+    // 必填标记：成组字段（CodeArts 的 SecretKey）随配对字段的填写状态变化，
+    // 所以单独挂一个可更新的 <span>，由 updateGroupRules 统一刷新
+    const requiredMark = element('span', 'manage__required');
+    if (field.required) requiredMark.textContent = '（必填）';
+    label.querySelector(':scope > span').append(requiredMark);
     if (field.hint) label.append(element('span', 'manage__field-hint', field.hint));
     fieldsBox.append(label);
   }
+
+  /**
+   * 成组字段的启用 / 必填联动（契约见 base.ts 的 pairedWith / flagGroup）：
+   *   - 组内全空：只有锚点必填，其余字段可选；
+   *   - 组内有值：其余字段变为必填。
+   * 只改提示与 input.required，不阻止提交——服务端会兜底校验。
+   */
+  const updateGroupRules = () => {
+    const filled = new Set(
+      fields.filter((field) => (form.elements[field.key]?.value ?? '').trim()).map((field) => field.key),
+    );
+    for (const field of fields) {
+      if (!field.pairedWith && !field.flagGroup) continue;
+      const group = field.flagGroup
+        ? fields.filter((item) => item.flagGroup === field.flagGroup)
+        : [field, ...fields.filter((item) => item.key === field.pairedWith)];
+      const anchor = group[0].pairedWith ? null : group[0];
+      const required = anchor === field || group.some((item) => filled.has(item.key));
+      const input = form.elements[field.key];
+      if (input) input.required = required;
+      const mark = input?.closest('.manage__field')?.querySelector('.manage__required');
+      if (mark) mark.textContent = required ? '（必填）' : '（可选）';
+    }
+  };
+  fieldsBox.addEventListener('input', updateGroupRules);
+  fieldsBox.addEventListener('change', updateGroupRules);
+  updateGroupRules();
 
   // 能取到适配器声明时，表单才是可用的；声明拉取失败只提示、不隐藏已有账号列表
   if (!meta) {

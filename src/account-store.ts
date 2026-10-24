@@ -366,6 +366,32 @@ function effectiveOption(account: AccountConfig, field: ManageFieldDescriptor): 
   return String(raw);
 }
 
+/**
+ * 凭证字段在当前输入下是否必填。
+ *
+ * 默认逐字段必填（旧语义）。声明了 `pairedWith` / `flagGroup` 的字段按组判断：
+ * 组内全空 → 只有锚点必填；组内有值 → 组内所有非 `required: false` 的字段都必填。
+ *
+ * 锚点 = 组内第一个未声明 `pairedWith` 的字段（CodeArts 的 AccessKey）。
+ * 配对的 SecretKey 不是锚点，所以填了 SecretKey 不填 AccessKey 时，
+ * AccessKey 仍然必填，SecretKey 则只在 AccessKey 有值时才必填。
+ */
+export function isFieldRequired(
+  field: ManageFieldDescriptor,
+  filledKeys: Set<string>,
+  fields: ManageFieldDescriptor[],
+): boolean {
+  if (field.target === 'option') return field.required !== false;
+  if (!field.flagGroup && !field.pairedWith) return field.required !== false;
+
+  const group = field.flagGroup
+    ? fields.filter((item) => item.flagGroup === field.flagGroup)
+    : [field, ...fields.filter((item) => item.key === field.pairedWith)];
+  const anchor = group[0].pairedWith ? undefined : group[0];
+  if (anchor === field) return true;
+  return group.some((item) => filledKeys.has(item.key));
+}
+
 /** 从 `credentials` / `envRefs` 里取一个字段的值（envRefs 引用 .env，需先 loadDotEnv） */
 function inputValue(input: AddManagedInput, key: string): string {
   const direct = input.credentials?.[key];
@@ -479,7 +505,10 @@ export async function addManagedAccount(input: AddManagedInput): Promise<AddMana
       }
       continue;
     }
-    if (field.required !== false) missingFields.push(field.label);
+    // 成组字段（CodeArts 的 AK/SK）按组判断，其余保留逐字段必填
+    if (isFieldRequired(field, new Set(Object.keys(values)), credentialFields)) {
+      missingFields.push(field.label);
+    }
   }
   for (const field of optionFields) {
     const direct = input.options?.[field.key];
