@@ -299,7 +299,7 @@ interface ProviderSnapshot {
 | Qoder | `qoder` / `qoder.cn` / `qoder-global` | `cookie`（国内站 `QODER_COOKIE`；国际站 `QODER_GLOBAL_COOKIE`）<br>或扫码登录写入的 `accessToken` + `refreshToken`（国内站 `QODER_ACCESS_TOKEN` / `QODER_REFRESH_TOKEN`；国际站加 `QODER_GLOBAL_` 前缀） | `site: "cn"`（国内站，默认）/ `"global"`（国际站 qoder.com）/ `"auto"`（自动探测并回退）；显式站点失败后要自动换站再加 `fallbackSite: true`。两种凭证模式都会拆积分批次：Cookie 模式给出逐包明细（`quota_detail[]`），令牌模式只能给出账户级分桶 + 可选的 `dedicated_resource_packages[]`（逐包明细需 Cookie） |
 | Trae | `trae` / `trae.cn` | `cookie`<br>或「打开链接登录」写入的 `accessToken` + `refreshToken` + `deviceKey`（`TRAE_ACCESS_TOKEN` / `TRAE_REFRESH_TOKEN` / `TRAE_DEVICE_KEY`） | JWT 由 Cookie 自动续签；令牌模式由 `deviceKey` 签名续期 |
 | CodeBuddy | `codebuddy` | `cookie`（**必须含 `www` 子域**）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`CODEBUDDY_ACCESS_TOKEN` / `CODEBUDDY_REFRESH_TOKEN`）| — |
-| CodeArts | `codearts` | **`accessKey` + `secretKey`（推荐，长期有效）**<br>`cookie`（兼容，会话过期需重抓） | 可选 `authMode: "auto" \| "aksk" \| "cookie"`、`resourceType`、`region` |
+| CodeArts | `codearts` | **网页端登录（推荐，一键添加）**：卡片上点「网页端登录」，在自动打开的调试 Chrome 里登录华为云即可，Cookie 自动落 `CODEARTS_COOKIE` 并由 `npm run codearts:refresh` 定时续期<br>`accessKey` + `secretKey`（长期有效，多账号路径）<br>`cookie`（兼容，会话过期需重抓） | 可选 `authMode: "auto" \| "aksk" \| "cookie"`、`resourceType`、`region` |
 | MiniMax Code | `minimax` / `minimax-code` / `agent.minimax.cn` | `token`（`_token`）+ `cookie`（SSO）+ 真实身份 `userId`/`opTicket`/`uuid`（capture 一并抓取，缺一不可）| `site: "cn"`（默认）或 `"global"` |
 | A1etherOpenAi | `a1etheropenai` / `d1v.ai`（上游服务域名保持不变，也是它的解析别名） | `apiKey`（查余额）<br>`paiApiKey`（托管复制） | `baseUrl`、`revealApiKey` |
 | 任意平台 | `custom` | 按需 `headers` | `providerId`、`endpoint`、`mapping` |
@@ -634,8 +634,8 @@ Trae 的 OAuth 回调 `/authorize` 是唯一例外：浏览器从 trae.cn 跳回
   请通过 `npm run capture` 抓取；手工配置时注意 `HTTP_USER_AGENT` 与子域 Cookie。
 - **CodeBuddy / CodeArts 的接口是通过抓包定位的**，上游若改动字段，适配器会以明确的
   错误信息暴露出来（例如「响应缺少 xxx」），届时更新对应单文件即可。
-- CodeArts 官方另有一套 AK/SK 签名的 API 网关，本项目优先支持网页登录态；
-  若要接 AK/SK，可基于 `codearts.ts` 扩展，用 `options.headers` 注入签名头。
+- CodeArts 官方另有一套 AK/SK 签名的 API 网关（snap-access），本项目已接入并在有 AK/SK 时优先使用；
+  AK/SK 与 Cookie 都可以在「平台与账号」里直接添加（AK/SK 成对必填，Cookie 可选、只增强活动逐笔明细）。
 - **A1etherOpenAi 的账号密钥会过期/轮换**：官方要求「以替换方式轮换」而不是原地覆盖，
   轮换后更新 `.env` 即可（热加载）；卡片里该条会显示 `unauthorized` 与原因。
 - **A1etherOpenAi 用 QUOTA 计**：与其余平台的 CREDITS 都不同，顶部汇总按单位分开计，
