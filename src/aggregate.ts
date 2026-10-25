@@ -144,10 +144,12 @@ function sumDailyUsage(
     todayAdded: sum((usage) => usage.todayAdded),
     yesterdayAdded: sum((usage) => usage.yesterdayAdded),
     currency,
-    // 来源归并：只要有一个账号是本地兜底，就不冒充「全平台明细」
+    // 来源归并（逐字段）：只要有一个账号是本地兜底，就不冒充「全平台明细」
     sources: {
-      used: mergeSources(picked.map((usage) => usage.sources.used)),
-      added: mergeSources(picked.map((usage) => usage.sources.added)),
+      todayUsed: mergeSources(picked.map((usage) => usage.sources.todayUsed)),
+      yesterdayUsed: mergeSources(picked.map((usage) => usage.sources.yesterdayUsed)),
+      todayAdded: mergeSources(picked.map((usage) => usage.sources.todayAdded)),
+      yesterdayAdded: mergeSources(picked.map((usage) => usage.sources.yesterdayAdded)),
     },
   };
 }

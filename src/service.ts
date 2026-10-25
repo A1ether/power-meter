@@ -11,7 +11,7 @@ import {
 import { TtlCache } from './lib/cache.js';
 import { describeSecrets, type ProbeContext, type ProviderAdapter } from './providers/base.js';
 import { resolveAdapter } from './providers/index.js';
-import type { ProviderSnapshot } from './types.js';
+import type { ProviderSnapshot, UsageSource } from './types.js';
 import { OK_STATUSES } from './types.js';
 import { UsageHistory } from './usage-history.js';
 import { summarizeLedger, type UsageLedger } from './usage-ledger.js';
@@ -141,6 +141,30 @@ async function persistResolvedName(
 function displayedAmount(snapshot: ProviderSnapshot): number {
   if (snapshot.balance) return snapshot.balance.amount;
   return snapshot.credits.reduce((sum, lot) => sum + lot.amount, 0);
+}
+
+/**
+ * 「今日」字段的择优：上游按天聚合 vs 本地实时观测 —— 两者是**同一个量**的独立观测。
+ *
+ * 为什么不能「上游优先」：CodeArts 控制台的按天用量是**统计模型给出的总量**（不是可逐笔的
+ * 扣减记录，用户 2026-10-25 指出），当天这一格明显滞后。实测（2026-10-25 01:31，本机服务）：
+ * 上游「今天」= 0.01 积分，而同一时刻余额自当天首个样本起已下降 135.68 —— 于是卡片显示 ≈ 0。
+ *
+ * 为什么也不是「一律本地优先」：本地观测也会漏（服务没开、采样间隔里的先消耗后发放），
+ * 而上游对**已结束的日子**是完整记录集。
+ *
+ * 取较大值：两个观测都不可能在同一个量上「多记」（不是相加，不会双计），取大既避免了
+ * 把「今天还没出数」当成确定的 0，也不会低估。已结束的昨日仍以上游为准（缺记录 = 0）。
+ */
+function reconcileToday(
+  upstream: number | undefined,
+  local: number | null,
+  covered: boolean,
+): { value: number | null; source: UsageSource } {
+  if (!covered) return { value: local, source: 'local' };
+  const value = upstream ?? 0;
+  if (local === null || local <= value) return { value, source: 'upstream' };
+  return { value: local, source: 'mixed' };
 }
 
 /**
@@ -409,8 +433,12 @@ export class DashboardService {
   }
 
   /**
-   * 组装日级四字段（v2）：明细接口覆盖的维度用上游值（该日缺记录 = 0），
-   * 未覆盖 / 明细失败的维度回退本地采样，并在 sources 里如实标注来源。
+   * 组装日级四字段（v3）：证据与口径见 docs/fixes/用量明细-CodeArts今日用量恒为0-修复方案.md
+   *   - 已结束的日子（昨日）：明细覆盖的维度用上游值（该日缺记录 = 0，是确定值）；
+   *   - 进行中的当天（今日）：上游与本地观测**取较大值**（见 reconcileToday）——
+   *     上游按天统计当天明显滞后（实测 0.01），本地观测（余额下降）会漏（服务没开）；
+   *   - 未覆盖 / 明细失败的维度回退本地采样；
+   *   - sources 逐字段标注来源，界面 tooltip 可见。
    */
   private withDailyUsage(
     snapshot: ProviderSnapshot,
@@ -420,19 +448,23 @@ export class DashboardService {
   ): ProviderSnapshot {
     const local = this.usage.metricsFor(key, now);
     const summary = ledger ? summarizeLedger(ledger, now) : {};
-    const usedUpstream = ledger?.covers.use === true;
-    const addedUpstream = ledger?.covers.grant === true;
+    const coversUse = ledger?.covers.use === true;
+    const coversGrant = ledger?.covers.grant === true;
+    const todayUsed = reconcileToday(summary.usedToday, local.todayUsed, coversUse);
+    const todayAdded = reconcileToday(summary.addedToday, local.todayAdded, coversGrant);
     return {
       ...snapshot,
       dailyUsage: {
-        todayUsed: usedUpstream ? summary.usedToday ?? 0 : local.todayUsed,
-        yesterdayUsed: usedUpstream ? summary.usedYesterday ?? 0 : local.yesterdayUsed,
-        todayAdded: addedUpstream ? summary.addedToday ?? 0 : local.todayAdded,
-        yesterdayAdded: addedUpstream ? summary.addedYesterday ?? 0 : local.yesterdayAdded,
+        todayUsed: todayUsed.value,
+        yesterdayUsed: coversUse ? summary.usedYesterday ?? 0 : local.yesterdayUsed,
+        todayAdded: todayAdded.value,
+        yesterdayAdded: coversGrant ? summary.addedYesterday ?? 0 : local.yesterdayAdded,
         currency: snapshot.balance?.currency ?? snapshot.credits[0]?.currency ?? 'CREDITS',
         sources: {
-          used: usedUpstream ? 'upstream' : 'local',
-          added: addedUpstream ? 'upstream' : 'local',
+          todayUsed: todayUsed.source,
+          yesterdayUsed: coversUse ? 'upstream' : 'local',
+          todayAdded: todayAdded.source,
+          yesterdayAdded: coversGrant ? 'upstream' : 'local',
         },
       },
     };

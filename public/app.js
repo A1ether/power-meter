@@ -10,12 +10,14 @@ const VISIBLE_LOTS = 3;
 const VISIBLE_ENTRIES = 2;
 
 /**
- * 来源文案：upstream = 平台明细接口，local = 本地采样兜底，mixed = 合并卡片里两者混合
- * （由后端 dailyUsage.sources 下发，见 src/service.ts 的 withDailyUsage）
+ * 来源文案：upstream = 平台明细接口，local = 本地采样兜底，
+ * mixed = 两种来源都参与了判定（合并卡片里各账号来源不一致，或「今日」上游尚未出数、
+ * 由本地实时观测兜底——见 src/service.ts 的 reconcileToday）。
+ * 后端按**字段**下发（dailyUsage.sources 的键就是四字段名）。
  */
 const USAGE_SOURCE_LABELS = {
   upstream: '来源：平台明细',
-  local: '来源：本地采样兜底（该平台无此明细）',
+  local: '来源：本地采样兜底',
   mixed: '来源：平台明细 + 本地采样',
 };
 
@@ -26,6 +28,7 @@ const USAGE_SOURCE_LABELS = {
  *   - 增量 = 该日额度**增加量**之和（增加的量，如每日签到、充值）；
  *   两者互不抵消，按本地时间 00:00–24:00 切日。
  * 数据优先来自后端 provider.dailyUsage（平台明细接口，见 src/usage-ledger.ts）。
+ * `source` 是该字段在 dailyUsage.sources 里的键（逐字段标注来源）。
  * `increase: true` 的字段按正负着色（正=绿、零=灰）并给正数加「+」前缀。
  */
 const USAGE_FIELDS = [
@@ -33,28 +36,28 @@ const USAGE_FIELDS = [
     key: 'yesterdayUsed',
     label: '昨日用量',
     increase: false,
-    dimension: 'used',
+    source: 'yesterdayUsed',
     hint: '昨日（本地时间 00:00–24:00）的消耗合计；增加不计入',
   },
   {
     key: 'yesterdayAdded',
     label: '昨日增量',
     increase: true,
-    dimension: 'added',
+    source: 'yesterdayAdded',
     hint: '昨日的增加合计（如每日签到、充值）；消耗不计入',
   },
   {
     key: 'todayUsed',
     label: '今日用量',
     increase: false,
-    dimension: 'used',
+    source: 'todayUsed',
     hint: '今日（本地时间 00:00 起）的消耗合计；增加不计入',
   },
   {
     key: 'todayAdded',
     label: '今日增量',
     increase: true,
-    dimension: 'added',
+    source: 'todayAdded',
     hint: '今日的增加合计（如每日签到、充值）；消耗不计入',
   },
 ];
@@ -788,7 +791,7 @@ function renderUsage(node, provider, healthy) {
     const item = element('div', 'usage__item');
     const label = element('span', 'usage__label', field.label);
     const valueNode = element('span', 'usage__value');
-    const source = USAGE_SOURCE_LABELS[usage.sources?.[field.dimension]] ?? USAGE_SOURCE_LABELS.local;
+    const source = USAGE_SOURCE_LABELS[usage.sources?.[field.source]] ?? USAGE_SOURCE_LABELS.local;
 
     if (value === null || value === undefined || Number.isNaN(value)) {
       valueNode.textContent = '–';

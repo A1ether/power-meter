@@ -99,8 +99,19 @@ export interface DailyUsage {
   todayAdded: number | null;
   yesterdayAdded: number | null;
   currency: Currency;
-  /** 各维度的数据来源，用于界面标注（upstream / local / mixed） */
-  sources: { used: UsageSource; added: UsageSource };
+  /**
+   * 每个字段各自的数据来源，用于界面**逐字段**标注（upstream / local / mixed）。
+   *
+   * 逐字段而非「按维度」：同一次取数里「今日」与「昨日」可能分别来自两种来源
+   * ——上限是「平台明细」，而「今日」是尚在进行中的一天，上游按天聚合当天可能
+   * 还没出数，此时退回本地实时观测（见 src/service.ts 的 reconcileToday）。
+   */
+  sources: {
+    todayUsed: UsageSource;
+    yesterdayUsed: UsageSource;
+    todayAdded: UsageSource;
+    yesterdayAdded: UsageSource;
+  };
 }
 
 /**
