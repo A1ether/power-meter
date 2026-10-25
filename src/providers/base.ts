@@ -55,7 +55,7 @@ export interface ManageFieldDescriptor {
   /**
    * 写入目标，默认 `credential`：
    *   - `credential`：写进 accounts.json 的 `credentials`，占 `.env` 槽位、参与掩码预览；
-   *   - `option`：写进 `options`（如 Qoder 的站点选择 `site`），属非敏感配置，
+   *   - `option`：写进 `options`（如将来某个平台的站点选择），属非敏感配置，
    *     不占 `.env` 槽位、不进掩码预览；表单里的取值会被校验必须在 `choices` 内。
    */
   target?: 'credential' | 'option';
@@ -188,6 +188,15 @@ export function resolveLoginMethod(
 export interface ProviderAdapter {
   id: string;
   displayName: string;
+  /**
+   * 该平台改名前的 displayName（占位名兼容）。
+   *
+   * 占位名 `<displayName> · 登录账号` 是登录时没拿到昵称留下的，
+   * 平台改名（如 Qoder 拆成「Qoder 国内版 / Qoder 国际版」）后，
+   * 旧条目仍是老前缀——这些名字也要认，否则它们永远等不到自动补昵称
+   * （见 `isPlaceholderAccountName` 与 `src/account-store.ts` 的 adoptResolvedAccountName）。
+   */
+  legacyDisplayNames?: string[];
   region: 'cn' | 'global';
   dashboardUrl: string;
   /** 平台用量页地址：卡片「每日用量」区点击跳转目标（见 src/types.ts 的 usageUrl），没有写空串 */
@@ -253,9 +262,10 @@ export interface ProviderAdapter {
    * 与历史约定不符的平台（如 codearts 的 accessKey → CODEARTS_AK）在这里显式声明。
    * 第 N 个账号的槽位写成 `<前缀>_N`（N≥2）。
    *
-   * 也可以传函数：同一平台的不同账号可能落在不同站点（如 Qoder 的 `options.site`），
-   * 变量前缀随之变化（cn → `QODER_COOKIE`，global → `QODER_GLOBAL_COOKIE`）。
-   * 传入的是该账号**即将写入**的 options（添加时来自表单，登录时来自登录结果）。
+   * 也可以传函数：同一平台的凭证变量名要跟着某个**非敏感选项**走时用它
+   * （参数是该账号**即将写入**的 options——添加时来自表单，登录时来自登录结果）。
+   * 典型场景是「一个实现承载多个平台身份」：如 `qoder.ts` 用工厂产出国内版 / 国际版，
+   * 各绑定一张静态表（`QODER_*` / `QODER_GLOBAL_*`），不再靠站点选项推算前缀。
    */
   envNames?: Record<string, string> | ((options: Record<string, string>) => Record<string, string>);
   /**

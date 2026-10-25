@@ -13,9 +13,11 @@
  *   - 多账号：`--slot 2` 把抓到的凭证写进带 `_2` 后缀的变量
  *     （如 CODEBUDDY_COOKIE_2），因此不会覆盖槽位 1 的账号；
  *     抓完再用 `npm run account -- --provider <平台> --env <变量名>` 注册成账号。
- *   - 多站点：`--site global` 抓国际站（目前仅 Qoder 支持 cn / global），
- *     国际站凭证写入 QODER_GLOBAL_COOKIE，与国内站的 QODER_COOKIE 互不覆盖；
- *     注册时带上同一参数：npm run account -- --provider qoder --site global。
+ *   - 多站点：Qoder 国内站与国际站是两个平台——
+ *     `npm run capture -- qoder`（或 `--site cn`）抓国内站，写 QODER_COOKIE；
+ *     `npm run capture -- qoder-intl`（或兼容写法 `--site global`）抓国际站，写 QODER_GLOBAL_COOKIE。
+ *     两者互不覆盖，注册时用对应的 provider id：
+ *     `npm run account -- --provider qoder-intl --env QODER_GLOBAL_COOKIE`。
  *
  * 踩坑记录（务必保留）：
  *   Cookie 必须按「域可覆盖」收集——请求 www.codebuddy.cn 时，
@@ -50,6 +52,8 @@ const SLOT_SUFFIX = SLOT >= 2 ? `_${SLOT}` : '';
  * `--site <id>`：多站点平台的站点选择（Qoder：cn / global）。
  * 目标声明了 `siteVariants` 且含该站点时，用变体覆盖 envKey / usageUrl / apiHost 等；
  * 未声明变体的平台不受影响（照常抓取）。
+ * Qoder 的 `global` 是兼容写法：等价于直接用平台 id `qoder-intl` 作为位置参数
+ * （见 TARGETS 的 `providerId`），站点已从「账号选项」升为「平台身份」。
  */
 const SITE_INDEX = ARGS.indexOf('--site');
 const SITE_VALUE_INDEX = SITE_INDEX >= 0 ? SITE_INDEX + 1 : -1;
@@ -193,36 +197,50 @@ interface Target {
    * 站点变体（多站点平台）：`--site <id>` 时覆盖 envKey / usageUrl / apiHost / cookieSites / label。
    * Qoder 用它区分国内站（qoder.com.cn）与国际站（qoder.com）——国际站的 Cookie 必须
    * 落到 `QODER_GLOBAL_COOKIE`，且抓取时打开的是 qoder.com 的用量页。
+   *
+   * 站点是**平台身份**的一部分（见 `src/providers/qoder.ts` 的 createQoderAdapter）：
+   * 国际站真正的平台 id 是独立的 `qoder-intl`，变体用 `providerId` 声明它，
+   * 这样「槽位 ≥2 的注册提示」给出的命令直接就是 `--provider qoder-intl`。
    */
   siteVariants?: Record<string, Partial<Omit<Target, 'id' | 'siteVariants'>>>;
   /**
-   * 变体附带的账号注册参数：slot ≥2 抓完后会提示「下一步注册命令」，
-   * 这里声明的键值会拼进命令（如 `{ site: "global" }` → `--site global`），
-   * 否则国际站账号会被注册成默认的国内站。
+   * 注册账号时用的 provider id：平台拆分站点后，抓取目标（按域名组织）与平台 id 不再一一对应。
+   * 未声明时用 `id`。
    */
-  optionFlags?: Record<string, string>;
+  providerId?: string;
 }
 
 const TARGETS: Target[] = [
   {
     id: 'qoder',
-    label: 'Qoder',
+    label: 'Qoder 国内版',
     envKey: 'QODER_COOKIE',
-    cookieSites: ['qoder.com.cn', 'qoder.cn', 'qoder.com'],
+    // 只认国内站域名：qoder.com 的 Cookie 属于另一个平台（qoder-intl），
+    // 到这里只会被写进国内站的变量里，探测必然 401
+    cookieSites: ['qoder.com.cn', 'qoder.cn'],
     usageUrl: 'https://qoder.com.cn/account/usage',
     apiHost: 'qoder.com.cn',
-    // 国内站 = 上面的默认取值（--site cn 与不带 --site 等价）；
-    // 国际站必须把 Cookie 单独放到 QODER_GLOBAL_COOKIE，两个站点的登录态互不覆盖
+    // 兼容写法：`--site global` 等价于 `npm run capture -- qoder-intl`
+    // （国内站 = 上面的默认取值，`--site cn` 与不带 `--site` 等价）
     siteVariants: {
       global: {
-        label: 'Qoder 国际站',
+        label: 'Qoder 国际版',
         envKey: 'QODER_GLOBAL_COOKIE',
         cookieSites: ['qoder.com'],
         usageUrl: 'https://qoder.com/account/usage',
         apiHost: 'qoder.com',
-        optionFlags: { site: 'global' },
+        providerId: 'qoder-intl',
       },
     },
+  },
+  {
+    // 国际站：独立平台（provider id = qoder-intl），凭证与国内站完全分开
+    id: 'qoder-intl',
+    label: 'Qoder 国际版',
+    envKey: 'QODER_GLOBAL_COOKIE',
+    cookieSites: ['qoder.com'],
+    usageUrl: 'https://qoder.com/account/usage',
+    apiHost: 'qoder.com',
   },
   {
     id: 'trae',
@@ -814,12 +832,11 @@ function main(): void {
     if (registerable.length > 0) {
       console.log(`\n槽位 ${SLOT} 的凭证还没有对应的账号，注册它（同样会先真实验证）：`);
       for (const result of registerable) {
-        const optionFlags = Object.entries(result.target.optionFlags ?? {})
-          .map(([key, value]) => ` --${key} ${value}`)
-          .join('');
+        // provider id 可能与抓取目标 id 不同（Qoder 国际站：目标 qoder --site global → 平台 qoder-intl）
+        const provider = result.target.providerId ?? result.target.id;
         console.log(
-          `  npm run account -- --provider ${result.target.id}` +
-            ` --env ${result.target.envKey}${SLOT_SUFFIX}${optionFlags}` +
+          `  npm run account -- --provider ${provider}` +
+            ` --env ${result.target.envKey}${SLOT_SUFFIX}` +
             ` --name "${result.target.label} · 账号 ${SLOT}"`,
         );
       }

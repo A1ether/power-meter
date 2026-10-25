@@ -5,11 +5,11 @@
     "credentials 用 ${ENV_VAR} 引用 .env，避免把凭证明文写进文件。",
     "保存后服务会自动热加载，无需重启。",
     "provider 支持：qoder / trae / codebuddy / codearts / a1etheropenai / minimax / custom / demo:*",
-    "Qoder 是国内站（qoder.com.cn，默认）与国际站（qoder.com）双站点：options.site 取",
-    "     cn / global / auto（auto 自动探测并回退）；显式指定站点时默认不回退，",
-    "     需要失败后自动换站再加 \"fallbackSite\": true。",
-    "     国际站凭证单独放 QODER_GLOBAL_COOKIE：npm run capture -- qoder --site global 抓取，",
-    "     npm run account -- --provider qoder --site global --env QODER_GLOBAL_COOKIE 注册。",
+    "Qoder 国内站与国际站是两个独立平台：provider 取 qoder（qoder.com.cn，凭证 QODER_*）或",
+    "     qoder-intl（qoder.com，凭证 QODER_GLOBAL_*）。站点由平台决定，不再有 options.site，",
+    "     一个平台的账号只出现在该平台的卡片上。",
+    "     npm run capture -- qoder-intl 抓取国际站，npm run account -- --provider qoder-intl 注册。",
+    "     旧配置（provider: qoder 且 options.site: global）用 npm run migrate:qoder-sites 迁移。",
     "MiniMax Code（minimax）凭证较特殊：请求头 token（localStorage `_token`）+ SSO 会话 Cookie +",
     "     真实身份 userId/uuid（公共参数，服务端会与 token 交叉校验），缺一不可；",
     "     opTicket 仅当 capture 抓到了 op_ticket 时才需要在 credentials 里加 \"opTicket\"。",
@@ -42,25 +42,21 @@
   "accounts": [
     {
       "provider": "qoder",
-      "displayName": "Qoder",
+      "displayName": "Qoder 国内版",
       "enabled": true,
       "credentials": {
         "cookie": "${QODER_COOKIE}"
       },
-      "options": {
-        "site": "cn"
-      }
+      "options": {}
     },
     {
-      "provider": "qoder",
-      "displayName": "Qoder 国际站",
+      "provider": "qoder-intl",
+      "displayName": "Qoder 国际版",
       "enabled": false,
       "credentials": {
         "cookie": "${QODER_GLOBAL_COOKIE}"
       },
-      "options": {
-        "site": "global"
-      }
+      "options": {}
     },
     {
       "provider": "trae",

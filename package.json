@@ -14,6 +14,7 @@
     "account": "tsx src/cli/account.ts",
     "a1etheropenai:add": "tsx src/cli/a1etheropenai-add.ts",
     "capture": "tsx src/cli/capture.ts",
+    "migrate:qoder-sites": "tsx src/cli/migrate-qoder-sites.ts",
     "codearts:aksk-probe": "tsx src/cli/codearts-aksk-probe.ts",
     "codearts:console-probe": "tsx src/cli/codearts-console-probe.ts",
     "codearts:refresh": "bash tools/codearts-refresh.sh",

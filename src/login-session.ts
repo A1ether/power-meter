@@ -48,8 +48,6 @@ export interface LoginSessionView {
   expiresAt: number;
   /** ready 时落库结果 */
   account: { name: string; updated: boolean } | null;
-  /** 发起会话时选择的站点（Qoder：`cn` / `global`），未选择为 null */
-  site: string | null;
 }
 
 interface LoginSession {
@@ -70,8 +68,6 @@ interface LoginSession {
   /** 防止后台轮询与落库重入 */
   polling: boolean;
   account: { name: string; updated: boolean } | null;
-  /** 该会话申请的站点（Qoder 的 cn / global）：只用于状态回显，不参与鉴权 */
-  site: string | null;
 }
 
 const SESSIONS = new Map<string, LoginSession>();
@@ -98,7 +94,6 @@ function view(session: LoginSession): LoginSessionView {
     createdAt: session.createdAt,
     expiresAt: session.expiresAt,
     account: session.account,
-    site: session.site,
   };
 }
 
@@ -221,7 +216,6 @@ export async function startLogin(input: StartLoginInput): Promise<StartLoginResu
     timer: null,
     polling: false,
     account: null,
-    site: (input.options?.site ?? '').trim().toLowerCase() || null,
   };
   SESSIONS.set(sessionId, session);
   ACTIVE.set(activeKey, sessionId);

@@ -118,9 +118,10 @@ function providerEnvPrefix(providerId: string): string {
 /**
  * credentials 的键 → .env 变量名前缀（适配器可用 envNames 覆盖）。
  *
- * `options` 是该账号即将写入的 options：Qoder 用它把国际站的 Cookie 落到
- * `QODER_GLOBAL_COOKIE`（见 qoder.ts 的 envNames 函数）。旧账号（已在
- * `credentials` 里写死 `${出变量}`）不经过这里，变量名不会被改动。
+ * `options` 是该账号即将写入的 options：适配器的 `envNames` 可以是函数，
+ * 按账号配置给出不同的变量名（Qoder 拆站后改用**静态对象**——站点由 provider 决定，
+ * `qoder` → `QODER_COOKIE`，`qoder-intl` → `QODER_GLOBAL_COOKIE`，见 qoder.ts）。
+ * 旧账号（已在 `credentials` 里写死 `${出变量}`）不经过这里，变量名不会被改动。
  */
 export function envNameFor(
   adapter: ProviderAdapter,
@@ -200,9 +201,9 @@ export interface ManagedAccountView {
   envRefs: string[];
   /**
    * 账号的非敏感选项，**只含适配器在 `manageFields` 里声明为 `target: 'option'` 的键**
-   * （如 Qoder 的 `site`）。
+   * （如 MiniMax 的 `site`；Qoder 拆分站点后已无此类字段）。
    *
-   * 用途：「平台与账号」弹窗按站点拆行、账号按站点归桶。之所以要白名单而不是整份
+   * 用途：前端按这些选项做展示或分组。之所以要白名单而不是整份
    * `options` 透出去：`options` 里可能有用户自定义域名之类的配置，而 `option` 字段
    * 的契约本身就是「非敏感、可展示」（见 base.ts 的 ManageFieldDescriptor）。
    */
@@ -283,9 +284,10 @@ export function listManagedAccounts(provider: string): ListManagedResult {
 /**
  * 账号的非敏感选项白名单：`manageFields` 里 `target === 'option'` 的键。
  *
- * 前端「平台与账号」按站点拆行时要读 `options.site`，但 `options` 还可能装着
- * 用户自定义域名之类的配置，不该整份下发。声明为 option 的字段本身就是
- * 「非敏感、可展示」的契约（见 base.ts 的 ManageFieldDescriptor）。
+ * 看板要展示账号的非敏感选项，但整份 `options` 还可能装着用户自定义域名之类的配置，
+ * 不该全下发。声明为 option 的字段本身就是「非敏感、可展示」的契约
+ *（见 base.ts 的 ManageFieldDescriptor）。拆分后的 Qoder 两个平台没有 option 字段，
+ * 因此返回空对象——前端不再有机会按选项值分桶。
  */
 function declaredOptionsOf(
   adapter: ProviderAdapter,
@@ -356,9 +358,10 @@ function fail(status: number, stage: AddStage, error: string): AddManagedFailure
 }
 
 /**
- * 账号某个 option 字段的「有效值」：未配置时按字段默认值算
- * （例如 Qoder 的 site 缺省即 "cn"），这样「同一份 Cookie + site: "cn"」
- * 与「没写 site」会被正确判为重复添加，而不是各建一个账号。
+ * 账号某个 option 字段的「有效值」：未配置时按字段默认值算，
+ * 这样「同一份凭证 + 显式写了默认值」与「没写该选项」会被正确判为重复添加，
+ * 而不是各建一个账号。（当前没有平台声明 `target: 'option'` 字段——Qoder 的
+ * `site` 已随站点拆分移除——机制保留给日后需要的平台。）
  */
 function effectiveOption(account: AccountConfig, field: ManageFieldDescriptor): string {
   const raw = account.options[field.key];
@@ -592,7 +595,8 @@ export async function addManagedAccount(input: AddManagedInput): Promise<AddMana
   // ③ 槽位：明文输入的 credential 字段各自需要一个新的 .env 变量；
   //    引用已有变量的字段直接用那个变量（option 字段不占槽位）
   const plainFields = credentialFields.filter((field) => !refs[field.key]);
-  // 变量前缀跟着本次写入的 options 走（Qoder 国际站 → QODER_GLOBAL_COOKIE）
+  // 变量前缀跟着适配器的 envNames 与本次写入的 options 走
+  // （Qoder 国际站：provider = qoder-intl → QODER_GLOBAL_COOKIE）
   const bases = plainFields.map((field) => envNameFor(adapter, field.key, optionValues));
   const occupied = new Set<string>(members.flatMap((item) => referencedEnvNames(item)));
   const envFile = readEnvFile();
@@ -707,9 +711,16 @@ function loginIdentityOf(item: Record<string, unknown>): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-/** 是否是「登录账号」占位名（判定在 `base.ts`，探测与落库共用） */
+/**
+ * 是否是「登录账号」占位名（判定在 `base.ts`，探测与落库共用）。
+ *
+ * 平台改名后（如 Qoder 拆成「国内版 / 国际版」），旧条目的占位名仍带老前缀，
+ * 因此适配器声明的 `legacyDisplayNames` 也要认，否则这些账号永远等不到自动补昵称。
+ */
 function isPlaceholderLoginName(adapter: ProviderAdapter, name: string): boolean {
-  return isPlaceholderAccountName(adapter.displayName, name);
+  return [adapter.displayName, ...(adapter.legacyDisplayNames ?? [])].some((displayName) =>
+    isPlaceholderAccountName(displayName, name),
+  );
 }
 
 /** 在「同平台已有名字」集合里挑一个不撞名的 `平台 · 昵称`（撞名追加序号） */

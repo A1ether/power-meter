@@ -66,8 +66,9 @@ const USAGE = `
   # 引用 .env 里已有的变量（配合 npm run capture -- codebuddy --slot 2 使用）
   npm run account -- --provider codebuddy --env CODEBUDDY_COOKIE_2 [--name "..."]
 
-  # 带站点选择的平台（如 Qoder 的国内站 / 国际站）
-  npm run account -- --provider qoder --cookie '<Cookie 值>' --site global
+  # Qoder 国内站 / 国际站是两个平台，用各自的 provider id（站点不再是账号选项）
+  npm run account -- --provider qoder --cookie '<Cookie 值>'
+  npm run account -- --provider qoder-intl --cookie '<Cookie 值>'
 
   # 成组字段（CodeArts：AK/SK 必填成对，Cookie 可选）
   npm run account -- --provider codearts --accessKey '<AK>' --secretKey '<SK>' [--cookie '<Cookie 值>']
@@ -76,7 +77,7 @@ const USAGE = `
   npm run account -- --provider codebuddy --remove "CodeBuddy · 账号 2"
 
 其它可选参数：
-  --option k=v   写入账号 options 的非敏感配置（可重复；对 Qoder 而言 --site global 是其快捷写法）
+  --option k=v   写入账号 options 的非敏感配置（可重复；选项字段由适配器的 manageFields 声明）
   --force        允许重复添加同一份凭证（默认 409 拒绝）
   --dry-run      只验证不写入
 
@@ -210,7 +211,9 @@ async function main(): Promise<void> {
     }
   }
 
-  // option 字段（如 Qoder 的站点）：`--site global` 或通用 `--option site=global`
+  // option 字段：由适配器的 manageFields（target: 'option'）声明，可用 `--<字段名> <值>`
+  // 或通用写法 `--option k=v`。Qoder 拆分站点后不再有这类字段——国内站/国际站用
+  // 各自的 provider id（qoder / qoder-intl）区分，`--site global` 不再有任何效果。
   const options: Record<string, string> = {};
   for (const item of allFlags('option')) {
     const eq = item.indexOf('=');

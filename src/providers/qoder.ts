@@ -264,19 +264,6 @@ function parseQoderOpenApiQuota(body: unknown): QoderTokenUsage {
   };
 }
 
-/**
- * 令牌探测失败时携带失败站点：续期必须回到**同一个站点**的 openapi，
- * `auto` 的 `candidates[0]` 恒为国内站，不能用来推断令牌属于哪个站点。
- */
-class QoderTokenFailure extends Error {
-  constructor(
-    readonly site: QoderSiteMeta,
-    readonly original: unknown,
-  ) {
-    super((original as Error)?.message ?? '取数失败');
-  }
-}
-
 /** openapi 额度接口（登录令牌的原生业务面）——路径按站点主机组装 */
 async function qoderOpenApiQuota(
   site: QoderSiteMeta,
@@ -294,72 +281,61 @@ async function qoderOpenApiQuota(
  * 令牌模式的完整探测：先试网页接口（保留批次到期），失败退回 openapi；
  * 任一接口 401/403 时刷新一次令牌、写回 `.env`，再按同一顺序重试一次。
  *
- * 两个接口都沿站点候选链走：`auto` / `fallbackSite` 账号的令牌可能属于
- * 国际站，兜底与续期必须用同一个站点的主机（国内站 openapi 不认识国际站令牌）。
+ * 站点由平台身份固定（`site` 参数）：接口主机与续期站点都跟着它走——
+ * 国内站的 openapi 不认识国际站令牌，反之亦然，因此不存在跨站点兜底。
  */
 async function qoderProbeWithToken(
+  adapter: ProviderAdapter,
   account: AccountConfig,
   ctx: ProbeContext,
   token: string,
+  site: QoderSiteMeta,
 ): Promise<ProviderSnapshot> {
-  const sitePlan = resolveSitePlan(account);
-  const primary = sitePlan.candidates[0];
   const refreshToken = cred(account, ctx, ['refreshToken', 'refresh_token']);
 
-  /** 多站失败时挑「最可操作」的那个（401 优先于网络错误），并带上站点 */
-  const pickFailure = (failures: Array<{ site: QoderSiteMeta; error: unknown }>): QoderTokenFailure => {
-    const chosen = failures.find((item) => statusOfError(item.error) === pickStatus(failures.map((f) => f.error)));
-    return new QoderTokenFailure((chosen ?? failures[0]).site, (chosen ?? failures[0]).error);
+  /** 两个接口都失败时挑「最可操作」的那个错误（401 优先于网络错误）交给上层 */
+  const pickActionable = (failures: Error[]): Error => {
+    const status = pickStatus(failures);
+    return failures.find((error) => statusOfError(error) === status) ?? failures[0];
   };
 
-  const attempt = async (accessToken: string): Promise<{ usage: QoderTokenUsage; site: QoderSiteMeta }> => {
-    const failures: Array<{ site: QoderSiteMeta; error: unknown }> = [];
-    for (const site of sitePlan.candidates) {
-      try {
-        const parsed = await qoderTokenWebUsage(site, accessToken, ctx);
-        return {
-          site,
-          usage: {
-            used: parsed.usedCredits,
-            total: parsed.totalCredits,
-            remaining: parsed.remainingCredits,
-            lots: parsed.lots,
-            resetsAt: parsed.resetsAt,
-            unit: parsed.unit,
-            openapiOnly: false,
-          },
-        };
-      } catch (error) {
-        failures.push({ site, error });
-        ctx.log(`Qoder ${site.label}网页用量接口（令牌）不可用：${(error as Error).message}`);
-      }
+  const attempt = async (accessToken: string): Promise<QoderTokenUsage> => {
+    const failures: Error[] = [];
+    try {
+      const parsed = await qoderTokenWebUsage(site, accessToken, ctx);
+      return {
+        used: parsed.usedCredits,
+        total: parsed.totalCredits,
+        remaining: parsed.remainingCredits,
+        lots: parsed.lots,
+        resetsAt: parsed.resetsAt,
+        unit: parsed.unit,
+        openapiOnly: false,
+      };
+    } catch (error) {
+      failures.push(error as Error);
+      ctx.log(`Qoder ${site.label}网页用量接口（令牌）不可用：${(error as Error).message}`);
     }
 
-    // 兜底：openapi 额度接口，同样沿候选链（站点与主机一一对应）
-    for (const site of sitePlan.candidates) {
-      try {
-        return { site, usage: await qoderOpenApiQuota(site, accessToken, ctx) };
-      } catch (error) {
-        failures.push({ site, error });
-        ctx.log(`Qoder ${site.label} openapi 额度接口不可用：${(error as Error).message}`);
-      }
+    // 兜底：openapi 额度接口（主机与站点一一对应）
+    try {
+      return await qoderOpenApiQuota(site, accessToken, ctx);
+    } catch (error) {
+      failures.push(error as Error);
+      ctx.log(`Qoder ${site.label} openapi 额度接口不可用：${(error as Error).message}`);
     }
-    throw pickFailure(failures);
+    throw pickActionable(failures);
   };
 
   // `current` 是「本轮实际生效的令牌」：401 续期后会换成新令牌，昵称查询必须用它
   let current = token;
-  let result: { usage: QoderTokenUsage; site: QoderSiteMeta };
+  let usage: QoderTokenUsage;
   try {
-    result = await attempt(current);
+    usage = await attempt(current);
   } catch (error) {
-    const failure = error instanceof QoderTokenFailure ? error : null;
-    const original = failure ? failure.original : error;
     const authError =
-      original instanceof HttpError && (original.status === 401 || original.status === 403);
+      error instanceof HttpError && (error.status === 401 || error.status === 403);
     if (!authError || !refreshToken) throw error;
-    // 续期回到令牌所属站点（auto 的首选是 cn，不能直接拿来刷新）
-    const site = failure?.site ?? primary;
     ctx.log(`Qoder ${site.label}登录令牌已失效，尝试用 refreshToken 续期`);
     const refreshed = await qoderRefreshToken(account, ctx, refreshToken, site.id);
     current = refreshed.accessToken;
@@ -372,10 +348,9 @@ async function qoderProbeWithToken(
         ctx.log(`Qoder 新令牌写回 .env 失败（不影响本次取数）：${(persistError as Error).message}`);
       }
     }
-    result = await attempt(current);
+    usage = await attempt(current);
   }
 
-  const { usage, site } = result;
   // 与 Cookie 路径同一口径：上游偶尔返回已过去的重置时间，展示出来只会让人困惑
   const resetsAt = usage.resetsAt && Date.parse(usage.resetsAt) > ctx.now ? usage.resetsAt : null;
   const window = makeWindow({
@@ -394,7 +369,7 @@ async function qoderProbeWithToken(
   // 昵称：设备流不一定带回；仅当卡片名还是「登录账号」占位名时补查一次，改完就不再打这个接口
   const needsName =
     Boolean(ctx.persistAccountName) &&
-    isPlaceholderAccountName(qoderAdapter.displayName, account.displayName ?? '');
+    isQoderPlaceholderName(adapter, account.displayName ?? '');
   const userInfo = needsName ? await qoderUserInfo(site.id, current, ctx) : null;
   const displayName =
     userInfo?.name && ctx.persistAccountName
@@ -407,7 +382,7 @@ async function qoderProbeWithToken(
       : null;
 
   return buildSnapshot({
-    adapter: adapterForSite(site),
+    adapter,
     account,
     // 本轮已解析出昵称时直接用最终展示名，避免等下一轮配置热加载才更新标题；
     // accountId 同步指向新名字，卡片上的管理操作才不会落在旧条目上
@@ -520,8 +495,6 @@ const QODER_SITES: Record<QoderSiteId, QoderSiteMeta> = {
   },
 };
 
-const OTHER_SITE: Record<QoderSiteId, QoderSiteId> = { cn: 'global', global: 'cn' };
-
 /** 上游接口路径（两侧站点共用；如有差异在此按站点分解） */
 const QODER_PATHS = {
   usage: '/api/v2/me/usages/big_model_credits',
@@ -529,17 +502,6 @@ const QODER_PATHS = {
   usageHistory: '/api/v1/me/usages/big_model_credits/histories',
   quotaHistory: '/api/v1/me/quotas/big_model_credits/histories',
 } as const;
-
-export interface QoderSitePlan {
-  /** 允许尝试的站点顺序，首个 = 首选（快照的 region / 链接都按首选站点写） */
-  candidates: QoderSiteMeta[];
-  /** 候选链由 auto 或 fallbackSite 扩展而来：生效站点可能不是首选 */
-  allowFallback: boolean;
-  /** true 表示 options.site === "auto"（note 里标注自动探测） */
-  auto: boolean;
-  /** options.site 里无法识别的取值（有值时在 note / 失败文案中提示） */
-  invalidSetting: string | null;
-}
 
 function hostnameOf(value: string): string {
   try {
@@ -549,68 +511,77 @@ function hostnameOf(value: string): string {
   }
 }
 
-/** 从域名反推站点：qoder.com.cn / qoder.cn 属国内站，其余（含 qoder.com）按国际站 */
-function siteIdFromOrigin(origin: string): QoderSiteId {
-  const hostname = hostnameOf(origin);
-  return /(^|\.)qoder\.com\.cn$|(^|\.)qoder\.cn$/.test(hostname) ? 'cn' : 'global';
+/**
+ * 拆分前遗留的站点选项（`options.site` / `options.fallbackSite`）。
+ *
+ * 拆分后站点由**平台身份**决定（国内版 `qoder` 恒为 qoder.com.cn，国际版 `qoder-intl`
+ * 恒为 qoder.com），这两个选项不再参与站点解析，只在探测时用于识别旧账号并给出迁移指引。
+ * 迁移脚本 `npm run migrate:qoder-sites` 会把它们从 `accounts.json` 里清理掉。
+ */
+interface LegacySiteOptions {
+  /** `options.site` 原值（小写，空串 = 未配置） */
+  site: string;
+  /** `options.fallbackSite`（回退到另一站点的开关，已废弃） */
+  fallback: boolean;
+}
+
+function legacySiteOptions(account: AccountConfig): LegacySiteOptions {
+  return {
+    site: (optString(account, 'site') || '').trim().toLowerCase(),
+    fallback: optBool(account, 'fallbackSite'),
+  };
 }
 
 /**
- * 解析账号的站点计划。规则（详见 docs/plans/平台适配器-接入Qoder国际站-开发设计方案.md §4.2）：
- *   - `options.origin` 覆盖 → 单候选（自定义域名/代理不参与站点切换），站点由域名推断；
- *   - `site: "cn" | "global"` → 单候选；`fallbackSite: true` 时追加另一站；
- *   - `site: "auto"` → 候选链 [cn, global]，首个能取到数的站点生效；
- *   - 取值非法 → 按国内站处理（与历史默认一致）并回传非法值用于提示。
+ * 旧配置是否**显式跨站**：`options.site` 写了另一站点的 id。
+ *
+ * `auto` 不算跨站——它没有指定站点，按本平台站点探测并在 note 里标注已废弃即可；
+ * 但 `site: "global"` 出现在国内版账号上（或反之）意味着这份凭证很可能属于另一站点，
+ * 用本平台站点探测必然 401/403，因此直接失败并指回迁移脚本。
  */
-export function resolveSitePlan(account: AccountConfig): QoderSitePlan {
-  const override = optString(account, 'origin');
-  if (override) {
-    const site = siteIdFromOrigin(override);
-    return {
-      candidates: [{ ...QODER_SITES[site], origin: override.replace(/\/+$/, '') }],
-      allowFallback: false,
-      auto: false,
-      invalidSetting: null,
-    };
-  }
-
-  const raw = (optString(account, 'site') || 'cn').toLowerCase();
-  if (raw === 'auto') {
-    return {
-      candidates: [QODER_SITES.cn, QODER_SITES.global],
-      allowFallback: true,
-      auto: true,
-      invalidSetting: null,
-    };
-  }
-  if (raw === 'cn' || raw === 'global') {
-    const primary = raw as QoderSiteId;
-    const fallback = optBool(account, 'fallbackSite');
-    return {
-      candidates: fallback
-        ? [QODER_SITES[primary], QODER_SITES[OTHER_SITE[primary]]]
-        : [QODER_SITES[primary]],
-      allowFallback: fallback,
-      auto: false,
-      invalidSetting: null,
-    };
-  }
-  return {
-    candidates: [QODER_SITES.cn],
-    allowFallback: false,
-    auto: false,
-    invalidSetting: raw,
-  };
+function isCrossSiteConfig(legacy: LegacySiteOptions, siteId: QoderSiteId): boolean {
+  return legacy.site !== '' && legacy.site !== 'auto' && legacy.site !== siteId;
 }
 
-/** 按生效站点覆盖快照里的 region / 面板页 / 用量页（与 probe 内覆盖 region 同一手法） */
-function adapterForSite(site: QoderSiteMeta): ProviderAdapter {
-  return {
-    ...qoderAdapter,
-    region: site.id,
-    dashboardUrl: site.dashboardUrl,
-    usageUrl: site.usageUrl,
-  };
+/** 旧站点选项的残留提示（note 用）；没有残留时返回 null */
+function legacySiteNote(legacy: LegacySiteOptions, site: QoderSiteMeta): string | null {
+  const parts: string[] = [];
+  if (legacy.site) {
+    parts.push(`options.site「${legacy.site}」已废弃（站点由平台身份固定为${site.label}）`);
+  }
+  if (legacy.fallback) {
+    parts.push('options.fallbackSite 已废弃（不再跨站点回退）');
+  }
+  if (parts.length === 0) return null;
+  return `${parts.join('；')}，可用 \`npm run migrate:qoder-sites\` 清理`;
+}
+
+/**
+ * 跨站旧配置的失败文案：**不发上游请求**，直接告诉用户该迁到哪个平台。
+ * 用 `error` 状态而不是 `unauthorized`——这不是登录态失效，而是配置写错了平台。
+ */
+function crossSiteMessage(
+  adapter: ProviderAdapter,
+  site: QoderSiteMeta,
+  legacy: LegacySiteOptions,
+): string {
+  const otherId = site.id === 'cn' ? 'qoder-intl' : 'qoder';
+  return (
+    `账号的 options.site 是「${legacy.site}」，但 ${adapter.displayName} 固定使用${site.label}` +
+    `（${site.origin}）：站点已由平台身份决定，这份凭证很可能属于另一站点。` +
+    `请运行 \`npm run migrate:qoder-sites\` 迁移本机配置（国际站账号的 provider 应为 ${otherId}），` +
+    '或在看板上把该账号添加到另一平台的卡片下。'
+  );
+}
+
+/**
+ * 本平台的站点元信息：站点由平台身份固定，`options.origin` 仍可覆盖主机
+ * （自定义域名 / 代理场景），面板页与用量页地址保持站点默认值不变。
+ */
+function siteFor(site: QoderSiteMeta, account: AccountConfig): QoderSiteMeta {
+  const override = (optString(account, 'origin') || '').replace(/\/+$/, '');
+  if (!override || !hostnameOf(override)) return site;
+  return { ...site, origin: override };
 }
 
 /** 失败状态优先级：越靠前越「可操作」，多站点都失败时据此挑选最终状态 */
@@ -624,8 +595,6 @@ const STATUS_PRIORITY: ProviderStatus[] = [
 ];
 
 function statusOfError(error: unknown): ProviderStatus {
-  // 令牌分支把真实错误包在 QoderTokenFailure 里（用于记住失败站点），先解开
-  if (error instanceof QoderTokenFailure) return statusOfError(error.original);
   if (error instanceof HttpError) return error.kind;
   if (/Unauthorized/i.test((error as Error).message)) return 'unauthorized';
   return 'error';
@@ -718,7 +687,7 @@ interface QoderSiteUsage {
   plan: string;
 }
 
-/** 在指定站点取「用量 + 套餐」（套餐失败不影响余额），解析失败即抛错交给候选链 */
+/** 在指定站点取「用量 + 套餐」（套餐失败不影响余额），解析失败即抛错交给上层 */
 async function fetchUsageAtSite(
   site: QoderSiteMeta,
   cookie: string,
@@ -832,22 +801,28 @@ function isNetworkFailure(error: Error): boolean {
   );
 }
 
-/** 全站点失败的合并文案：逐站原因 + 可操作的下一步（网络层 / 站点不匹配 / 非法取值各给专项提示） */
+/**
+ * 单站点失败的文案：失败原因 + 可操作的下一步。
+ *
+ * 站点已由平台身份固定，因此这里不再有「把 options.site 改成 auto / 换另一站点」
+ * 这类建议，只有三类可操作提示：网络层、登录态失效、凭证与站点不匹配。
+ */
 function buildFailureMessage(
-  sitePlan: QoderSitePlan,
-  failures: Array<{ site: QoderSiteMeta; error: Error }>,
+  adapter: ProviderAdapter,
+  site: QoderSiteMeta,
+  failures: Error[],
+  legacy: LegacySiteOptions,
 ): string {
-  const causes = failures.map(({ site, error }) => `${site.label}：${error.message}`);
-  const shapeMismatch = failures.some(({ error }) => /缺少 total_quota/.test(error.message));
-  const networkFailure = failures.some(({ error }) => isNetworkFailure(error));
-  const primary = sitePlan.candidates[0];
+  const causes = failures.map((error) => `${site.label}：${error.message}`);
+  const shapeMismatch = failures.some((error) => /缺少 total_quota/.test(error.message));
+  const networkFailure = failures.some(isNetworkFailure);
+  // 401/403：登录态失效或凭证属于另一站点，两者提示合并成一条可操作的说明
+  const authFailure = failures.some(
+    (error) => error instanceof HttpError && (error.status === 401 || error.status === 403),
+  );
 
-  let hint: string | null = null;
-  if (sitePlan.invalidSetting) {
-    hint =
-      `options.site 取值「${sitePlan.invalidSetting}」无法识别（可用 cn / global / auto），` +
-      '本次按国内站处理';
-  } else if (networkFailure) {
+  let hint: string;
+  if (networkFailure) {
     // 连不上就别说「Cookie 属于另一站点」：那是把网络问题说成配置问题
     const directState = directRetryEnabled()
       ? '自动直连重试已尝试，仍失败说明该主机从本机两条出网路径都不通'
@@ -855,24 +830,19 @@ function buildFailureMessage(
     hint =
       '本次是网络层失败（没拿到任何 HTTP 响应，与 Cookie / 站点归属无关）：' +
       `若本机在用代理（TUN / 系统代理），请在代理里放行该站点或换一个节点；${directState}`;
-  } else if (!sitePlan.allowFallback) {
-    hint = shapeMismatch
-      ? '站点可能与 Cookie 不匹配：请把 options.site 改为 "auto"，' +
-        `或改为 ${primary.id === 'cn' ? '"global"' : '"cn"'} 后重试`
-      : '若该 Cookie 属于另一站点，可把 options.site 改为 "auto" 自动探测，或加 "fallbackSite": true 开启回退';
-  }
-  // 401/403：站点归属或登录态问题，两者提示合并成一条可操作的说明
-  const authFailure = failures.some(({ error }) => {
-    const status = error instanceof HttpError ? error.status : 0;
-    return status === 401 || status === 403;
-  });
-  if (authFailure && !sitePlan.invalidSetting) {
+  } else if (authFailure) {
     hint =
-      '上游判定登录态无效（401/403）：Cookie 可能已过期，请重新登录后执行 ' +
-      `\`npm run capture -- qoder${primary.id === 'global' ? ' --site global' : ''}\`；` +
-      '若这份 Cookie 其实属于另一站点，把 options.site 改成 "auto" 即可自动探测';
+      `上游判定登录态无效（401/403）：这份凭证可能已过期，请重新登录后执行 ` +
+      `\`npm run capture -- ${adapter.id}\`；若它其实属于另一站点，` +
+      '请把该账号添加到另一平台的卡片下（国内版 qoder 用 qoder.com.cn，国际版 qoder-intl 用 qoder.com）。';
+  } else if (shapeMismatch) {
+    hint =
+      '返回的报文结构与本站点不符：请确认这份 Cookie / 令牌属于' +
+      `${site.label}（${site.origin}）；跨站点凭证应配到另一平台的账号上。`;
+  } else {
+    hint = `请确认这份凭证属于${site.label}（${site.origin}），必要时重新抓取后重试。`;
   }
-  return joinNotes(...causes, hint) ?? '取数失败';
+  return joinNotes(...causes, legacySiteNote(legacy, site), hint) ?? '取数失败';
 }
 
 interface QoderSummary {
@@ -1252,251 +1222,202 @@ function parsePlanLabel(body: unknown): string {
 }
 
 /**
- * 「网页端登录」（Qoder 第二个登录方法，`loginMethods` 的第二项）：
- * 服务端驱动本机调试 Chrome 打开 Qoder 用量页，用户在那个窗口里自己完成登录，
+ * 「网页端登录」（Qoder 登录方法之二，`loginMethods` 的第二项）：
+ * 服务端驱动本机调试 Chrome 打开 **本平台站点**的 Qoder 用量页，用户在那个窗口里自己完成登录，
  * 我们只**旁听浏览器真实发出的 Cookie 请求头**（不注入、不代填、不拼 cookie jar——
  * jar 拼装会超上游 header 上限而 401，见 `src/cli/capture.ts:445-452` 的踩坑记录）。
  *
  * 抓到 Cookie 后走同一个登录会话层落库：probe 验证、去重、`.env` 槽位、备份全部复用。
  * 令牌模式拿不到逐包批次明细，Cookie 模式才能拿到——这是本方法存在的理由。
+ *
+ * 站点由工厂参数固定：国内版开 qoder.com.cn，国际版开 qoder.com，卡片上不再需要选站点。
  */
-const qoderWebLogin: ProviderLogin = {
-  id: 'web',
-  kind: 'web',
-  label: '网页端登录',
-  hint: '自动打开调试 Chrome 的 Qoder 用量页；你在那个窗口登录后，本页面自动完成添加。',
-  qr: false,
-  intervalMs: QODER_WEB_POLL_INTERVAL_MS,
-  async start(input) {
-    const site = input.options.site === 'global' ? 'global' : 'cn';
-    const siteMeta = QODER_SITES[site];
+function makeQoderWebLogin(site: QoderSiteMeta): ProviderLogin {
+  return {
+    id: 'web',
+    kind: 'web',
+    label: '网页端登录',
+    hint: `自动打开调试 Chrome 的 ${site.label}Qoder 用量页；你在那个窗口登录后，本页面自动完成添加。`,
+    qr: false,
+    intervalMs: QODER_WEB_POLL_INTERVAL_MS,
+    async start(input) {
+      // ① 确保调试 Chrome 在跑（没跑就按 tools/chrome-debug.sh 同款参数拉起）
+      const chrome = await ensureDebugChrome();
+      input.log(
+        `Qoder 调试 Chrome 已就绪（${chrome.browser}${chrome.started ? '，本次已拉起' : '，复用已运行的实例'}）`,
+      );
 
-    // ① 确保调试 Chrome 在跑（没跑就按 tools/chrome-debug.sh 同款参数拉起）
-    const chrome = await ensureDebugChrome();
-    input.log(
-      `Qoder 调试 Chrome 已就绪（${chrome.browser}${chrome.started ? '，本次已拉起' : '，复用已运行的实例'}）`,
-    );
+      // ② 打开用量页并开始旁听请求头；采集器挂在 secret 里，cleanup 时释放
+      const collector = await openCookieCollector({ url: site.dashboardUrl });
+      input.log(`Qoder ${site.label}用量页已打开，等待登录`);
 
-    // ② 打开用量页并开始旁听请求头；采集器挂在 secret 里，cleanup 时释放
-    const collector = await openCookieCollector({ url: siteMeta.dashboardUrl });
-    input.log(`Qoder ${siteMeta.label}用量页已打开，等待登录`);
-
-    const startedAt = Date.now();
-    return {
-      authUrl: siteMeta.dashboardUrl,
-      qr: false,
-      ttlMs: QODER_WEB_LOGIN_TTL_MS,
-      hint: `请在刚打开的 Chrome 窗口里登录${siteMeta.label}（${siteMeta.origin}）；登录后本页面会自动完成添加。`,
-      secret: { site, collector, startedAt, reloads: 0, lastReloadAt: 0 },
-    };
-  },
-  async poll(secret, ctx) {
-    if (!isRecord(secret)) return { status: 'failed', message: '登录会话缺少采集器参数，请重新发起。' };
-    const collector = pick(secret, 'collector') as CookieCollector | undefined;
-    const site = firstString(pick(secret, 'site')) === 'global' ? 'global' : 'cn';
-    const startedAt = Number(pick(secret, 'startedAt')) || Date.now();
-    if (!collector || typeof collector.cookieFor !== 'function') {
-      return { status: 'failed', message: '登录会话缺少采集器，请重新发起。' };
-    }
-
-    const siteMeta = QODER_SITES[site];
-    // 目标域清单：origin 与用量页的主机（qoder.com.cn / qoder.cn；国际站 qoder.com），
-    // 采集到的 Cookie 头只要落在这些域上就算命中
-    const hosts = [...new Set([hostnameOf(siteMeta.origin), hostnameOf(siteMeta.dashboardUrl)])].filter(
-      Boolean,
-    );
-    const raw = collector.cookieFor(hosts);
-
-    /**
-     * 登录态判据：**不能**只看「抓到了 Cookie」。
-     *
-     * 采集修好后，未登录页面同样会带访客 Cookie 发请求（acw_tc / cna / tfstk /
-     * qoder_visitor_id / arms_uid / isg 等）。若此时直接报 ready，会话层会拿这串
-     * 访客 Cookie 去 probe，必然 401 → 直接判 failed，比「一直等待」更糟。
-     *
-     * 两条判据取「或」：
-     *   ① 站点声明的登录态 Cookie 名出现（国内站：qoder_session_cookie）；
-     *   ② 功能性证据：页面**自己**请求身份接口 `/api/v1/me` 拿到 2xx
-     *      （实测登录态 200、匿名态 401）。站点无关，登录态 Cookie 名随上游改版时仍成立。
-     */
-    const names = collector.cookieNamesFor(hosts);
-    const hasLoginCookie = siteMeta.loginCookieNames.some((name) => names.includes(name));
-    const identityOk = collector.sawSuccessfulRequest(QODER_WEB_IDENTITY_PATH);
-    const loggedIn = Boolean(raw) && (hasLoginCookie || identityOk);
-
-    if (!loggedIn) {
-      // 刷新策略：只在页面**确实空闲**时刷新，且限次 + 最小间隔。
-      // 旧实现是「20 秒后每轮（2 秒）刷新」，会反复重置用户正在填写的登录页。
-      const reloads = Number(pick(secret, 'reloads')) || 0;
-      const lastReloadAt = Number(pick(secret, 'lastReloadAt')) || 0;
-      const now = Date.now();
-      const idle = collector.idleMs();
-      const idleLongEnough = idle >= QODER_WEB_RELOAD_IDLE_MS || idle === 0;
-      if (
-        reloads < QODER_WEB_RELOAD_MAX &&
-        idleLongEnough &&
-        now - lastReloadAt >= QODER_WEB_RELOAD_MIN_INTERVAL_MS
-      ) {
-        await collector.reload();
-        if (isRecord(secret)) {
-          secret.reloads = reloads + 1;
-          secret.lastReloadAt = now;
-        }
-      }
-      const waitedSec = Math.round((now - startedAt) / 1000);
+      const startedAt = Date.now();
       return {
-        status: 'waiting',
-        message: raw
-          ? `已抓到 ${siteMeta.label}的页面 Cookie，但尚未检测到登录态，请在该 Chrome 窗口完成登录（已等待 ${waitedSec} 秒）…`
-          : `正在等待你在调试 Chrome 窗口里登录（已等待 ${waitedSec} 秒）…`,
+        authUrl: site.dashboardUrl,
+        qr: false,
+        ttlMs: QODER_WEB_LOGIN_TTL_MS,
+        hint: `请在刚打开的 Chrome 窗口里登录${site.label}（${site.origin}）；登录后本页面会自动完成添加。`,
+        secret: { collector, startedAt, reloads: 0, lastReloadAt: 0 },
       };
-    }
+    },
+    async poll(secret, ctx) {
+      if (!isRecord(secret)) return { status: 'failed', message: '登录会话缺少采集器参数，请重新发起。' };
+      const collector = pick(secret, 'collector') as CookieCollector | undefined;
+      const startedAt = Number(pick(secret, 'startedAt')) || Date.now();
+      if (!collector || typeof collector.cookieFor !== 'function') {
+        return { status: 'failed', message: '登录会话缺少采集器，请重新发起。' };
+      }
 
-    const cookie = normalizeCookieHeader(raw ?? '') ?? '';
-    if (!cookie) return { status: 'waiting', message: '抓到的 Cookie 头为空，继续等待页面发起新请求…' };
+      // 目标域清单：origin 与用量页的主机（国内站 qoder.com.cn / qoder.cn；国际站 qoder.com），
+      // 采集到的 Cookie 头只要落在这些域上就算命中
+      const hosts = [...new Set([hostnameOf(site.origin), hostnameOf(site.dashboardUrl)])].filter(
+        Boolean,
+      );
+      const raw = collector.cookieFor(hosts);
 
-    // 账号身份：
-    //   - 去重键仍用「Cookie 指纹」：同一账号的登录态 Cookie 相对稳定，重新登录 → 指纹一致
-    //     → 更新原条目；不同账号 → 指纹不同 → 新建卡片。改成上游 id 会让已有账号的
-    //     loginAccountId 对不上（重新登录会新建卡片），故本次不动。
-    //   - 昵称走**网页**身份接口 `GET /api/v1/me`（与 Cookie 同一条信任面）。早先
-    //     「网页侧拿不到昵称」的结论只对 openapi `/api/v1/userinfo`（要 Bearer）成立，
-    //     网页接口本来就返回 `{ id, username, name, email }`——实测 `name` 即昵称。
-    const accountId = createHash('sha256').update(cookie).digest('hex').slice(0, 16);
-    const identity = await qoderCookieIdentity(siteMeta, cookie, ctx, QODER_TIMEOUT_FALLBACK);
-    const name = identity?.name ?? '';
-    ctx.log(
-      `Qoder 网页端登录已抓到 Cookie（指纹 ${accountId}）` +
-        (name ? `，账号昵称：${name}` : '，未能解析昵称（将使用占位名，探测时再补）') +
-        '，开始验证落库',
-    );
+      /**
+       * 登录态判据：**不能**只看「抓到了 Cookie」。
+       *
+       * 采集修好后，未登录页面同样会带访客 Cookie 发请求（acw_tc / cna / tfstk /
+       * qoder_visitor_id / arms_uid / isg 等）。若此时直接报 ready，会话层会拿这串
+       * 访客 Cookie 去 probe，必然 401 → 直接判 failed，比「一直等待」更糟。
+       *
+       * 两条判据取「或」：
+       *   ① 站点声明的登录态 Cookie 名出现（国内站：qoder_session_cookie）；
+       *   ② 功能性证据：页面**自己**请求身份接口 `/api/v1/me` 拿到 2xx
+       *      （实测登录态 200、匿名态 401）。站点无关，登录态 Cookie 名随上游改版时仍成立。
+       */
+      const names = collector.cookieNamesFor(hosts);
+      const hasLoginCookie = site.loginCookieNames.some((name) => names.includes(name));
+      const identityOk = collector.sawSuccessfulRequest(QODER_WEB_IDENTITY_PATH);
+      const loggedIn = Boolean(raw) && (hasLoginCookie || identityOk);
 
-    return {
-      status: 'ready',
-      // 昵称交给落库层命名；为空时优回落占位名「平台 · 登录账号」
-      account: { id: accountId, name },
-      credentials: { cookie },
-      options: { site },
-      message: '已抓到登录 Cookie，正在验证取数并写入本机配置…',
-    };
+      if (!loggedIn) {
+        // 刷新策略：只在页面**确实空闲**时刷新，且限次 + 最小间隔。
+        // 旧实现是「20 秒后每轮（2 秒）刷新」，会反复重置用户正在填写的登录页。
+        const reloads = Number(pick(secret, 'reloads')) || 0;
+        const lastReloadAt = Number(pick(secret, 'lastReloadAt')) || 0;
+        const now = Date.now();
+        const idle = collector.idleMs();
+        const idleLongEnough = idle >= QODER_WEB_RELOAD_IDLE_MS || idle === 0;
+        if (
+          reloads < QODER_WEB_RELOAD_MAX &&
+          idleLongEnough &&
+          now - lastReloadAt >= QODER_WEB_RELOAD_MIN_INTERVAL_MS
+        ) {
+          await collector.reload();
+          if (isRecord(secret)) {
+            secret.reloads = reloads + 1;
+            secret.lastReloadAt = now;
+          }
+        }
+        const waitedSec = Math.round((now - startedAt) / 1000);
+        return {
+          status: 'waiting',
+          message: raw
+            ? `已抓到 ${site.label}的页面 Cookie，但尚未检测到登录态，请在该 Chrome 窗口完成登录（已等待 ${waitedSec} 秒）…`
+            : `正在等待你在调试 Chrome 窗口里登录（已等待 ${waitedSec} 秒）…`,
+        };
+      }
+
+      const cookie = normalizeCookieHeader(raw ?? '') ?? '';
+      if (!cookie) return { status: 'waiting', message: '抓到的 Cookie 头为空，继续等待页面发起新请求…' };
+
+      // 账号身份：
+      //   - 去重键仍用「Cookie 指纹」：同一账号的登录态 Cookie 相对稳定，重新登录 → 指纹一致
+      //     → 更新原条目；不同账号 → 指纹不同 → 新建卡片。改成上游 id 会让已有账号的
+      //     loginAccountId 对不上（重新登录会新建卡片），故本次不动。
+      //   - 昵称走**网页**身份接口 `GET /api/v1/me`（与 Cookie 同一条信任面）。早先
+      //     「网页侧拿不到昵称」的结论只对 openapi `/api/v1/userinfo`（要 Bearer）成立，
+      //     网页接口本来就返回 `{ id, username, name, email }`——实测 `name` 即昵称。
+      const accountId = createHash('sha256').update(cookie).digest('hex').slice(0, 16);
+      const identity = await qoderCookieIdentity(site, cookie, ctx, QODER_TIMEOUT_FALLBACK);
+      const name = identity?.name ?? '';
+      ctx.log(
+        `Qoder 网页端登录已抓到 Cookie（指纹 ${accountId}）` +
+          (name ? `，账号昵称：${name}` : '，未能解析昵称（将使用占位名，探测时再补）') +
+          '，开始验证落库',
+      );
+
+      return {
+        status: 'ready',
+        // 昵称交给落库层命名；为空时优回落占位名「平台 · 登录账号」
+        account: { id: accountId, name },
+        credentials: { cookie },
+        // 站点不再写进 options：拆分后站点由 provider 表达（国内版 qoder / 国际版 qoder-intl）
+        options: {},
+        message: '已抓到登录 Cookie，正在验证取数并写入本机配置…',
+      };
+    },
+    async cleanup(secret) {
+      // 释放我们开出的标签页与 WebSocket；浏览器本体不关（用户可能还在用）
+      const collector = isRecord(secret)
+        ? (pick(secret, 'collector') as CookieCollector | undefined)
+        : undefined;
+      await collector?.close().catch(() => {});
+    },
+  };
+}
+
+/**
+ * 两个站点各自的 `.env` 变量前缀。
+ *
+ * 登录态互不通用，混用同一个变量会让后添加的账号覆盖前一个，因此按平台分开：
+ *   - `qoder`（国内版）：`QODER_COOKIE` / `QODER_ACCESS_TOKEN` / `QODER_REFRESH_TOKEN`
+ *   - `qoder-intl`（国际版）：`QODER_GLOBAL_COOKIE` / `QODER_GLOBAL_ACCESS_TOKEN` /
+ *     `QODER_GLOBAL_REFRESH_TOKEN`
+ *
+ * 用**静态对象**声明而不是让 `providerEnvPrefix()` 推导：`qoder-intl` 推导出来是
+ * `QODER_INTL_*`，会与用户已有的 `.env` 对不上。第 N 个账号（N≥2）仍由
+ * `src/account-store.ts` 的 `slotEnvName()` 追加 `_N` 后缀。
+ */
+const QODER_ENV_NAMES: Record<QoderSiteId, Record<string, string>> = {
+  cn: {
+    cookie: 'QODER_COOKIE',
+    accessToken: 'QODER_ACCESS_TOKEN',
+    refreshToken: 'QODER_REFRESH_TOKEN',
   },
-  async cleanup(secret) {
-    // 释放我们开出的标签页与 WebSocket；浏览器本体不关（用户可能还在用）
-    const collector = isRecord(secret)
-      ? (pick(secret, 'collector') as CookieCollector | undefined)
-      : undefined;
-    await collector?.close().catch(() => {});
+  global: {
+    cookie: 'QODER_GLOBAL_COOKIE',
+    accessToken: 'QODER_GLOBAL_ACCESS_TOKEN',
+    refreshToken: 'QODER_GLOBAL_REFRESH_TOKEN',
   },
 };
 
-export const qoderAdapter: ProviderAdapter = {
-  id: 'qoder',
-  displayName: 'Qoder',
-  // 以下三项是国内站（默认站点）的取值；探测时由 adapterForSite() 按实际生效站点覆盖
-  region: 'cn',
-  dashboardUrl: QODER_SITES.cn.dashboardUrl,
-  usageUrl: QODER_SITES.cn.usageUrl,
-  requiredCredentialKeys: ['cookie'],
-  /**
-   * 两种凭证形态：手工 Cookie（保留批次到期）或设备流登录令牌。
-   *
-   * 变量前缀按站点分开——两个站点的登录态互不通用，混用同一个变量会让后添加的
-   * 账号覆盖前一个：
-   *   - 国内站：`QODER_COOKIE` / `QODER_ACCESS_TOKEN` / `QODER_REFRESH_TOKEN`
-   *   - 国际站：`QODER_GLOBAL_COOKIE` / `QODER_GLOBAL_ACCESS_TOKEN` /
-   *     `QODER_GLOBAL_REFRESH_TOKEN`（第 N 个账号仍加 `_N` 后缀）
-   */
-  envNames: (options) => {
-    const isGlobal = String(options.site ?? '').trim().toLowerCase() === 'global';
-    if (!isGlobal) {
-      return {
-        cookie: 'QODER_COOKIE',
-        accessToken: 'QODER_ACCESS_TOKEN',
-        refreshToken: 'QODER_REFRESH_TOKEN',
-      };
-    }
-    return {
-      cookie: 'QODER_GLOBAL_COOKIE',
-      accessToken: 'QODER_GLOBAL_ACCESS_TOKEN',
-      refreshToken: 'QODER_GLOBAL_REFRESH_TOKEN',
-    };
-  },
-  // accessToken 是取数必需；refreshToken 只影响续期
-  isConfigured: (account) =>
-    Boolean(account.credentials.cookie) || Boolean(account.credentials.accessToken),
-  credentialHint:
-    '登录 qoder.com.cn（国际站为 qoder.com）后，从 DevTools 的 Network 里复制任意 /api/ 请求的 Cookie 头，' +
-    '填入 credentials.cookie；国际站账号请把站点选为 global（或在登录块先切到「国际站」再扫码），' +
-    '也可用 npm run capture -- qoder --site global 自动抓取。' +
-    '国际站的凭证写入 QODER_GLOBAL_* 变量，与国内站互不覆盖。',
-  /** 站点可在看板上直接切换（见 manageFields 的 site 下拉），增删账号走通用实现 */
-  manageAccounts: true,
-  manageFields: [
-    {
-      key: 'cookie',
-      label: 'Cookie',
-      placeholder: '从 DevTools 的 Network 复制任意 /api/ 请求的 Cookie 头',
-      hint: '站点要与 Cookie 的来源一致（qoder.com.cn 或 qoder.com）',
-      multiline: true,
-    },
-    {
-      key: 'site',
-      label: '站点',
-      target: 'option',
-      choices: ['cn', 'global', 'auto'],
-      defaultValue: 'cn',
-      required: false,
-      secret: false,
-      hint: 'cn 国内站（默认）· global 国际站 · auto 自动探测并回退',
-    },
-  ],
-  manageHint: 'Cookie 会先按所选站点真实验证，通过了才写入本机配置；写入前自动备份到 .run/。',
-  /**
-   * 用量 + 获取明细（v2）：
-   *   - 用量：`/api/v1/me/usages/big_model_credits/histories` 逐笔（`time` + `credits`），
-   *     与页面「使用记录」同源；
-   *   - 获取：`/api/v1/me/quotas/big_model_credits/histories` 额度变更流水
-   *     （`change_amount` + `effective_at`，如资源包激活/发放），与页面「个人资源包 / 获取」同源。
-   */
-  async fetchUsageLedger(account: AccountConfig, ctx: ProbeContext): Promise<UsageLedger | null> {
-    // 登录令牌模式暂不接逐笔用量（明细接口只对网页会话开放），由本地采样兜底
-    if (!cred(account, ctx, ['cookie', 'cookieHeader'])) return null;
-    const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
-    if (!cookie) return null;
-    const sitePlan = resolveSitePlan(account);
-    const timeoutMs = ctx.timeoutMs || QODER_TIMEOUT_FALLBACK;
+/** 站点 → provider id（账号、卡片、缓存键都以它区分，见 docs/plans/…-彻底分离-开发设计方案.md §3.3） */
+export const QODER_PROVIDER_IDS: Record<QoderSiteId, string> = {
+  cn: 'qoder',
+  global: 'qoder-intl',
+};
 
-    // 明细与探测同源：沿同一候选链取数，首个能通的站点胜出（失败由编排层降级到本地采样）
-    let lastError: unknown = null;
-    for (const site of sitePlan.candidates) {
-      try {
-        return await fetchLedgerAtSite(site, cookie, ctx, timeoutMs);
-      } catch (error) {
-        lastError = error;
-        ctx.log(`Qoder ${site.label}用量明细获取失败：${(error as Error).message}`);
-      }
-    }
-    if (lastError) {
-      ctx.log(`Qoder 用量明细全部失败，已回退本地采样：${(lastError as Error).message}`);
-    }
-    return null;
-  },
+/** 旧 displayName：拆分前落库的占位名是「Qoder · 登录账号」，改名后仍需认出它（见 base.ts） */
+const QODER_LEGACY_DISPLAY_NAMES = ['Qoder'];
 
-  /**
-   * 「扫码登录」：Qoder 设备流（qodercli 同款）。
-   *
-   * 授权页是 `{website}/device/selectAccounts?...`，手机扫码确认后，
-   * 服务端用 `nonce + verifier` 轮询 `/api/v1/deviceToken/poll` 拿令牌。
-   * 设备流只支持国内站（国际站主机未验证），与 `.env.example` 的说明一致。
-   */
-  login: {
+/** 占位名判定：本平台现名与旧名都要认，否则旧条目永远等不到自动补昵称 */
+function isQoderPlaceholderName(adapter: ProviderAdapter, name: string): boolean {
+  return [adapter.displayName, ...QODER_LEGACY_DISPLAY_NAMES].some((displayName) =>
+    isPlaceholderAccountName(displayName, name),
+  );
+}
+
+/**
+ * 「扫码登录」：Qoder 设备流（qodercli 同款）。
+ *
+ * 授权页是 `{website}/device/selectAccounts?...`，手机扫码确认后，
+ * 服务端用 `nonce + verifier` 轮询 `/api/v1/deviceToken/poll` 拿令牌。
+ * 站点由工厂参数固定（`QODER_LOGIN` 里有国际站的 website / openapi，
+ * 但其设备流**未实测**；拿不到令牌时用户可改用「网页端登录」）。
+ *
+ * 落库 options 不再写 `site`：请求打到哪个站点由 provider 决定，配置里不需要重复表达。
+ */
+function makeQoderDeviceLogin(site: QoderSiteMeta): ProviderLogin {
+  const target = QODER_LOGIN[site.id];
+  return {
     label: '扫码登录',
-    hint: '用 Qoder 手机 App 扫码，或在浏览器里打开链接完成授权。',
+    hint: `用 Qoder 手机 App 扫码授权${site.label}账号，或在浏览器里打开链接完成授权。`,
     qr: true,
     intervalMs: QODER_POLL_INTERVAL_MS,
     async start(input) {
-      const site = input.options.site === 'global' ? 'global' : 'cn';
-      const target = QODER_LOGIN[site];
       const { verifier, challenge } = pkcePair();
       const nonce = randomUUID();
       const machineId = randomUUID();
@@ -1507,27 +1428,26 @@ export const qoderAdapter: ProviderAdapter = {
         machine_id: machineId,
         client_id: QODER_CLIENT_ID,
       });
-      input.log('Qoder 设备流已创建，等待扫码授权');
+      input.log(`Qoder ${site.label}设备流已创建，等待扫码授权`);
       return {
         authUrl: `${target.website}/device/selectAccounts?${query.toString()}`,
         qr: true,
         ttlMs: QODER_LOGIN_TTL_MS,
         hint: '扫码后在手机上确认；本页面会自动完成添加。',
         // verifier 只留在服务端内存，绝不写日志
-        secret: { nonce, verifier, site, machineId },
+        secret: { nonce, verifier, machineId },
       };
     },
     async poll(secret, ctx) {
       if (!isRecord(secret)) return { status: 'failed', message: '登录会话缺少设备流参数，请重新发起。' };
       const nonce = firstString(pick(secret, 'nonce'));
       const verifier = firstString(pick(secret, 'verifier'));
-      const site = firstString(pick(secret, 'site')) === 'global' ? 'global' : 'cn';
       const machineId = firstString(pick(secret, 'machineId'));
       if (!nonce || !verifier) {
         return { status: 'failed', message: '登录会话缺少 nonce / verifier，请重新发起。' };
       }
       const query = new URLSearchParams({ nonce, verifier, challenge_method: 'S256' });
-      const url = `${QODER_LOGIN[site].openapi}/api/v1/deviceToken/poll?${query.toString()}`;
+      const url = `${target.openapi}/api/v1/deviceToken/poll?${query.toString()}`;
 
       let body: unknown;
       try {
@@ -1560,7 +1480,7 @@ export const qoderAdapter: ProviderAdapter = {
       // 设备流响应不一定带昵称；缺了就用 userinfo 补一次（卡片标题要显示账号名）
       const userName =
         firstString(isRecord(payload) ? pick(payload, 'user_name', 'userName', 'name') : undefined) ||
-        (await qoderUserInfo(site, token, ctx))?.name ||
+        (await qoderUserInfo(site.id, token, ctx))?.name ||
         '';
 
       return {
@@ -1572,51 +1492,115 @@ export const qoderAdapter: ProviderAdapter = {
         },
         options: {
           userId,
-          site,
           ...(machineId ? { machineId } : {}),
         },
         message: '登录成功，正在验证取数并写入本机配置…',
       };
     },
-  },
+  };
+}
 
+/**
+ * 按站点产出一个完整的 Qoder 适配器：站点在闭包内固定，登录、探测、失败文案、
+ * `.env` 变量前缀全部跟着它走，不再有候选链 / 回退 / auto 探测。
+ *
+ * 两个站点的解析逻辑完全共用同一份实现，差异只在站点元信息与变量名，
+ * 因此这里用工厂而不是复制两份适配器。
+ */
+function createQoderAdapter(siteId: QoderSiteId): ProviderAdapter {
+  const site = QODER_SITES[siteId];
+  const login = makeQoderDeviceLogin(site);
+  const webLogin = makeQoderWebLogin(site);
 
-  async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
-    const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
-    // 令牌分支：手工 Cookie 优先（保留批次到期），没有 Cookie 才走设备令牌
-    if (!cookie) {
-      const accessToken = cred(account, ctx, ['accessToken', 'token']);
-      if (!accessToken) {
-        return notConfigured(qoderAdapter, account, ctx, ['cookie 或 accessToken+refreshToken']);
-      }
+  const adapter: ProviderAdapter = {
+    id: QODER_PROVIDER_IDS[siteId],
+    displayName: siteId === 'cn' ? 'Qoder 国内版' : 'Qoder 国际版',
+    region: site.id,
+    dashboardUrl: site.dashboardUrl,
+    usageUrl: site.usageUrl,
+    requiredCredentialKeys: ['cookie'],
+    envNames: QODER_ENV_NAMES[siteId],
+    // accessToken 是取数必需；refreshToken 只影响续期
+    isConfigured: (account) =>
+      Boolean(account.credentials.cookie) || Boolean(account.credentials.accessToken),
+    credentialHint:
+      `登录 ${hostnameOf(site.origin)} 后，从 DevTools 的 Network 里复制任意 /api/ 请求的 Cookie 头，` +
+      '填入 cookie；也可用「网页端登录」自动抓取，或用 ' +
+      `npm run capture -- ${QODER_PROVIDER_IDS[siteId]} 命令行抓取。` +
+      `本平台的凭证写入 ${QODER_ENV_NAMES[siteId].cookie} 变量，与另一站点互不覆盖。`,
+    /** 旧名兼容：拆分前的「Qoder · 登录账号」仍是本平台的占位名 */
+    legacyDisplayNames: QODER_LEGACY_DISPLAY_NAMES,
+    /** 站点由平台身份固定，不再有站点选项；增删账号走通用实现 */
+    manageAccounts: true,
+    manageFields: [
+      {
+        key: 'cookie',
+        label: 'Cookie',
+        placeholder: '从 DevTools 的 Network 复制任意 /api/ 请求的 Cookie 头',
+        hint: `必须是 ${hostnameOf(site.origin)} 的 Cookie（本平台固定${site.label}）`,
+        multiline: true,
+      },
+    ],
+    manageHint: `Cookie 会先按${site.label}（${site.origin}）真实验证，通过了才写入本机配置；写入前自动备份到 .run/。`,
+    /** 默认登录方法（扫码）；完整方法清单在对象外组装成 `loginMethods`，见本文件末尾 */
+    login,
+    /**
+     * 用量 + 获取明细（v2）：
+     *   - 用量：`/api/v1/me/usages/big_model_credits/histories` 逐笔（`time` + `credits`），
+     *     与页面「使用记录」同源；
+     *   - 获取：`/api/v1/me/quotas/big_model_credits/histories` 额度变更流水
+     *     （`change_amount` + `effective_at`，如资源包激活/发放），与页面「个人资源包 / 获取」同源。
+     */
+    async fetchUsageLedger(account: AccountConfig, ctx: ProbeContext): Promise<UsageLedger | null> {
+      // 登录令牌模式暂不接逐笔用量（明细接口只对网页会话开放），由本地采样兜底
+      if (!cred(account, ctx, ['cookie', 'cookieHeader'])) return null;
+      const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+      if (!cookie) return null;
+      // 旧跨站配置的凭证不属于本站点，明细必然取不到：直接交给本地采样兜底，不打上游
+      if (isCrossSiteConfig(legacySiteOptions(account), siteId)) return null;
+      const timeoutMs = ctx.timeoutMs || QODER_TIMEOUT_FALLBACK;
       try {
-        return await qoderProbeWithToken(account, ctx, accessToken);
+        return await fetchLedgerAtSite(siteFor(site, account), cookie, ctx, timeoutMs);
       } catch (error) {
-        // 失败站点由 QoderTokenFailure 携带：国际站令牌失效时，卡片链接不能回落成国内站
-        const failedSite =
-          error instanceof QoderTokenFailure
-            ? error.site
-            : resolveSitePlan(account).candidates[0];
-        return failure(
-          adapterForSite(failedSite),
-          account,
-          ctx,
-          statusOfError(error),
-          (error as Error).message,
+        ctx.log(
+          `Qoder ${site.label}用量明细获取失败，已回退本地采样：${(error as Error).message}`,
         );
+        return null;
       }
-    }
+    },
 
-    const sitePlan = resolveSitePlan(account);
-    const primary = sitePlan.candidates[0];
-    const timeoutMs = ctx.timeoutMs || QODER_TIMEOUT_FALLBACK;
-    const failures: Array<{ site: QoderSiteMeta; error: Error }> = [];
+    async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
+      const legacy = legacySiteOptions(account);
+      // 旧配置显式跨站：这份凭证属于另一站点，用本平台站点探测必然 401/403。
+      // 与其打一次注定失败的上游请求（还可能触发风控），不如直接给出迁移指引。
+      if (isCrossSiteConfig(legacy, siteId)) {
+        return failure(adapter, account, ctx, 'error', crossSiteMessage(adapter, site, legacy));
+      }
+      // `options.origin` 覆盖（自定义域名 / 代理）只换主机，站点其余元信息不变
+      const target = siteFor(site, account);
+      const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+      // 令牌分支：手工 Cookie 优先（保留批次到期），没有 Cookie 才走设备令牌
+      if (!cookie) {
+        const accessToken = cred(account, ctx, ['accessToken', 'token']);
+        if (!accessToken) {
+          return notConfigured(adapter, account, ctx, ['cookie 或 accessToken+refreshToken']);
+        }
+        try {
+          return await qoderProbeWithToken(adapter, account, ctx, accessToken, target);
+        } catch (error) {
+          return failure(
+            adapter,
+            account,
+            ctx,
+            statusOfError(error),
+            buildFailureMessage(adapter, target, [error as Error], legacy),
+          );
+        }
+      }
 
-    // 沿候选链串行探测：显式站点只有一条候选（除非开了 fallbackSite），auto 则是 [cn, global]。
-    // 首个能取到数的站点即生效站点，region / 面板链接 / 用量链接都跟着它走。
-    for (const [index, site] of sitePlan.candidates.entries()) {
+      const timeoutMs = ctx.timeoutMs || QODER_TIMEOUT_FALLBACK;
       try {
-        const { parsed, plan } = await fetchUsageAtSite(site, cookie, ctx, timeoutMs);
+        const { parsed, plan } = await fetchUsageAtSite(target, cookie, ctx, timeoutMs);
 
         // 上游偶尔返回已过去的重置时间（例如当前处于免费档位），展示出来只会让人困惑
         const resetsAt =
@@ -1636,25 +1620,14 @@ export const qoderAdapter: ProviderAdapter = {
         const { active, expired } = splitByExpiry(parsed.lots, ctx.now);
         const datedLots = active.filter((lot) => lot.expiresAt !== null).length;
 
-        const siteNote = sitePlan.auto
-          ? `站点：${site.label}（${site.origin}，自动探测）`
-          : `站点：${site.label}（${site.origin}）`;
-        const fallbackNote =
-          index > 0
-            ? `已回退到${site.label}：首选${primary.label}不可用（${failures[0]?.error.message ?? '原因未知'}）`
-            : null;
-        const invalidNote = sitePlan.invalidSetting
-          ? `options.site 取值「${sitePlan.invalidSetting}」无法识别（可用 cn / global / auto），已按国内站处理`
-          : null;
-
         // 昵称：与令牌模式同一门禁——只在卡片名仍是「登录账号」占位名时补查一次，
-        // 改完即停（isPlaceholderAccountName 不再命中），不产生常驻开销。
+        // 改完即停（占位名判定不再命中），不产生常驻开销。
         // Cookie 模式走网页身份接口 /api/v1/me（openapi /userinfo 要 Bearer，Cookie 打过去 401）。
         const needsName =
           Boolean(ctx.persistAccountName) &&
-          isPlaceholderAccountName(qoderAdapter.displayName, account.displayName ?? '');
+          isQoderPlaceholderName(adapter, account.displayName ?? '');
         const identity = needsName
-          ? await qoderCookieIdentity(site, cookie, ctx, timeoutMs)
+          ? await qoderCookieIdentity(target, cookie, ctx, timeoutMs)
           : null;
         const resolvedName =
           identity?.name && ctx.persistAccountName
@@ -1667,7 +1640,7 @@ export const qoderAdapter: ProviderAdapter = {
             : null;
 
         return buildSnapshot({
-          adapter: adapterForSite(site),
+          adapter,
           account,
           // 本轮已解析出昵称时直接用最终展示名，避免等下一轮配置热加载才更新标题；
           // accountId 同步指向新名字，卡片上的管理操作才不会落在旧条目上
@@ -1680,9 +1653,8 @@ export const qoderAdapter: ProviderAdapter = {
           credits: active,
           windows: [window],
           note: joinNotes(
-            invalidNote,
-            siteNote,
-            fallbackNote,
+            `站点：${target.label}（${target.origin}）`,
+            legacySiteNote(legacy, target),
             hiddenLotsNote(expired),
             datedLots === 0 && resetsAt
               ? '未返回独立过期时间，未用完的积分将在本期重置时作废'
@@ -1691,33 +1663,35 @@ export const qoderAdapter: ProviderAdapter = {
           ),
         });
       } catch (error) {
-        failures.push({ site, error: error as Error });
-        ctx.log(
-          `Qoder ${site.label}取数失败：${(error as Error).message}` +
-            (sitePlan.candidates.length > 1 ? '（继续尝试下一站点）' : ''),
+        ctx.log(`Qoder ${target.label}取数失败：${(error as Error).message}`);
+        return failure(
+          adapter,
+          account,
+          ctx,
+          statusOfError(error),
+          buildFailureMessage(adapter, target, [error as Error], legacy),
         );
       }
-    }
+    },
+  };
 
-    // 全部候选站点都失败：状态取最可操作的那个，文案逐站列出原因并给下一步建议
-    return failure(
-      adapterForSite(primary),
-      account,
-      ctx,
-      pickStatus(failures.map((item) => item.error)),
-      buildFailureMessage(sitePlan, failures),
-    );
-  },
-};
+  /**
+   * 登录方法清单：`login`（扫码，默认方法）+ `webLogin`（网页端抓 Cookie）。
+   *
+   * 声明后前端按清单渲染两个按钮，会话层按 `method` 路由；
+   * `login` 仍保留在适配器上（不传 method 时走它），行为向后兼容。
+   */
+  adapter.loginMethods = [login, webLogin];
+  return adapter;
+}
+
+/** 国内站（qoder.com.cn / qoder.cn）：凭证写 `QODER_*`，与拆分前的行为一致 */
+export const qoderAdapter: ProviderAdapter = createQoderAdapter('cn');
 
 /**
- * 登录方法清单：`login`（扫码，默认方法）+ `webLogin`（网页端抓 Cookie）。
+ * 国际站（qoder.com）：独立 provider id，凭证写 `QODER_GLOBAL_*`。
  *
- * 声明后前端按清单渲染两个按钮，会话层按 `method` 路由；
- * `login` 仍保留在适配器上（不传 method 时走它），行为向后兼容。
- * 放在对象外组装：两个方法都引用 `qoderAdapter` 定义时的上下文，
- * 对象字面量内部无法安全自引用。
+ * 站点从「账号选项」上移成「平台身份」——账号列表、卡片、登录入口、缓存键都按 provider 分开，
+ * 看板上不再有站点下拉与「本平台已配置账号」的跨站筛选（见 §3.1）。
  */
-qoderAdapter.loginMethods = [qoderAdapter.login, qoderWebLogin].filter(
-  (method): method is ProviderLogin => Boolean(method),
-);
+export const qoderIntlAdapter: ProviderAdapter = createQoderAdapter('global');

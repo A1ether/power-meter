@@ -52,7 +52,13 @@ export interface CreditPeg {
 /** 平台积分的官方单价表（2026-10-25 查证，按「积分包 / 增购积分」口径）。 */
 export const CREDIT_PEGS: ReadonlyArray<{
   provider: string;
-  /** 同一平台不同站点单价不同（Qoder 国内站 / 国际站）时按站点取 */
+  /**
+   * 同一平台不同站点单价不同时按站点取。
+   *
+   * Qoder 拆分站点后不再用它——国内站 / 国际站已是两个 provider id
+   * （`qoder` / `qoder-intl`），条目直接按 provider 命中；保留该字段供日后
+   * 出现「同一平台按 region 定价」的情况使用。
+   */
   region?: 'cn' | 'global';
   peg: CreditPeg;
 }> = [
@@ -87,7 +93,6 @@ export const CREDIT_PEGS: ReadonlyArray<{
   },
   {
     provider: 'qoder',
-    region: 'cn',
     peg: {
       cnyPerUnit: 59 / 2000,
       official: 'Qoder CN 专业版 ¥59 / 月含 2,000 Credits（docs.qoder.cn 计费说明；Pro+ ¥169/6,000、Ultra ¥559/20,000 折合约 ¥0.028/Credit）',
@@ -96,8 +101,9 @@ export const CREDIT_PEGS: ReadonlyArray<{
     },
   },
   {
-    provider: 'qoder',
-    region: 'global',
+    // 国际站已是独立平台（provider id = qoder-intl，见 src/providers/qoder.ts），
+    // 不再用 region 区分：条目与平台 id 一一对应，取数结果里的 provider 直接命中
+    provider: 'qoder-intl',
     peg: {
       cnyPerUnit: (20 / 1500) * USD_CNY,
       official: `Qoder 国际站 个人资源包 $20 / 1,500 Credits（docs.qoder.com/zh/account/pricing），按 1 USD = ¥${USD_CNY} 折算`,

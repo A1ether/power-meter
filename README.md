@@ -47,7 +47,8 @@ npm start
 | 平台 | 登录方式 | 说明 |
 | --- | --- | --- |
 | CodeBuddy | 手机扫码 / 新窗口打开链接 | 用 CodeBuddy 客户端或微信完成授权 |
-| Qoder | 手机 Qoder App 扫码 / 新窗口打开链接 | 登录块里先选「国内站 / 国际站」再扫码；令牌按站点写入 `QODER_*` 或 `QODER_GLOBAL_*` |
+| Qoder 国内版 | 手机 Qoder App 扫码 / 新窗口打开链接 | 目标固定 `qoder.com.cn`；令牌写入 `QODER_*` |
+| Qoder 国际版 | 手机 Qoder App 扫码 / 新窗口打开链接 | 目标固定 `qoder.com`；令牌写入 `QODER_GLOBAL_*`（国际站设备流未实测，网页端登录更稳） |
 | Trae | 新窗口打开链接 | 回调固定 `127.0.0.1`，必须在本机浏览器完成 |
 
 授权成功后服务端会先验证取数、再把令牌写入 `.env` 并注册账号，**一个账号一张卡片**；
@@ -59,7 +60,8 @@ npm start
 npm run chrome:debug     # ① 弹出一个调试专用 Chrome 窗口
                          #   ② 在里面登录 Qoder / Trae / CodeBuddy / CodeArts / MiniMax Code
                          #      并各自打开「用量 / 账单」页面（MiniMax Code 停在 agent.minimax.cn；
-                         #      Qoder 国际站账号停在 qoder.com/account/usage，抓取时加 --site global）
+                         #      Qoder 国际站账号停在 qoder.com/account/usage，用
+                         #      npm run capture -- qoder-intl 抓取）
 npm run capture          # ③ 自动抓取各平台的登录态，写入 .env
 npm run probe            # ④ 验证取数是否正常
 # 刷新 http://127.0.0.1:48213
@@ -80,7 +82,8 @@ npm run probe            # ④ 验证取数是否正常
 | `npm run chrome:debug` | 启动带调试端口的独立 Chrome（抓取凭证用）|
 | `npm run capture` | **自动抓取各平台的登录态并写入 `.env`** |
 | `npm run capture -- codebuddy --slot 2` | 抓第二个账号的登录态，写进 `CODEBUDDY_COOKIE_2`（多账号，见下文）|
-| `npm run capture -- qoder --site global` | 抓 Qoder 国际站（qoder.com）登录态，写进 `QODER_GLOBAL_COOKIE`（国内站仍用 `QODER_COOKIE`）|
+| `npm run capture -- qoder-intl` | 抓 Qoder 国际站（qoder.com）登录态，写进 `QODER_GLOBAL_COOKIE`（国内站用 `npm run capture -- qoder` → `QODER_COOKIE`）|
+| `npm run migrate:qoder-sites --dry-run` | 预览 Qoder 旧站点配置（`options.site`）的迁移；去掉 `--dry-run` 才写入（自动备份到 `.run/`）|
 | `npm run capture -- --dry-run` | 只预览，不写文件 |
 | `npm run probe` | **命令行探测取数是否正常**（改配置后先跑这个最快）|
 | `npm run probe -- qoder trae` | 只探测指定平台 |
@@ -296,11 +299,11 @@ interface ProviderSnapshot {
 
 ```jsonc
 {
-  "provider": "qoder",              // 平台 id，支持别名，见下表
-  "displayName": "Qoder",            // 可选，自定义展示名
+  "provider": "qoder-intl",         // 平台 id，支持别名，见下表
+  "displayName": "Qoder 国际版",      // 可选，自定义展示名
   "enabled": true,
-  "credentials": { "cookie": "${QODER_COOKIE}" },  // 敏感值，建议引用环境变量
-  "options": { "site": "cn" }        // 非敏感配置
+  "credentials": { "cookie": "${QODER_GLOBAL_COOKIE}" },  // 敏感值，建议引用环境变量
+  "options": {}                      // 非敏感配置
 }
 ```
 
@@ -313,7 +316,8 @@ interface ProviderSnapshot {
 
 | 平台 | `provider` | 需要的凭证 | 关键 `options` |
 | --- | --- | --- | --- |
-| Qoder | `qoder` / `qoder.cn` / `qoder-global` | `cookie`（国内站 `QODER_COOKIE`；国际站 `QODER_GLOBAL_COOKIE`）<br>或扫码登录写入的 `accessToken` + `refreshToken`（国内站 `QODER_ACCESS_TOKEN` / `QODER_REFRESH_TOKEN`；国际站加 `QODER_GLOBAL_` 前缀） | `site: "cn"`（国内站，默认）/ `"global"`（国际站 qoder.com）/ `"auto"`（自动探测并回退）；显式站点失败后要自动换站再加 `fallbackSite: true`。两种凭证模式都会拆积分批次：Cookie 模式给出逐包明细（`quota_detail[]`），令牌模式只能给出账户级分桶 + 可选的 `dedicated_resource_packages[]`（逐包明细需 Cookie） |
+| Qoder 国内版 | `qoder` / `qoder.cn` | `cookie`（`QODER_COOKIE`）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`QODER_ACCESS_TOKEN` / `QODER_REFRESH_TOKEN`） | 站点固定 `qoder.com.cn`，无站点选项；`origin` 可覆盖为自定义域名/代理。两种凭证模式都会拆积分批次：Cookie 模式给出逐包明细（`quota_detail[]`），令牌模式只能给出账户级分桶 + 可选的 `dedicated_resource_packages[]`（逐包明细需 Cookie） |
+| Qoder 国际版 | `qoder-intl` / `qoder.com` / `qoder-global` | `cookie`（`QODER_GLOBAL_COOKIE`）<br>或登录写入的 `accessToken` + `refreshToken`（`QODER_GLOBAL_ACCESS_TOKEN` / `QODER_GLOBAL_REFRESH_TOKEN`） | 站点固定 `qoder.com`，无站点选项；`origin` 可覆盖。积分批次口径与国内版一致 |
 | Trae | `trae` / `trae.cn` | `cookie`<br>或「打开链接登录」写入的 `accessToken` + `refreshToken` + `deviceKey`（`TRAE_ACCESS_TOKEN` / `TRAE_REFRESH_TOKEN` / `TRAE_DEVICE_KEY`） | JWT 由 Cookie 自动续签；令牌模式由 `deviceKey` 签名续期 |
 | CodeBuddy | `codebuddy` | `cookie`（**必须含 `www` 子域**）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`CODEBUDDY_ACCESS_TOKEN` / `CODEBUDDY_REFRESH_TOKEN`）| — |
 | CodeArts | `codearts` | **网页端登录（推荐，一键添加）**：卡片上点「网页端登录」，在自动打开的调试 Chrome 里登录华为云即可，Cookie 自动落 `CODEARTS_COOKIE` 并由 `npm run codearts:refresh` 定时续期<br>`accessKey` + `secretKey`（长期有效，多账号路径）<br>`cookie`（兼容，会话过期需重抓） | 可选 `authMode: "auto" \| "aksk" \| "cookie"`、`resourceType`、`region` |
@@ -332,7 +336,7 @@ interface ProviderSnapshot {
 
 推荐直接用卡片上的「＋ 登录 / 添加账号」扫码：另一个账号登录后会**新增**一张卡片
 （登录身份按平台账号 ID 去重，同一账号重复登录只更新凭证）。
-下文的 Cookie 槽位方式仍然可用，适合国际站或无法扫码的场景。
+下文的 Cookie 槽位方式仍然可用，适合 Qoder 国际版或无法扫码的场景。
 
 ```bash
 npm run capture -- codebuddy --slot 2    # ② 抓第二个账号（在调试 Chrome 里登录它）→ CODEBUDDY_COOKIE_2

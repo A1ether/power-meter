@@ -6,7 +6,7 @@ import { a1etheropenaiAdapter } from './a1etheropenai.js';
 import { demoAdapters } from './demo.js';
 import { minimaxAdapter } from './minimax.js';
 import { sessionApiAdapters } from './presets.js';
-import { qoderAdapter } from './qoder.js';
+import { qoderAdapter, qoderIntlAdapter } from './qoder.js';
 import { traeAdapter } from './trae.js';
 
 /**
@@ -17,6 +17,7 @@ const REGISTRY = new Map<string, ProviderAdapter>();
 
 for (const adapter of [
   qoderAdapter,
+  qoderIntlAdapter,
   traeAdapter,
   codebuddyAdapter,
   codeartsAdapter,
@@ -34,8 +35,12 @@ export function listAdapters(): ProviderAdapter[] {
 
 /**
  * 按 provider id 找适配器，支持：
- *   - 精确匹配（qoder / trae / codebuddy / codearts / custom / demo:qoder ...）
- *   - 别名回退：qoder-cn / qoder.com.cn -> qoder，trae-cn -> trae
+ *   - 精确匹配（qoder / qoder-intl / trae / codebuddy / codearts / custom / demo:qoder ...）
+ *   - 别名回退：qoder-cn / qoder.com.cn -> qoder，qoder-global / qoder.com -> qoder-intl，
+ *     trae-cn -> trae
+ *
+ * Qoder 的两个站点是两个平台（`qoder` 国内版 / `qoder-intl` 国际版），
+ * 别名按域名归属分流，不再有「一个平台带站点选项」的写法。
  */
 export function resolveAdapter(providerId: string): ProviderAdapter | null {
   const normalized = providerId.trim().toLowerCase();
@@ -49,11 +54,11 @@ export function resolveAdapter(providerId: string): ProviderAdapter | null {
 }
 
 const ALIASES: Record<string, string> = {
-  'qoder.com': 'qoder',
+  'qoder.com': 'qoder-intl',
   'qoder.com.cn': 'qoder',
   'qoder.cn': 'qoder',
   'qoder-cn': 'qoder',
-  'qoder-global': 'qoder',
+  'qoder-global': 'qoder-intl',
   'trae.cn': 'trae',
   'trae.com.cn': 'trae',
   'trae-cn': 'trae',
