@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { ensureDebugChrome, openCookieCollector, type CookieCollector } from '../lib/cdp.js';
 import { assertBusinessOk, fetchJson, HttpError } from '../lib/http.js';
 import { clamp, firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
 import { localDateKey, startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
@@ -18,41 +19,116 @@ import {
   splitByExpiry,
   type ProbeContext,
   type ProviderAdapter,
+  type ProviderLogin,
 } from './base.js';
 
 /**
- * CodeBuddy（codebuddy.cn，腾讯云代码助手）
+ * CodeBuddy（国内版 www.codebuddy.cn / 国际版 codebuddy.ai，即 WorkBuddy）
  *
  * 接口是通过 npm run capture 抓包定位的（GitHub 上没有任何现成实现），已实测：
- *   ① POST https://www.codebuddy.cn/billing/meter/get-user-resource-summary
+ *   ① POST {billing}/billing/meter/get-user-resource-summary
  *      → data.Packages[]: CycleTotalCapacity / CycleRemainCapacity / CycleUsedCapacity
  *        （字符串形式的数字，容量单位 capacityUnit 通常为 credits）
- *   ② POST https://www.codebuddy.cn/billing/meter/get-user-resource-free-packages
+ *   ② POST {billing}/billing/meter/get-user-resource-free-packages
  *      → data.Accounts[]: PackageName / CycleStartTime / CycleEndTime / DeductionEndTime
  *        / CycleCapacitySize / CycleCapacityRemain（含 Precise 精确值）
  *
- * 必需请求头：Cookie（**必须包含 www.codebuddy.cn 子域下的会话 Cookie**）、
+ * 必需请求头：Cookie（**必须包含计费域 www 子域下的会话 Cookie**）、
  *            x-client-platform: web。
- * 只发送 .codebuddy.cn 父域 Cookie 会得到 401——这是实测踩过的坑。
+ * 只发送父域 Cookie 会得到 401——这是实测踩过的坑。
  *
  * 口径：①给账户级汇总（余额取它），②给各资源包的周期与到期时间。
  * 两者粒度不同（②是包内某个子资源的周期额度），因此批次标记 basis='granted'，
  * 只用于「最快到期」，不参与汇总，避免与余额重复计算。
+ *
+ * 站点拆分（2026-10-25）：国内版 `codebuddy` 与国际版 `codebuddy-intl` 是两个
+ * 独立平台，账号体系、登录态、`.env` 变量完全隔离（与 Qoder 国内版 / 国际版
+ * 同一拆分思路）。差异收敛在 CODEBUDDY_SITES 元信息表，解析逻辑全站共用。
  */
 
-const CB_SUMMARY_URL = 'https://www.codebuddy.cn/billing/meter/get-user-resource-summary';
-const CB_PACKAGES_URL = 'https://www.codebuddy.cn/billing/meter/get-user-resource-free-packages';
-const CB_PAID_PACKAGES_URL = 'https://www.codebuddy.cn/billing/meter/get-user-resource-paid-packages';
-const CB_REQUEST_USAGE_URL = 'https://www.codebuddy.cn/billing/meter/get-user-request-usage';
-const CB_GIFT_URL = 'https://www.codebuddy.cn/billing/meter/check-gift-claimed';
-const CB_TIMEOUT_FALLBACK = 12_000;
+/* ------------------------------ 站点体系 ------------------------------ */
+
+export type CodeBuddySiteId = 'cn' | 'global';
+
+interface CodeBuddySiteMeta {
+  id: CodeBuddySiteId;
+  /** 站点中文名（note / 失败文案里给人看） */
+  label: string;
+  /** 计费域（网页端接口 Origin / Referer / Cookie 域判定都按它） */
+  billingOrigin: string;
+  /** 插件后端（登录认证 + 令牌模式明细的首选主机） */
+  pluginBase: string;
+  /**
+   * 扫码登录 `/v2/plugin/auth/state` 的 `platform` 参数。
+   * 国内版桌面端当前取 `workbuddy`，国际版取 `workbuddy-ai`
+   * （多个独立实现交叉验证：yetone/magpie、token-monitor、workbuddy-switch-plus 等）。
+   */
+  platform: string;
+  /** 用量页（卡片「每日用量」跳转 + 网页端登录打开的页面） */
+  usageUrl: string;
+  /** 该站点偏好的 Accept-Language：国际站以英文优先 */
+  acceptLanguage: string;
+  /**
+   * 该站点的**登录态** Cookie 名（网页端登录判据之一）。
+   *
+   * 留空 = 「未实测」：此时仅靠功能性判据（页面自身请求身份接口得到 2xx）兜底，
+   * 避免用一个没验证过的名字把用户永久卡在 waiting（与 Qoder 国际站同一策略）。
+   */
+  loginCookieNames: string[];
+  /** `.env` 变量名（第 N 个账号由 account-store 追加 `_N` 后缀） */
+  envNames: Record<string, string>;
+}
+
+const CODEBUDDY_SITES: Record<CodeBuddySiteId, CodeBuddySiteMeta> = {
+  cn: {
+    id: 'cn',
+    label: '国内站',
+    billingOrigin: 'https://www.codebuddy.cn',
+    pluginBase: 'https://copilot.tencent.com',
+    platform: 'workbuddy',
+    usageUrl: 'https://www.codebuddy.cn/profile/plans-usage',
+    acceptLanguage: 'zh-CN',
+    loginCookieNames: [],
+    envNames: {
+      cookie: 'CODEBUDDY_COOKIE',
+      accessToken: 'CODEBUDDY_ACCESS_TOKEN',
+      refreshToken: 'CODEBUDDY_REFRESH_TOKEN',
+    },
+  },
+  global: {
+    id: 'global',
+    label: '国际站',
+    billingOrigin: 'https://www.codebuddy.ai',
+    // 国际版认证主机与国内版完全分离（多个独立实现实测一致）；
+    // 若国际站后续换域名，用 CODEBUDDY_GLOBAL_PLUGIN_BASE 覆盖
+    pluginBase: process.env.CODEBUDDY_GLOBAL_PLUGIN_BASE?.trim() || 'https://www.workbuddy.ai',
+    platform: 'workbuddy-ai',
+    usageUrl: 'https://www.codebuddy.ai/profile/plans-usage',
+    acceptLanguage: 'en-US,en;q=0.9,zh-CN;q=0.8',
+    loginCookieNames: [],
+    envNames: {
+      cookie: 'CODEBUDDY_GLOBAL_COOKIE',
+      accessToken: 'CODEBUDDY_GLOBAL_ACCESS_TOKEN',
+      refreshToken: 'CODEBUDDY_GLOBAL_REFRESH_TOKEN',
+    },
+  },
+};
+
+/** 把 URL 解析成主机名；解析失败返回空串 */
+function hostnameOf(value: string): string {
+  try {
+    return new URL(value).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
 
 /**
- * 登录（腾讯插件认证）与令牌取数端点。
+ * 登录（腾讯插件认证）与令牌取数的路径模板。
  *
  * 协议来自官方 WorkBuddy 客户端的实测行为（workbuddy2api 的 Go 实现与
  * workbuddy-manager 的 Python 实现一致）：
- *   ① POST {chat}/v2/plugin/auth/state?platform=CLI → { state, authUrl }
+ *   ① POST {chat}/v2/plugin/auth/state?platform=<站点 platform> → { state, authUrl }
  *   ② GET  {chat}/v2/plugin/auth/token?state=       → { accessToken, refreshToken, expiresIn, domain }
  *   ③ GET  {chat}/v2/plugin/login/account?state=    → { uid, nickname, enterpriseId }
  *   ④ POST {chat}/v2/plugin/auth/token/refresh      → 新 accessToken（refreshToken 走 X-Refresh-Token 头）
@@ -60,10 +136,19 @@ const CB_TIMEOUT_FALLBACK = 12_000;
  *
  * 版本号集中在这里：上游改版时只需要改这两个常量或设环境变量覆盖。
  */
-const CB_PLUGIN_BASE = 'https://copilot.tencent.com';
-const CB_BILLING_ORIGIN = 'https://www.codebuddy.cn';
-const CB_USER_RESOURCE_URL = `${CB_BILLING_ORIGIN}/v2/billing/meter/get-user-resource`;
+const CB_TIMEOUT_FALLBACK = 12_000;
 const CB_LOGIN_TTL_MS = 15 * 60 * 1000;
+/** 网页端登录（CDP 抓取）：与 Qoder 同一套节奏常量 */
+const CB_WEB_POLL_INTERVAL_MS = 2_000;
+const CB_WEB_RELOAD_IDLE_MS = 20_000;
+const CB_WEB_RELOAD_MIN_INTERVAL_MS = 15_000;
+const CB_WEB_RELOAD_MAX = 2;
+const CB_WEB_LOGIN_TTL_MS = 10 * 60 * 1000;
+/**
+ * 网页端登录的功能性身份判据：页面自己请求该路径拿到 2xx 即视为已登录。
+ * 待确认：国际站的身份接口路径若与国内站不同，需在站点表里按站点分解。
+ */
+const CB_WEB_IDENTITY_PATH = '/billing/meter/get-user-resource-summary';
 
 function cbClientVersion(): string {
   return process.env.CODEBUDDY_CLIENT_VERSION?.trim() || '5.5.4';
@@ -102,17 +187,17 @@ function cbDeviceHeaders(uid: string): Record<string, string> {
   };
 }
 
-/** 登录 / 刷新接口的通用头 */
-function cbPluginHeaders(token = '', uid = ''): Record<string, string> {
+/** 登录 / 刷新接口的通用头（Origin / Referer / Accept-Language 跟着站点走） */
+function cbPluginHeaders(site: CodeBuddySiteMeta, token = '', uid = ''): Record<string, string> {
   return {
     'Content-Type': 'application/json',
     Accept: 'application/json',
-    'Accept-Language': 'zh-CN',
+    'Accept-Language': site.acceptLanguage,
     'X-Requested-With': 'XMLHttpRequest',
     'X-CodeBuddy-Request': '1',
     'User-Agent': cbChatUserAgent(),
-    Origin: CB_BILLING_ORIGIN,
-    Referer: `${CB_BILLING_ORIGIN}/`,
+    Origin: site.billingOrigin,
+    Referer: `${site.billingOrigin}/`,
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
     ...cbDeviceHeaders(uid),
   };
@@ -120,10 +205,11 @@ function cbPluginHeaders(token = '', uid = ''): Record<string, string> {
 
 /** billing 域头：在通用头之上补身份字段与单段 UA */
 function cbBillingHeaders(
+  site: CodeBuddySiteMeta,
   token: string,
   identity: { uid?: string; enterpriseId?: string; domain?: string },
 ): Record<string, string> {
-  const headers = cbPluginHeaders(token, identity.uid ?? '');
+  const headers = cbPluginHeaders(site, token, identity.uid ?? '');
   headers['User-Agent'] = cbBillingUserAgent();
   if (identity.uid) headers['X-User-Id'] = identity.uid;
   if (identity.enterpriseId) {
@@ -178,20 +264,24 @@ function cbIdentity(account: AccountConfig): {
 }
 
 /**
- * 网页域（www.codebuddy.cn）的令牌头：Bearer + 身份头 + X-Client-Platform。
+ * 网页域（billingOrigin）的令牌头：Bearer + 身份头 + X-Client-Platform。
  *
  * 形态对齐 buddyToken 的实测实现（`workbuddy-api.js` 的 authHeaders）：
  * 网页域这组接口既接受会话 Cookie，也接受插件签发的 Bearer 令牌。
  */
-function cbWebTokenHeaders(account: AccountConfig, token: string): Record<string, string> {
+function cbWebTokenHeaders(
+  site: CodeBuddySiteMeta,
+  account: AccountConfig,
+  token: string,
+): Record<string, string> {
   const { uid, enterpriseId, domain } = cbIdentity(account);
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
     Accept: 'application/json',
     'X-Client-Platform': 'web',
-    Origin: CB_BILLING_ORIGIN,
-    Referer: `${CB_BILLING_ORIGIN}/profile/plans-usage`,
+    Origin: site.billingOrigin,
+    Referer: `${site.billingOrigin}/profile/plans-usage`,
   };
   if (uid) headers['X-User-Id'] = uid;
   if (enterpriseId) {
@@ -292,20 +382,21 @@ export function parseCodeBuddyTokenPacks(body: unknown): CbTokenPack[] {
 
 /** 用 refreshToken 换新令牌；新值由调用方写回 `.env` */
 async function cbRefreshToken(
+  site: CodeBuddySiteMeta,
   account: AccountConfig,
   ctx: ProbeContext,
   refreshToken: string,
 ): Promise<{ accessToken: string; refreshToken: string | null }> {
   const accessToken = cred(account, ctx, ['accessToken', 'token']);
   const uid = optString(account, 'uid');
-  const headers = cbPluginHeaders(accessToken, uid);
+  const headers = cbPluginHeaders(site, accessToken, uid);
   headers['X-Refresh-Token'] = refreshToken;
   headers['X-Auth-Refresh-Source'] = 'plugin';
   const enterpriseId = optString(account, 'enterpriseId');
   if (enterpriseId) headers['X-Enterprise-Id'] = enterpriseId;
   if (uid) headers['X-User-Id'] = uid;
 
-  const { body } = await fetchJson(`${CB_PLUGIN_BASE}/v2/plugin/auth/token/refresh`, {
+  const { body } = await fetchJson(`${site.pluginBase}/v2/plugin/auth/token/refresh`, {
     method: 'POST',
     headers,
     timeoutMs: ctx.timeoutMs || CB_TIMEOUT_FALLBACK,
@@ -328,6 +419,7 @@ async function cbRefreshToken(
  * 前者对齐上游请求形态，后者要对账展示，不能互相统一。
  */
 async function cbFetchTokenPacks(
+  site: CodeBuddySiteMeta,
   account: AccountConfig,
   ctx: ProbeContext,
   token: string,
@@ -342,10 +434,10 @@ async function cbFetchTokenPacks(
     PackageEndTimeRangeEnd: cbLocalStamp(now + 101 * 365 * 86_400_000),
   });
   const { body: responseBody } = await fetchJson(
-    optString(account, 'billingEndpoint') || CB_USER_RESOURCE_URL,
+    optString(account, 'billingEndpoint') || `${site.billingOrigin}/v2/billing/meter/get-user-resource`,
     {
       method: 'POST',
-      headers: cbBillingHeaders(token, {
+      headers: cbBillingHeaders(site, token, {
         uid: optString(account, 'uid'),
         enterpriseId: optString(account, 'enterpriseId'),
         domain: optString(account, 'domain'),
@@ -377,6 +469,8 @@ const cbRefreshCache = new WeakMap<AccountConfig, { accessToken: string }>();
  * 写回失败不阻断取数，只是下次刷新会再试。
  */
 async function cbWithToken<T>(
+  site: CodeBuddySiteMeta,
+  adapter: ProviderAdapter,
   account: AccountConfig,
   ctx: ProbeContext,
   token: string,
@@ -390,8 +484,8 @@ async function cbWithToken<T>(
     const refreshToken = cred(account, ctx, ['refreshToken', 'refresh_token']);
     if (!refreshToken) throw error;
 
-    ctx.log('CodeBuddy 登录令牌已失效，尝试用 refreshToken 续期');
-    const refreshed = await cbRefreshToken(account, ctx, refreshToken);
+    ctx.log(`${adapter.displayName} 登录令牌已失效，尝试用 refreshToken 续期`);
+    const refreshed = await cbRefreshToken(site, account, ctx, refreshToken);
     cbRefreshCache.set(account, { accessToken: refreshed.accessToken });
     if (ctx.persistCredentials) {
       const patch: Record<string, string> = { accessToken: refreshed.accessToken };
@@ -399,7 +493,9 @@ async function cbWithToken<T>(
       try {
         await ctx.persistCredentials(patch);
       } catch (persistError) {
-        ctx.log(`CodeBuddy 新令牌写回 .env 失败（不影响本次取数）：${(persistError as Error).message}`);
+        ctx.log(
+          `${adapter.displayName} 新令牌写回 .env 失败（不影响本次取数）：${(persistError as Error).message}`,
+        );
       }
     }
     return run(refreshed.accessToken);
@@ -411,12 +507,14 @@ async function cbWithToken<T>(
  * 刷新写回失败不阻断本次取数（只是下次刷新会再试）。
  */
 async function cbProbeWithToken(
+  site: CodeBuddySiteMeta,
+  adapter: ProviderAdapter,
   account: AccountConfig,
   ctx: ProbeContext,
   token: string,
 ): Promise<ProviderSnapshot> {
-  const packs = await cbWithToken(account, ctx, token, (accessToken) =>
-    cbFetchTokenPacks(account, ctx, accessToken),
+  const packs = await cbWithToken(site, adapter, account, ctx, token, (accessToken) =>
+    cbFetchTokenPacks(site, account, ctx, accessToken),
   );
 
   const limit = Math.round(packs.reduce((sum, pack) => sum + Math.max(0, pack.size), 0) * 100) / 100;
@@ -453,7 +551,7 @@ async function cbProbeWithToken(
   });
 
   return buildSnapshot({
-    adapter: codebuddyAdapter,
+    adapter,
     account,
     status: 'ok',
     now: ctx.now,
@@ -502,6 +600,7 @@ function parsePackageGrants(body: unknown): UsageRecord[] {
  * 没有这个路径（404/405），再按网页域形态试一次。
  */
 async function cbTokenRequestUsage(
+  site: CodeBuddySiteMeta,
   account: AccountConfig,
   ctx: ProbeContext,
   token: string,
@@ -510,7 +609,7 @@ async function cbTokenRequestUsage(
   const startDay = localDateKey(startOfDay(ctx.now) - 86_400_000);
   const endDay = localDateKey(ctx.now);
   const pageSize = 500;
-  const tokenHeaders = cbWebTokenHeaders(account, token);
+  const tokenHeaders = cbWebTokenHeaders(site, account, token);
 
   const fetchPages = async (base: string): Promise<UsageRecord[]> => {
     const url = `${base}/billing/meter/get-user-request-usage`;
@@ -544,12 +643,12 @@ async function cbTokenRequestUsage(
   };
 
   try {
-    return await fetchPages(CB_PLUGIN_BASE);
+    return await fetchPages(site.pluginBase);
   } catch (error) {
     const missingPath = error instanceof HttpError && (error.status === 404 || error.status === 405);
     if (!cbIsAuthError(error) && !missingPath) throw error;
-    ctx.log('CodeBuddy 插件后端用量明细不可用，改试网页域形态');
-    return fetchPages(CB_BILLING_ORIGIN);
+    ctx.log('插件后端用量明细不可用，改试网页域形态');
+    return fetchPages(site.billingOrigin);
   }
 }
 
@@ -562,21 +661,23 @@ async function cbTokenRequestUsage(
  *     任一来源失败即整体放弃 `grant` 覆盖，避免「只统计一半还标 upstream」。
  */
 async function cbTokenLedger(
+  site: CodeBuddySiteMeta,
+  adapter: ProviderAdapter,
   account: AccountConfig,
   ctx: ProbeContext,
   token: string,
 ): Promise<UsageLedger> {
-  return cbWithToken(account, ctx, token, async (accessToken) => {
-    const records = await cbTokenRequestUsage(account, ctx, accessToken);
+  return cbWithToken(site, adapter, account, ctx, token, async (accessToken) => {
+    const records = await cbTokenRequestUsage(site, account, ctx, accessToken);
 
     // 资源包发放：与 probe 的令牌模式同一接口、同一时间窗
     let grantCovered = true;
     try {
       const response = await fetchJson(
-        optString(account, 'billingEndpoint') || CB_USER_RESOURCE_URL,
+        optString(account, 'billingEndpoint') || `${site.billingOrigin}/v2/billing/meter/get-user-resource`,
         {
           method: 'POST',
-          headers: cbBillingHeaders(accessToken, cbIdentity(account)),
+          headers: cbBillingHeaders(site, accessToken, cbIdentity(account)),
           body: JSON.stringify({
             PageNumber: 1,
             PageSize: 100,
@@ -593,14 +694,14 @@ async function cbTokenLedger(
       records.push(...parsePackageGrants(response.body));
     } catch (error) {
       grantCovered = false;
-      ctx.log(`CodeBuddy 令牌模式资源包发放明细获取失败（退回本地采样）：${(error as Error).message}`);
+      ctx.log(`${adapter.displayName} 令牌模式资源包发放明细获取失败（退回本地采样）：${(error as Error).message}`);
     }
 
     // 礼包只对网页会话开放：令牌被拒时同样只放弃 grant 覆盖
     try {
-      const { body } = await fetchJson(CB_GIFT_URL, {
+      const { body } = await fetchJson(`${site.billingOrigin}/billing/meter/check-gift-claimed`, {
         method: 'POST',
-        headers: cbWebTokenHeaders(account, accessToken),
+        headers: cbWebTokenHeaders(site, account, accessToken),
         body: '{}',
         timeoutMs: ctx.timeoutMs || CB_TIMEOUT_FALLBACK,
       });
@@ -614,7 +715,7 @@ async function cbTokenLedger(
       }
     } catch (error) {
       grantCovered = false;
-      ctx.log(`CodeBuddy 令牌模式礼包明细获取失败（退回本地采样）：${(error as Error).message}`);
+      ctx.log(`${adapter.displayName} 令牌模式礼包明细获取失败（退回本地采样）：${(error as Error).message}`);
     }
 
     return { records, covers: { use: true, grant: grantCovered } };
@@ -708,177 +809,28 @@ export function parseCodeBuddyPackages(body: unknown): CodeBuddyPack[] {
   return packs;
 }
 
-export const codebuddyAdapter: ProviderAdapter = {
-  id: 'codebuddy',
-  displayName: 'CodeBuddy',
-  region: 'cn',
-  dashboardUrl: 'https://www.codebuddy.cn/profile/plans-usage',
-  usageUrl: 'https://www.codebuddy.cn/profile/plans-usage',
-  requiredCredentialKeys: ['cookie'],
-  /**
-   * 两种凭证形态并存：手工 Cookie（历史路径）或插件登录令牌。
-   * 登录产出的变量名固定为 `CODEBUDDY_ACCESS_TOKEN` / `CODEBUDDY_REFRESH_TOKEN`，
-   * 与 `.env.example` 的占位符一致；第 2 个账号自动用 `_2` 槽位。
-   */
-  envNames: {
-    accessToken: 'CODEBUDDY_ACCESS_TOKEN',
-    refreshToken: 'CODEBUDDY_REFRESH_TOKEN',
-  },
-  // accessToken 是取数必需；refreshToken 只影响续期，缺失时仍可工作到令牌过期
-  isConfigured: (account) =>
-    Boolean(account.credentials.cookie) || Boolean(account.credentials.accessToken),
-  credentialHint:
-    '登录 www.codebuddy.cn 后，在 DevTools 里复制任意 www.codebuddy.cn 请求的 Cookie 头' +
-    '（务必包含 www 子域下的会话 Cookie），填入 credentials.cookie（也可用 npm run capture 自动抓取）；' +
-    '或在看板上点「扫码登录」自动写入插件令牌。',
-  /**
-   * 多账号：一个账号一份 Cookie，各自独立取数、各自一张卡片。
-   *
-   * 不声明 `groupAccounts`：合并卡片会把 `credits/windows/nextExpiryAt` 清空
-   * （见 src/aggregate.ts 的 finalizeCard），而 CodeBuddy 的积分包带真实到期时间，
-   * 合并后会从「最快到期」时间线与卡片批次列表里消失——与项目核心目标相悖。
-   *
-   * 第二个账号的 Cookie 抓取：`npm run capture -- codebuddy --slot 2`
-   * （写进 .env 的 CODEBUDDY_COOKIE_2），再用看板按钮或 `npm run account` 注册。
-   */
-  manageAccounts: true,
-  manageFields: [
-    {
-      key: 'cookie',
-      label: 'Cookie',
-      placeholder:
-        '登录 www.codebuddy.cn → DevTools → 任意 www.codebuddy.cn 请求 → Headers → 复制 Cookie 整段值',
-      hint: '必须是 www.codebuddy.cn 子域下的会话 Cookie，只复制父域 .codebuddy.cn 会得到 401。',
-      multiline: true,
-    },
-  ],
-  manageHint:
-    'Cookie 会先真实调用一次用量接口验证，通过了才写入本机 .env（新槽位）与 accounts.json；写入前自动备份到 .run/。',
-  /**
-   * 用量 + 获取明细（v2）：
-   *   - 用量：`get-user-request-usage` 逐笔（`requestTime` + `credit`，支持日期区间与翻页），
-   *     与页面「使用明细」同源；
-   *   - 获取：资源包当前周期发放（`CycleStartTime` + `CycleCapacitySizePrecise`）+
-   *     礼包（`claimed_at` + `credit_num`，只回最近一次领取）。任一获取来源失败即整体
-   *     退回本地采样（不标 upstream），避免「只统计了一半还说完整」。
-   *
-   * 凭证分派：有 Cookie 走会话路径（历史行为不变）；否则走令牌路径
-   * （与 `probe` 的令牌分支一致，接口同时接受 Bearer）。
-   */
-  async fetchUsageLedger(account: AccountConfig, ctx: ProbeContext): Promise<UsageLedger | null> {
-    const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
-    if (!cookie) {
-      const accessToken = cred(account, ctx, ['accessToken', 'token']);
-      if (!accessToken) return null;
-      return cbTokenLedger(account, ctx, accessToken);
-    }
-    const timeoutMs = ctx.timeoutMs || CB_TIMEOUT_FALLBACK;
-    const headers: Record<string, string> = {
-      Cookie: cookie,
-      'Content-Type': 'application/json',
-      Origin: 'https://www.codebuddy.cn',
-      Referer: 'https://www.codebuddy.cn/profile/plans-usage',
-      'x-client-platform': 'web',
-    };
-    const records: UsageRecord[] = [];
-
-    // ① 逐笔用量：本地日区间，按页拉取（上限 10 页 × 100）
-    const startDay = localDateKey(startOfDay(ctx.now) - 86_400_000);
-    const endDay = localDateKey(ctx.now);
-    const pageSize = 100;
-    for (let pageNum = 1; pageNum <= 10; pageNum += 1) {
-      const { body } = await fetchJson(CB_REQUEST_USAGE_URL, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          startTime: `${startDay} 00:00:00`,
-          endTime: `${endDay} 23:59:59`,
-          pageNum,
-          pageSize,
-        }),
-        timeoutMs,
-      });
-      assertBusinessOk(body);
-      const data = isRecord(body) ? pick(body, 'data') : undefined;
-      const list = isRecord(data) ? pick(data, 'data') : undefined;
-      if (!Array.isArray(list) || list.length === 0) break;
-      for (const raw of list) {
-        if (!isRecord(raw)) continue;
-        const at = toIso(pick(raw, 'requestTime', 'request_time'));
-        const amount = firstNumber(pick(raw, 'credit', 'credits'));
-        if (!at || amount === null || amount <= 0) continue;
-        records.push({ at: Date.parse(at), kind: 'use', amount });
-      }
-      if (list.length < pageSize) break;
-    }
-
-    // ②③ 获取记录：任一步失败即放弃覆盖声明（grant 回退本地采样）
-    let grantCovered = true;
-    try {
-      const summaryResponse = await fetchJson(optString(account, 'endpoint') || CB_SUMMARY_URL, {
-        method: 'POST',
-        headers,
-        body: '{}',
-        timeoutMs,
-      });
-      assertBusinessOk(summaryResponse.body);
-      const summary = parseCodeBuddySummary(summaryResponse.body);
-      const packageBody = JSON.stringify({
-        PageNumber: 1,
-        PageSize: 200,
-        Status: [0],
-        PackageCodes: summary.packageCodes,
-        NeedInUsage: true,
-      });
-      for (const url of [CB_PACKAGES_URL, CB_PAID_PACKAGES_URL]) {
-        try {
-          const { body } = await fetchJson(url, { method: 'POST', headers, body: packageBody, timeoutMs });
-          records.push(...parsePackageGrants(body));
-        } catch (error) {
-          grantCovered = false;
-          ctx.log(`CodeBuddy 资源包发放明细获取失败（退回本地采样）：${(error as Error).message}`);
-        }
-      }
-    } catch (error) {
-      grantCovered = false;
-      ctx.log(`CodeBuddy 资源包清单获取失败（退回本地采样）：${(error as Error).message}`);
-    }
-    try {
-      const { body } = await fetchJson(CB_GIFT_URL, { method: 'POST', headers, body: '{}', timeoutMs });
-      const data = isRecord(body) ? pick(body, 'data') : undefined;
-      if (isRecord(data) && pick(data, 'claimed') === true) {
-        const at = toIso(pick(data, 'claimed_at', 'claimedAt'));
-        const amount = firstNumber(pick(data, 'credit_num', 'creditNum'));
-        if (at && amount !== null && amount > 0) {
-          records.push({ at: Date.parse(at), kind: 'grant', amount });
-        }
-      }
-    } catch (error) {
-      grantCovered = false;
-      ctx.log(`CodeBuddy 礼包明细获取失败（退回本地采样）：${(error as Error).message}`);
-    }
-
-    return { records, covers: { use: true, grant: grantCovered } };
-  },
-
-  /**
-   * 「扫码登录」：腾讯插件认证。
-   *
-   * 流程：申请 state + authUrl → 用户在浏览器/手机授权 → 轮询 token 接口拿令牌
-   * → 用令牌查账号信息（uid / nickname）→ 返回给会话层落库。
-   * 二维码由前端本地渲染 authUrl，不经过任何第三方服务。
-   */
-  login: {
+/**
+ * 「扫码登录」（腾讯插件认证，默认方法）：站点差异收敛在 CODEBUDDY_SITES。
+ *
+ * 流程：申请 state + authUrl → 用户在浏览器/手机授权 → 轮询 token 接口拿令牌
+ * → 用令牌查账号信息（uid / nickname）→ 返回给会话层落库。
+ * 二维码由前端本地渲染 authUrl，不经过任何第三方服务。
+ */
+function makeCodeBuddyScanLogin(site: CodeBuddySiteMeta): ProviderLogin {
+  return {
     label: '扫码登录',
-    hint: '用手机 CodeBuddy / 微信扫码，或在新窗口打开链接完成授权。',
+    hint:
+      site.id === 'cn'
+        ? '用手机 CodeBuddy / 微信扫码，或在新窗口打开链接完成授权。'
+        : '用手机 WorkBuddy / 微信扫码，或在新窗口打开链接完成授权。',
     qr: true,
     intervalMs: 2_000,
     async start(input) {
       const { body } = await fetchJson(
-        `${CB_PLUGIN_BASE}/v2/plugin/auth/state?platform=CLI`,
+        `${site.pluginBase}/v2/plugin/auth/state?platform=${encodeURIComponent(site.platform)}`,
         {
           method: 'POST',
-          headers: cbPluginHeaders(),
+          headers: cbPluginHeaders(site),
           body: '{}',
           timeoutMs: input.timeoutMs || CB_TIMEOUT_FALLBACK,
         },
@@ -906,8 +858,8 @@ export const codebuddyAdapter: ProviderAdapter = {
       let tokenData: Record<string, unknown> | null = null;
       try {
         const { body } = await fetchJson(
-          `${CB_PLUGIN_BASE}/v2/plugin/auth/token?state=${encodeURIComponent(state)}`,
-          { headers: cbPluginHeaders(), timeoutMs },
+          `${site.pluginBase}/v2/plugin/auth/token?state=${encodeURIComponent(state)}`,
+          { headers: cbPluginHeaders(site), timeoutMs },
         );
         const { code, data } = cbEnvelope(body);
         if (code === 0 && isRecord(data) && firstString(pick(data, 'accessToken', 'access_token'))) {
@@ -929,13 +881,13 @@ export const codebuddyAdapter: ProviderAdapter = {
       let account: Record<string, unknown> = {};
       try {
         const { body } = await fetchJson(
-          `${CB_PLUGIN_BASE}/v2/plugin/login/account?state=${encodeURIComponent(state)}`,
-          { headers: cbPluginHeaders(accessToken), timeoutMs },
+          `${site.pluginBase}/v2/plugin/login/account?state=${encodeURIComponent(state)}`,
+          { headers: cbPluginHeaders(site, accessToken), timeoutMs },
         );
         const { data } = cbEnvelope(body);
         if (isRecord(data)) account = data;
       } catch (error) {
-        ctx.log(`CodeBuddy 登录令牌已获取，但账号信息查询失败：${(error as Error).message}`);
+        ctx.log(`登录令牌已获取，但账号信息查询失败：${(error as Error).message}`);
       }
       const uid = firstString(pick(account, 'uid', 'userId', 'user_id'));
       if (!uid) {
@@ -961,123 +913,440 @@ export const codebuddyAdapter: ProviderAdapter = {
             ? { enterpriseId: firstString(pick(account, 'enterpriseId', 'enterprise_id')) }
             : {}),
           ...(domain ? { domain } : {}),
-          realm: 'cn',
         },
         message: '登录成功，正在验证取数并写入本机配置…',
       };
     },
-  },
+  };
+}
 
-  async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
-    const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
-    // 令牌分支：手工 Cookie 优先（历史账号行为完全不变），没有 Cookie 才走插件令牌
-    if (!cookie) {
-      const accessToken = cred(account, ctx, ['accessToken', 'token']);
-      if (!accessToken) {
-        return notConfigured(codebuddyAdapter, account, ctx, ['cookie 或 accessToken+refreshToken']);
+/**
+ * 「网页端登录」：服务端驱动本机调试 Chrome 打开本平台站点的用量页，
+ * 用户在那个窗口里自己完成登录，我们只**旁听浏览器真实发出的 Cookie 请求头**
+ * （不注入、不代填、不拼 cookie jar）。
+ *
+ * 抓到 Cookie 后走同一个登录会话层落库：probe 验证、去重、`.env` 槽位、备份全部复用。
+ * 令牌模式拿不到逐包批次明细，Cookie 模式才能拿到——这是本方法存在的理由。
+ *
+ * 站点由工厂参数固定：国内版开 www.codebuddy.cn，国际版开 www.codebuddy.ai。
+ */
+function makeCodeBuddyWebLogin(site: CodeBuddySiteMeta): ProviderLogin {
+  return {
+    id: 'web',
+    kind: 'web',
+    label: '网页端登录',
+    hint: `自动打开调试 Chrome 的${site.label}用量页；你在那个窗口登录后，本页面自动完成添加。`,
+    qr: false,
+    intervalMs: CB_WEB_POLL_INTERVAL_MS,
+    async start(input) {
+      // ① 确保调试 Chrome 在跑（没跑就按 tools/chrome-debug.sh 同款参数拉起）
+      const chrome = await ensureDebugChrome();
+      input.log(
+        `CodeBuddy 调试 Chrome 已就绪（${chrome.browser}${chrome.started ? '，本次已拉起' : '，复用已运行的实例'}）`,
+      );
+
+      // ② 打开用量页并开始旁听请求头；采集器挂在 secret 里，cleanup 时释放
+      const collector = await openCookieCollector({ url: site.usageUrl });
+      input.log(`CodeBuddy ${site.label}用量页已打开，等待登录`);
+
+      const startedAt = Date.now();
+      return {
+        authUrl: site.usageUrl,
+        qr: false,
+        ttlMs: CB_WEB_LOGIN_TTL_MS,
+        hint: `请在刚打开的 Chrome 窗口里登录${site.label}（${hostnameOf(site.billingOrigin)}）；登录后本页面会自动完成添加。`,
+        secret: { collector, startedAt, reloads: 0, lastReloadAt: 0 },
+      };
+    },
+    async poll(secret, ctx) {
+      if (!isRecord(secret)) return { status: 'failed', message: '登录会话缺少采集器参数，请重新发起。' };
+      const collector = pick(secret, 'collector') as CookieCollector | undefined;
+      const startedAt = Number(pick(secret, 'startedAt')) || Date.now();
+      if (!collector || typeof collector.cookieFor !== 'function') {
+        return { status: 'failed', message: '登录会话缺少采集器，请重新发起。' };
       }
+
+      // 目标域清单：计费域与用量页的主机（www.codebuddy.cn / www.codebuddy.ai）
+      const hosts = [...new Set([hostnameOf(site.billingOrigin), hostnameOf(site.usageUrl)])].filter(
+        Boolean,
+      );
+      const raw = collector.cookieFor(hosts);
+
+      /**
+       * 登录态判据：**不能**只看「抓到了 Cookie」。
+       *
+       * 两条判据取「或」：
+       *   ① 站点声明的登录态 Cookie 名出现（`loginCookieNames`，未实测的站点留空）；
+       *   ② 功能性证据：页面**自己**请求身份接口 `CB_WEB_IDENTITY_PATH` 拿到 2xx。
+       */
+      const names = collector.cookieNamesFor(hosts);
+      const hasLoginCookie = site.loginCookieNames.some((name) => names.includes(name));
+      const identityOk = collector.sawSuccessfulRequest(CB_WEB_IDENTITY_PATH);
+      const loggedIn = Boolean(raw) && (hasLoginCookie || identityOk);
+
+      if (!loggedIn) {
+        // 刷新策略：只在页面确实空闲时刷新，且限次 + 最小间隔
+        const reloads = Number(pick(secret, 'reloads')) || 0;
+        const lastReloadAt = Number(pick(secret, 'lastReloadAt')) || 0;
+        const now = Date.now();
+        const idle = collector.idleMs();
+        const idleLongEnough = idle >= CB_WEB_RELOAD_IDLE_MS || idle === 0;
+        if (
+          reloads < CB_WEB_RELOAD_MAX &&
+          idleLongEnough &&
+          now - lastReloadAt >= CB_WEB_RELOAD_MIN_INTERVAL_MS
+        ) {
+          await collector.reload();
+          if (isRecord(secret)) {
+            secret.reloads = reloads + 1;
+            secret.lastReloadAt = now;
+          }
+        }
+        const waitedSec = Math.round((now - startedAt) / 1000);
+        return {
+          status: 'waiting',
+          message: raw
+            ? `已抓到${site.label}的页面 Cookie，但尚未检测到登录态，请在该 Chrome 窗口完成登录（已等待 ${waitedSec} 秒）…`
+            : `正在等待你在调试 Chrome 窗口里登录（已等待 ${waitedSec} 秒）…`,
+        };
+      }
+
+      const cookie = normalizeCookieHeader(raw ?? '') ?? '';
+      if (!cookie) return { status: 'waiting', message: '抓到的 Cookie 头为空，继续等待页面发起新请求…' };
+
+      // 账号身份：去重键用「Cookie 指纹」，与 Qoder 同一策略
+      const accountId = createHash('sha256').update(cookie).digest('hex').slice(0, 16);
+      ctx.log(`CodeBuddy 网页端登录已抓到 Cookie（指纹 ${accountId}），开始验证落库`);
+
+      return {
+        status: 'ready',
+        // 昵称为空时用占位名「平台 · 登录账号」，探测时由 adoptResolvedAccountName 补
+        account: { id: accountId, name: '' },
+        credentials: { cookie },
+        options: {},
+        message: '已抓到登录 Cookie，正在验证取数并写入本机配置…',
+      };
+    },
+    async cleanup(secret) {
+      const collector = isRecord(secret)
+        ? (pick(secret, 'collector') as CookieCollector | undefined)
+        : undefined;
+      await collector?.close().catch(() => {});
+    },
+  };
+}
+
+/**
+ * 按站点产出一个完整的 CodeBuddy 适配器：站点在闭包内固定，登录、探测、失败文案、
+ * `.env` 变量前缀全部跟着它走（与 Qoder 的 createQoderAdapter 同一工厂思路）。
+ */
+function createCodeBuddyAdapter(siteId: CodeBuddySiteId): ProviderAdapter {
+  const site = CODEBUDDY_SITES[siteId];
+  const scanLogin = makeCodeBuddyScanLogin(site);
+  const webLogin = makeCodeBuddyWebLogin(site);
+
+  const adapter: ProviderAdapter = {
+    id: siteId === 'cn' ? 'codebuddy' : 'codebuddy-intl',
+    displayName: siteId === 'cn' ? 'CodeBuddy' : 'WorkBuddy 国际版',
+    region: site.id,
+    dashboardUrl: site.usageUrl,
+    usageUrl: site.usageUrl,
+    requiredCredentialKeys: ['cookie'],
+    /**
+     * 两种凭证形态并存：手工 Cookie（历史路径）或插件登录令牌。
+     * 登录产出的变量名由站点 envNames 固定；第 2 个账号自动用 `_2` 槽位。
+     */
+    envNames: site.envNames,
+    // accessToken 是取数必需；refreshToken 只影响续期，缺失时仍可工作到令牌过期
+    isConfigured: (account) =>
+      Boolean(account.credentials.cookie) || Boolean(account.credentials.accessToken),
+    credentialHint:
+      `登录 ${hostnameOf(site.billingOrigin)} 后，在 DevTools 里复制任意 ${hostnameOf(site.billingOrigin)} 请求的 Cookie 头` +
+      `（务必包含 ${hostnameOf(site.billingOrigin)} 子域下的会话 Cookie），填入 credentials.cookie（也可用 npm run capture -- ${siteId === 'cn' ? 'codebuddy' : 'codebuddy-intl'} 自动抓取）；` +
+      '或在看板上点「扫码登录」自动写入插件令牌。',
+    /**
+     * 多账号：一个账号一份 Cookie，各自独立取数、各自一张卡片。
+     *
+     * 不声明 `groupAccounts`：合并卡片会把 `credits/windows/nextExpiryAt` 清空
+     * （见 src/aggregate.ts 的 finalizeCard），而 CodeBuddy 的积分包带真实到期时间，
+     * 合并后会从「最快到期」时间线与卡片批次列表里消失——与项目核心目标相悖。
+     *
+     * 第二个账号的 Cookie 抓取：`npm run capture -- <platform> --slot 2`。
+     */
+    manageAccounts: true,
+    manageFields: [
+      {
+        key: 'cookie',
+        label: 'Cookie',
+        placeholder: `登录 ${hostnameOf(site.billingOrigin)} → DevTools → 任意 ${hostnameOf(site.billingOrigin)} 请求 → Headers → 复制 Cookie 整段值`,
+        hint: `必须是 ${hostnameOf(site.billingOrigin)} 子域下的会话 Cookie，只复制父域会得到 401。`,
+        multiline: true,
+      },
+    ],
+    manageHint:
+      'Cookie 会先真实调用一次用量接口验证，通过了才写入本机 .env（新槽位）与 accounts.json；写入前自动备份到 .run/。',
+    /**
+     * 用量 + 获取明细（v2）：
+     *   - 用量：`get-user-request-usage` 逐笔（`requestTime` + `credit`，支持日期区间与翻页），
+     *     与页面「使用明细」同源；
+     *   - 获取：资源包当前周期发放（`CycleStartTime` + `CycleCapacitySizePrecise`）+
+     *     礼包（`claimed_at` + `credit_num`，只回最近一次领取）。任一获取来源失败即整体
+     *     退回本地采样（不标 upstream），避免「只统计了一半还说完整」。
+     *
+     * 凭证分派：有 Cookie 走会话路径（历史行为不变）；否则走令牌路径
+     * （与 `probe` 的令牌分支一致，接口同时接受 Bearer）。
+     */
+    async fetchUsageLedger(account: AccountConfig, ctx: ProbeContext): Promise<UsageLedger | null> {
+      const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+      if (!cookie) {
+        const accessToken = cred(account, ctx, ['accessToken', 'token']);
+        if (!accessToken) return null;
+        return cbTokenLedger(site, adapter, account, ctx, accessToken);
+      }
+      const timeoutMs = ctx.timeoutMs || CB_TIMEOUT_FALLBACK;
+      const headers: Record<string, string> = {
+        Cookie: cookie,
+        'Content-Type': 'application/json',
+        Origin: site.billingOrigin,
+        Referer: site.usageUrl,
+        'x-client-platform': 'web',
+      };
+      const records: UsageRecord[] = [];
+
+      // ① 逐笔用量：本地日区间，按页拉取（上限 10 页 × 100）
+      const startDay = localDateKey(startOfDay(ctx.now) - 86_400_000);
+      const endDay = localDateKey(ctx.now);
+      const pageSize = 100;
+      const requestUsageUrl = `${site.billingOrigin}/billing/meter/get-user-request-usage`;
+      for (let pageNum = 1; pageNum <= 10; pageNum += 1) {
+        const { body } = await fetchJson(requestUsageUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            startTime: `${startDay} 00:00:00`,
+            endTime: `${endDay} 23:59:59`,
+            pageNum,
+            pageSize,
+          }),
+          timeoutMs,
+        });
+        assertBusinessOk(body);
+        const data = isRecord(body) ? pick(body, 'data') : undefined;
+        const list = isRecord(data) ? pick(data, 'data') : undefined;
+        if (!Array.isArray(list) || list.length === 0) break;
+        for (const raw of list) {
+          if (!isRecord(raw)) continue;
+          const at = toIso(pick(raw, 'requestTime', 'request_time'));
+          const amount = firstNumber(pick(raw, 'credit', 'credits'));
+          if (!at || amount === null || amount <= 0) continue;
+          records.push({ at: Date.parse(at), kind: 'use', amount });
+        }
+        if (list.length < pageSize) break;
+      }
+
+      // ②③ 获取记录：任一步失败即放弃覆盖声明（grant 回退本地采样）
+      let grantCovered = true;
       try {
-        return await cbProbeWithToken(account, ctx, accessToken);
-      } catch (error) {
-        const status = error instanceof HttpError ? error.kind : 'error';
-        return failure(codebuddyAdapter, account, ctx, status, (error as Error).message);
-      }
-    }
-
-    const timeoutMs = ctx.timeoutMs || CB_TIMEOUT_FALLBACK;
-    const headers: Record<string, string> = {
-      Cookie: cookie,
-      'Content-Type': 'application/json',
-      Origin: 'https://www.codebuddy.cn',
-      Referer: 'https://www.codebuddy.cn/profile/plans-usage',
-      'x-client-platform': 'web',
-    };
-    const summaryUrl = optString(account, 'endpoint') || CB_SUMMARY_URL;
-
-    try {
-      const summaryResponse = await fetchJson(summaryUrl, {
-        method: 'POST',
-        headers,
-        body: '{}',
-        timeoutMs,
-      });
-      assertBusinessOk(summaryResponse.body);
-      const summary = parseCodeBuddySummary(summaryResponse.body);
-
-      // 资源包详情接口必须带上 summary 给出的 PackageCodes，失败不影响余额展示
-      let packs: CodeBuddyPack[] = [];
-      if (summary.packageCodes.length > 0) {
-        try {
-          const packagesResponse = await fetchJson(CB_PACKAGES_URL, {
+        const summaryResponse = await fetchJson(
+          optString(account, 'endpoint') || `${site.billingOrigin}/billing/meter/get-user-resource-summary`,
+          {
             method: 'POST',
             headers,
-            body: JSON.stringify({
-              PageNumber: 1,
-              PageSize: 200,
-              Status: [0],
-              PackageCodes: summary.packageCodes,
-              NeedInUsage: true,
-            }),
+            body: '{}',
             timeoutMs,
-          });
-          assertBusinessOk(packagesResponse.body);
-          packs = parseCodeBuddyPackages(packagesResponse.body);
+          },
+        );
+        assertBusinessOk(summaryResponse.body);
+        const summary = parseCodeBuddySummary(summaryResponse.body);
+        const packageBody = JSON.stringify({
+          PageNumber: 1,
+          PageSize: 200,
+          Status: [0],
+          PackageCodes: summary.packageCodes,
+          NeedInUsage: true,
+        });
+        for (const path of [
+          '/billing/meter/get-user-resource-free-packages',
+          '/billing/meter/get-user-resource-paid-packages',
+        ]) {
+          try {
+            const { body } = await fetchJson(`${site.billingOrigin}${path}`, {
+              method: 'POST',
+              headers,
+              body: packageBody,
+              timeoutMs,
+            });
+            records.push(...parsePackageGrants(body));
+          } catch (error) {
+            grantCovered = false;
+            ctx.log(`${adapter.displayName} 资源包发放明细获取失败（退回本地采样）：${(error as Error).message}`);
+          }
+        }
+      } catch (error) {
+        grantCovered = false;
+        ctx.log(`${adapter.displayName} 资源包清单获取失败（退回本地采样）：${(error as Error).message}`);
+      }
+      try {
+        const { body } = await fetchJson(`${site.billingOrigin}/billing/meter/check-gift-claimed`, {
+          method: 'POST',
+          headers,
+          body: '{}',
+          timeoutMs,
+        });
+        const data = isRecord(body) ? pick(body, 'data') : undefined;
+        if (isRecord(data) && pick(data, 'claimed') === true) {
+          const at = toIso(pick(data, 'claimed_at', 'claimedAt'));
+          const amount = firstNumber(pick(data, 'credit_num', 'creditNum'));
+          if (at && amount !== null && amount > 0) {
+            records.push({ at: Date.parse(at), kind: 'grant', amount });
+          }
+        }
+      } catch (error) {
+        grantCovered = false;
+        ctx.log(`${adapter.displayName} 礼包明细获取失败（退回本地采样）：${(error as Error).message}`);
+      }
+
+      return { records, covers: { use: true, grant: grantCovered } };
+    },
+
+    /** 默认登录方法（扫码）；完整清单在对象外组装成 `loginMethods` */
+    login: scanLogin,
+
+    async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
+      const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+      // 令牌分支：手工 Cookie 优先（历史账号行为完全不变），没有 Cookie 才走插件令牌
+      if (!cookie) {
+        const accessToken = cred(account, ctx, ['accessToken', 'token']);
+        if (!accessToken) {
+          return notConfigured(adapter, account, ctx, ['cookie 或 accessToken+refreshToken']);
+        }
+        try {
+          return await cbProbeWithToken(site, adapter, account, ctx, accessToken);
         } catch (error) {
-          ctx.log(`CodeBuddy 资源包详情获取失败（不影响余额）：${(error as Error).message}`);
+          const status = error instanceof HttpError ? error.kind : 'error';
+          return failure(adapter, account, ctx, status, (error as Error).message);
         }
       }
 
-      // 实测各包本周期剩余之和 === summary 的账户级剩余，因此批次按「剩余量」参与汇总
-      const usable = packs.filter((pack) => pack.remain > 0);
-      const usedUpCount = packs.length - usable.length;
-      const lots: CreditLot[] = usable.map((pack, index) =>
-        makeLot({
-          id: `cb-pack-${index}`,
-          label: pack.label,
-          amount: pack.remain,
-          currency: 'CREDITS',
-          expiresAt: pack.expiresAt,
-          note: `本周期额度 ${pack.size}`,
-        }),
-      );
-      const { active, expired } = splitByExpiry(lots, ctx.now);
+      const timeoutMs = ctx.timeoutMs || CB_TIMEOUT_FALLBACK;
+      const headers: Record<string, string> = {
+        Cookie: cookie,
+        'Content-Type': 'application/json',
+        Origin: site.billingOrigin,
+        Referer: site.usageUrl,
+        'x-client-platform': 'web',
+      };
+      const summaryUrl =
+        optString(account, 'endpoint') || `${site.billingOrigin}/billing/meter/get-user-resource-summary`;
 
-      const earliest =
-        active
-          .map((lot) => lot.expiresAt)
-          .filter((value): value is string => typeof value === 'string')
-          .sort((a, b) => Date.parse(a) - Date.parse(b))[0] ?? null;
+      try {
+        const summaryResponse = await fetchJson(summaryUrl, {
+          method: 'POST',
+          headers,
+          body: '{}',
+          timeoutMs,
+        });
+        assertBusinessOk(summaryResponse.body);
+        const summary = parseCodeBuddySummary(summaryResponse.body);
 
-      const round = (value: number): number => Math.round(value * 100) / 100;
-      const window = makeWindow({
-        kind: 'billing',
-        label: `积分额度（${summary.packageCount} 个资源包）`,
-        used: summary.used,
-        limit: summary.limit,
-        remaining: summary.remaining,
-        boundary: earliest ? 'expiry' : 'reset',
-        expiresAt: earliest,
-      });
+        // 资源包详情接口必须带上 summary 给出的 PackageCodes，失败不影响余额展示
+        let packs: CodeBuddyPack[] = [];
+        if (summary.packageCodes.length > 0) {
+          try {
+            const packagesResponse = await fetchJson(
+              `${site.billingOrigin}/billing/meter/get-user-resource-free-packages`,
+              {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                  PageNumber: 1,
+                  PageSize: 200,
+                  Status: [0],
+                  PackageCodes: summary.packageCodes,
+                  NeedInUsage: true,
+                }),
+                timeoutMs,
+              },
+            );
+            assertBusinessOk(packagesResponse.body);
+            packs = parseCodeBuddyPackages(packagesResponse.body);
+          } catch (error) {
+            ctx.log(`${adapter.displayName} 资源包详情获取失败（不影响余额）：${(error as Error).message}`);
+          }
+        }
 
-      return buildSnapshot({
-        adapter: codebuddyAdapter,
-        account,
-        status: 'ok',
-        now: ctx.now,
-        balance: { amount: round(summary.remaining), currency: 'CREDITS' },
-        credits: active,
-        windows: [window],
-        note: joinNotes(
-          hiddenLotsNote(expired, usedUpCount),
-          active.length > 0 && active.some((lot) => lot.expiresAt)
-            ? null
-            : '资源包接口未返回周期结束时间，无法给出批次到期日',
-        ),
-        fallbackExpiryFromWindow: false,
-      });
-    } catch (error) {
-      const status = error instanceof HttpError ? error.kind : 'error';
-      return failure(codebuddyAdapter, account, ctx, status, (error as Error).message);
-    }
-  },
-};
+        // 实测各包本周期剩余之和 === summary 的账户级剩余，因此批次按「剩余量」参与汇总
+        const usable = packs.filter((pack) => pack.remain > 0);
+        const usedUpCount = packs.length - usable.length;
+        const lots: CreditLot[] = usable.map((pack, index) =>
+          makeLot({
+            id: `cb-pack-${index}`,
+            label: pack.label,
+            amount: pack.remain,
+            currency: 'CREDITS',
+            expiresAt: pack.expiresAt,
+            note: `本周期额度 ${pack.size}`,
+          }),
+        );
+        const { active, expired } = splitByExpiry(lots, ctx.now);
+
+        const earliest =
+          active
+            .map((lot) => lot.expiresAt)
+            .filter((value): value is string => typeof value === 'string')
+            .sort((a, b) => Date.parse(a) - Date.parse(b))[0] ?? null;
+
+        const round = (value: number): number => Math.round(value * 100) / 100;
+        const window = makeWindow({
+          kind: 'billing',
+          label: `积分额度（${summary.packageCount} 个资源包）`,
+          used: summary.used,
+          limit: summary.limit,
+          remaining: summary.remaining,
+          boundary: earliest ? 'expiry' : 'reset',
+          expiresAt: earliest,
+        });
+
+        return buildSnapshot({
+          adapter,
+          account,
+          status: 'ok',
+          now: ctx.now,
+          balance: { amount: round(summary.remaining), currency: 'CREDITS' },
+          credits: active,
+          windows: [window],
+          note: joinNotes(
+            hiddenLotsNote(expired, usedUpCount),
+            active.length > 0 && active.some((lot) => lot.expiresAt)
+              ? null
+              : '资源包接口未返回周期结束时间，无法给出批次到期日',
+          ),
+          fallbackExpiryFromWindow: false,
+        });
+      } catch (error) {
+        const status = error instanceof HttpError ? error.kind : 'error';
+        return failure(adapter, account, ctx, status, (error as Error).message);
+      }
+    },
+  };
+
+  /**
+   * 登录方法清单：`login`（扫码，默认方法）+ `webLogin`（网页端抓 Cookie）。
+   *
+   * 声明后前端按清单渲染两个按钮，会话层按 `method` 路由；
+   * `login` 仍保留在适配器上（不传 method 时走它），行为向后兼容。
+   */
+  adapter.loginMethods = [scanLogin, webLogin];
+  return adapter;
+}
+
+/** 国内站（www.codebuddy.cn）：凭证写 `CODEBUDDY_*`，与既有行为一致 */
+export const codebuddyAdapter: ProviderAdapter = createCodeBuddyAdapter('cn');
+
+/**
+ * 国际站（www.codebuddy.ai，即 WorkBuddy）：独立 provider id，凭证写 `CODEBUDDY_GLOBAL_*`。
+ *
+ * 站点是**平台身份**的一部分（与 Qoder 国内版 / 国际版同一拆分思路）：
+ * 账号列表、卡片、登录入口、缓存键都按 provider 分开。
+ */
+export const codebuddyIntlAdapter: ProviderAdapter = createCodeBuddyAdapter('global');

@@ -257,6 +257,26 @@ const TARGETS: Target[] = [
     cookieSites: ['codebuddy.cn'],
     usageUrl: 'https://www.codebuddy.cn/profile/plans-usage',
     apiHost: 'www.codebuddy.cn',
+    // 兼容写法：`--site global` 等价于 `npm run capture -- codebuddy-intl`
+    siteVariants: {
+      global: {
+        label: 'WorkBuddy 国际版',
+        envKey: 'CODEBUDDY_GLOBAL_COOKIE',
+        cookieSites: ['codebuddy.ai'],
+        usageUrl: 'https://www.codebuddy.ai/profile/plans-usage',
+        apiHost: 'www.codebuddy.ai',
+        providerId: 'codebuddy-intl',
+      },
+    },
+  },
+  {
+    // 国际站：独立平台（provider id = codebuddy-intl），凭证与国内站完全分开
+    id: 'codebuddy-intl',
+    label: 'WorkBuddy 国际版',
+    envKey: 'CODEBUDDY_GLOBAL_COOKIE',
+    cookieSites: ['codebuddy.ai'],
+    usageUrl: 'https://www.codebuddy.ai/profile/plans-usage',
+    apiHost: 'www.codebuddy.ai',
   },
   {
     id: 'codearts',

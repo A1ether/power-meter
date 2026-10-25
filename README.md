@@ -47,6 +47,7 @@ npm start
 | 平台 | 登录方式 | 说明 |
 | --- | --- | --- |
 | CodeBuddy | 手机扫码 / 新窗口打开链接 | 用 CodeBuddy 客户端或微信完成授权 |
+| WorkBuddy 国际版 | 手机扫码 / 网页端登录 | 目标固定 `codebuddy.ai`；令牌写入 `CODEBUDDY_GLOBAL_*`；网页端登录会自动打开调试 Chrome 抓 Cookie（批次明细更全） |
 | Qoder 国内版 | 手机 Qoder App 扫码 / 新窗口打开链接 | 目标固定 `qoder.com.cn`；令牌写入 `QODER_*` |
 | Qoder 国际版 | 手机 Qoder App 扫码 / 新窗口打开链接 | 目标固定 `qoder.com`；令牌写入 `QODER_GLOBAL_*`（国际站设备流未实测，网页端登录更稳） |
 | Trae | 新窗口打开链接 | 回调固定 `127.0.0.1`，必须在本机浏览器完成 |
@@ -320,6 +321,7 @@ interface ProviderSnapshot {
 | Qoder 国际版 | `qoder-intl` / `qoder.com` / `qoder-global` | `cookie`（`QODER_GLOBAL_COOKIE`）<br>或登录写入的 `accessToken` + `refreshToken`（`QODER_GLOBAL_ACCESS_TOKEN` / `QODER_GLOBAL_REFRESH_TOKEN`） | 站点固定 `qoder.com`，无站点选项；`origin` 可覆盖。积分批次口径与国内版一致 |
 | Trae | `trae` / `trae.cn` | `cookie`<br>或「打开链接登录」写入的 `accessToken` + `refreshToken` + `deviceKey`（`TRAE_ACCESS_TOKEN` / `TRAE_REFRESH_TOKEN` / `TRAE_DEVICE_KEY`） | JWT 由 Cookie 自动续签；令牌模式由 `deviceKey` 签名续期 |
 | CodeBuddy | `codebuddy` | `cookie`（**必须含 `www` 子域**）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`CODEBUDDY_ACCESS_TOKEN` / `CODEBUDDY_REFRESH_TOKEN`）| — |
+| WorkBuddy 国际版 | `codebuddy-intl` / `codebuddy.ai` / `workbuddy.ai` | `cookie`（**必须含 `www` 子域**，写 `CODEBUDDY_GLOBAL_COOKIE`）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`CODEBUDDY_GLOBAL_ACCESS_TOKEN` / `CODEBUDDY_GLOBAL_REFRESH_TOKEN`）| 站点固定 `codebuddy.ai`，与国内版互不通用 |
 | CodeArts | `codearts` | **网页端登录（推荐，一键添加）**：卡片上点「网页端登录」，在自动打开的调试 Chrome 里登录华为云即可，Cookie 自动落 `CODEARTS_COOKIE` 并由 `npm run codearts:refresh` 定时续期<br>`accessKey` + `secretKey`（长期有效，多账号路径）<br>`cookie`（兼容，会话过期需重抓） | 可选 `authMode: "auto" \| "aksk" \| "cookie"`、`resourceType`、`region` |
 | MiniMax Code | `minimax` / `minimax-code` / `agent.minimax.cn` | `token`（`_token`）+ `cookie`（SSO）+ 真实身份 `userId`/`opTicket`/`uuid`（capture 一并抓取，缺一不可）| `site: "cn"`（默认）或 `"global"` |
 | A1etherOpenAi | `a1etheropenai` / `d1v.ai`（上游服务域名保持不变，也是它的解析别名） | `apiKey`（查余额）<br>`paiApiKey`（托管复制） | `baseUrl`、`revealApiKey` |

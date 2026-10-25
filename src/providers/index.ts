@@ -1,7 +1,7 @@
 import type { AccountConfig } from '../config.js';
 import type { ManageFieldDescriptor, ProviderAdapter } from './base.js';
 import { codeartsAdapter } from './codearts.js';
-import { codebuddyAdapter } from './codebuddy.js';
+import { codebuddyAdapter, codebuddyIntlAdapter } from './codebuddy.js';
 import { a1etheropenaiAdapter } from './a1etheropenai.js';
 import { demoAdapters } from './demo.js';
 import { minimaxAdapter } from './minimax.js';
@@ -20,6 +20,7 @@ for (const adapter of [
   qoderIntlAdapter,
   traeAdapter,
   codebuddyAdapter,
+  codebuddyIntlAdapter,
   codeartsAdapter,
   a1etheropenaiAdapter,
   minimaxAdapter,
@@ -66,6 +67,11 @@ const ALIASES: Record<string, string> = {
   'codebuddy.cn': 'codebuddy',
   'www.codebuddy.cn': 'codebuddy',
   'copilot.tencent.com': 'codebuddy',
+  'codebuddy.ai': 'codebuddy-intl',
+  'www.codebuddy.ai': 'codebuddy-intl',
+  'workbuddy': 'codebuddy-intl',
+  'workbuddy.ai': 'codebuddy-intl',
+  'www.workbuddy.ai': 'codebuddy-intl',
   'codearts.huaweicloud.com': 'codearts',
   'huaweicloud': 'codearts',
   'devcloud': 'codearts',
