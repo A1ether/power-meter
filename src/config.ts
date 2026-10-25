@@ -24,6 +24,26 @@ export interface AppConfig {
   accounts: AccountConfig[];
 }
 
+/**
+ * sidecar 模式的运行选项：power-meter 作为 magpie 的伴随进程（而非独立看板站）时的开关。
+ * 全部由 CLI 参数或环境变量驱动，独立看板用法（不带任何参数）行为完全不变。
+ */
+export interface SidecarOptions {
+  /**
+   * 不 serve public/ 看板静态资源（`--no-static` / `POWER_METER_NO_STATIC=1`）。
+   * sidecar 下看板 UI 由 magpie GUI 渲染，这里只暴露 /api/*；`/` 返回 JSON 指引而非 404 的 HTML。
+   */
+  noStatic: boolean;
+  /**
+   * 访问令牌（`--token <t>` / `POWER_METER_TOKEN`）。非空时，除 /api/health 与静态资源外的
+   * /api/* 请求必须带 `X-Power-Meter-Token` 头（或 `?token=` 查询）匹配，否则 401。
+   * 配合既有的回环 + privilegedGuard，给跨进程调用再加一层；缺省为空 = 不启用（保持兼容）。
+   */
+  token: string;
+  /** 解析命中的 .env 文件路径（--config-dir 重定位后的绝对路径），供启动日志展示 */
+  dotEnvPath: string;
+}
+
 const DEFAULTS = {
   port: 48213,
   host: '127.0.0.1',
@@ -33,9 +53,64 @@ const DEFAULTS = {
   expiryWarningDays: 14,
 };
 
-/** .env 的绝对路径（服务用它监听 mtime 做热加载） */
+/** .env 的绝对路径（服务用它监听 mtime 做热加载）；--config-dir 会把基准目录从 cwd 换掉 */
+let dotEnvDir = process.cwd();
 export function resolveDotEnvPath(file = '.env'): string {
-  return resolve(process.cwd(), file);
+  return resolve(dotEnvDir, file);
+}
+
+/**
+ * 解析 sidecar 相关 CLI 参数与环境变量，并就地生效配置目录重定位。
+ * 必须在 loadConfig() 之前调用（loadConfig 会先跑 loadDotEnv，依赖重定位后的目录）。
+ *
+ * 支持：
+ *   --port <n>        覆盖 PORT（0 = 让内核分配随机空闲端口，server 从 address() 回读真实端口）
+ *   --host <h>        覆盖 HOST
+ *   --no-static       不 serve 看板静态资源
+ *   --token <t>       启用 /api/* 访问令牌
+ *   --config-dir <d>  把 .env 与 accounts.json 的默认基准目录从 cwd 换成 <d>
+ *                     （显式的 ACCOUNTS_PATH 环境变量仍优先于它）
+ */
+export function parseSidecarOptions(argv: string[] = process.argv.slice(2)): SidecarOptions {
+  const takeValue = (index: number, flag: string): string => {
+    const inline = argv[index].slice(flag.length);
+    if (inline) return inline;
+    const next = argv[index + 1];
+    if (next === undefined || next.startsWith('--')) {
+      throw new Error(`${flag} 需要一个值，如 ${flag} <value>`);
+    }
+    return next;
+  };
+
+  let noStatic = process.env.POWER_METER_NO_STATIC === '1';
+  let token = process.env.POWER_METER_TOKEN ?? '';
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--no-static') {
+      noStatic = true;
+    } else if (arg === '--port' || arg.startsWith('--port=')) {
+      process.env.PORT = takeValue(i, '--port=');
+      if (arg === '--port') i += 1;
+    } else if (arg === '--host' || arg.startsWith('--host=')) {
+      process.env.HOST = takeValue(i, '--host=');
+      if (arg === '--host') i += 1;
+    } else if (arg === '--token' || arg.startsWith('--token=')) {
+      token = takeValue(i, '--token=');
+      if (arg === '--token') i += 1;
+    } else if (arg === '--config-dir' || arg.startsWith('--config-dir=')) {
+      const dir = resolve(takeValue(i, '--config-dir='));
+      if (arg === '--config-dir') i += 1;
+      dotEnvDir = dir;
+      // 仅当用户没有显式指定 ACCOUNTS_PATH 时，才把账号文件锚定到 config-dir；
+      // 显式的 ACCOUNTS_PATH 永远优先（无论是相对还是绝对，保持原有 cwd 语义）。
+      if (!process.env.ACCOUNTS_PATH) {
+        process.env.ACCOUNTS_PATH = resolve(dir, 'accounts.json');
+      }
+    }
+  }
+
+  return { noStatic, token, dotEnvPath: resolveDotEnvPath() };
 }
 
 /**

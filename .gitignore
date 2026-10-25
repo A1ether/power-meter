@@ -1,5 +1,7 @@
 node_modules/
 dist/
+# sidecar 单文件二进制（bun build --compile 产物，83M，不入库）
+dist/power-meter-sidecar
 .env
 accounts.json
 *.log

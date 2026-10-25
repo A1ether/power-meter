@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig } from './config.js';
+import { loadConfig, parseSidecarOptions } from './config.js';
 import { addA1etherOpenAiAccount, listA1etherOpenAiAccounts, parseKeyPairText, removeA1etherOpenAiAccount } from './a1etheropenai-store.js';
 import { addManagedAccount, listManagedAccounts, removeManagedAccount } from './account-store.js';
 import {
@@ -27,6 +27,9 @@ const MIME: Record<string, string> = {
   '.png': 'image/png',
 };
 
+// sidecar 选项要在 loadConfig() 之前解析：--config-dir 会重定位 .env / accounts.json 的基准目录，
+// 而 loadConfig 一进来就 loadDotEnv。独立看板（不带参数）时它们全部保持默认，行为不变。
+const sidecar = parseSidecarOptions();
 const service = new DashboardService();
 const bootstrap = loadConfig().config;
 
@@ -216,6 +219,19 @@ async function serveStatic(pathname: string, res: ServerResponse): Promise<boole
   }
 }
 
+/**
+ * sidecar 令牌闸门：仅当配置了 token 时启用。/api/health 与静态资源放行（健康探测与
+ * 独立看板静态页不需要），其余 /api/* 必须带匹配的 X-Power-Meter-Token 头或 ?token= 查询。
+ * 与既有回环监听 + privilegedGuard 叠加，不改变独立看板（无 token）的任何行为。
+ */
+function tokenGate(req: IncomingMessage, url: URL): boolean {
+  if (!sidecar.token) return true;
+  const pathname = url.pathname;
+  if (pathname === '/api/health' || !pathname.startsWith('/api/')) return true;
+  const presented = req.headers['x-power-meter-token'] ?? url.searchParams.get('token');
+  return presented === sidecar.token;
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const pathname = url.pathname;
@@ -223,6 +239,11 @@ const server = createServer(async (req, res) => {
   try {
     if (pathname === '/api/health') {
       sendJson(res, 200, { ok: true, now: new Date().toISOString() });
+      return;
+    }
+
+    if (!tokenGate(req, url)) {
+      sendJson(res, 401, { error: '缺少或错误的访问令牌（X-Power-Meter-Token）' });
       return;
     }
 
@@ -625,6 +646,21 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // sidecar 的 --no-static 模式：看板 UI 由 magpie GUI 渲染，这里不 serve public/，
+    // 根路径给一条 JSON 指引而不是 404 的静态页，避免误以为是服务挂了。
+    if (sidecar.noStatic) {
+      if (pathname === '/' || pathname === '/index.html') {
+        sendJson(res, 200, {
+          service: 'power-meter',
+          mode: 'sidecar',
+          hint: '看板 UI 由 magpie GUI 渲染；这里是纯 API 服务。健康探测：/api/health，数据：/api/summary。',
+        });
+        return;
+      }
+      sendJson(res, 404, { error: 'sidecar 模式不 serve 静态资源（--no-static）' });
+      return;
+    }
+
     if (req.method === 'GET' && (await serveStatic(pathname, res))) return;
     sendJson(res, 404, { error: 'Not Found' });
   } catch (error) {
@@ -638,7 +674,20 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(bootstrap.server.port, bootstrap.server.host, () => {
-  const origin = `http://${bootstrap.server.host}:${bootstrap.server.port}`;
+  // --port 0 时让内核分配随机空闲端口，真实端口从 address() 回读（bootstrap.server.port 仍是 0）。
+  // sidecar 模式下 magpie 也从 stdout 这行解析端口，格式保持稳定：<service> listening at <url>
+  const address = server.address();
+  const actualPort =
+    address && typeof address === 'object' ? address.port : bootstrap.server.port;
+  const origin = `http://${bootstrap.server.host}:${actualPort}`;
+
+  if (sidecar.noStatic || sidecar.token) {
+    // sidecar 模式：一行可被 magpie 解析的就绪信号，含端口与是否启用了令牌（不打印令牌本身）
+    console.log(
+      `[power-meter] listening at ${origin} mode=sidecar` +
+        `${sidecar.noStatic ? ' no-static' : ''} token=${sidecar.token ? 'on' : 'off'}`,
+    );
+  }
   console.log(`\n  Power Meter 已启动  ${origin}`);
   console.log(`  接口: ${origin}/api/summary   配置概览: ${origin}/api/config`);
   console.log(`  账号文件: ${bootstrap.accountsFilePath}`);

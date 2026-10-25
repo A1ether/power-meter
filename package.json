@@ -21,7 +21,9 @@
     "chrome:debug": "tools/chrome-debug.sh",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.json",
-    "serve": "node dist/server.js"
+    "serve": "node dist/server.js",
+    "serve:sidecar": "node dist/server.js --port 0 --no-static",
+    "build:sidecar": "npm run build && bun build --compile --minify dist/server.js --outfile dist/power-meter-sidecar"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
