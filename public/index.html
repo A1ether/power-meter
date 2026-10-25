@@ -252,13 +252,6 @@
                  文案、是否带二维码都来自声明，前端不认平台名）。只有一个方法的
                  平台照旧渲染单个按钮，视觉与之前完全一致 -->
             <span class="login__buttons"></span>
-            <!-- 站点选择：只有声明了站点 option 的平台（Qoder）才出现。选项由
-                 manageFields 的 choices 动态填充，取值随会话发给 /api/login/start，
-                 登录结果落库时带上同一站点 -->
-            <label class="login__site" hidden>
-              <span>站点</span>
-              <select class="login__site-select"></select>
-            </label>
             <span class="login__hint muted"></span>
           </div>
           <div class="login__panel" hidden>

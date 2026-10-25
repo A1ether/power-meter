@@ -1827,25 +1827,6 @@ kbd {
   gap: 7px;
 }
 
-.login__site {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--text-3);
-  font-size: 10.5px;
-}
-
-.login__site-select {
-  padding: 4px 8px;
-  border: 1px solid var(--line-strong);
-  border-radius: 7px;
-  background: var(--bg-soft);
-  color: var(--text);
-  font: inherit;
-  font-size: 10.5px;
-  cursor: pointer;
-}
-
 .login__hint {
   flex: 1;
   min-width: 180px;
@@ -1960,7 +1941,7 @@ kbd {
   transition: border-color 0.16s ease, background 0.16s ease;
 }
 
-/* 下拉字段（如 Qoder 的站点）：原生箭头保留，只统一主题与指针 */
+/* 声明了 choices 的下拉字段：原生箭头保留，只统一主题与指针 */
 .manage__field select {
   cursor: pointer;
 }

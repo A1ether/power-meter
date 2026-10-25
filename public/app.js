@@ -102,11 +102,10 @@ const state = {
   /**
    * 「平台与账号」弹窗的状态：
    *   - providerId = null 时显示平台列表（含一个账号都没有的平台）；
-   *   - providerId 非空时显示该平台的登录 / 添加表单（与卡片内管理区同一套逻辑）；
-   *   - site 非空表示从「某站点行」进来（Qoder 国内版 / 国际版），
-   *     管理视图会把站点锁定成该值，避免把账号加进另一个站点。
+   *   - providerId 非空时显示该平台的登录 / 添加表单（与卡片内管理区同一套逻辑）。
+   * 国内站 / 国际站是两个平台，所以这里只有 provider 一个维度，没有站点。
    */
-  dialog: { providerId: null, site: null },
+  dialog: { providerId: null },
   /** GET /api/accounts/overview 的缓存；增删 / 登录成功后置空重拉 */
   platformOverview: null,
   /**
@@ -421,24 +420,6 @@ function renderSortOptions(data) {
   els.sort.value = state.sort;
 }
 
-/**
- * 站点 → 前端文案。Qoder 的国内站 / 国际站是同一个 provider 下的两个账号，
- * 「按平台」子菜单、「平台与账号」弹窗与卡片 region 徽标都按这张表说人话。
- * 出现未登记的站点值时回退大写标识，不抛错——分组与筛选仍然可用。
- */
-const SITE_LABELS = { cn: '国内版', global: '国际版' };
-
-/**
- * 站点筛选词：`<平台名> <站点标签>`。
- *
- * 子菜单行的标签、命令面板的「查看 X」、卡片搜索 haystack 三处**必须**走同一个函数，
- * 否则「点菜单能筛到、手输同样的词却筛空」这种口径分裂就会出现。
- */
-function siteFilterTerm(baseName, region) {
-  const site = SITE_LABELS[region] ?? String(region ?? '').toUpperCase();
-  return `${baseName} ${site}`.trim();
-}
-
 /** 平台显示名：优先用 /api/providers 的适配器名（干净、稳定，不含账号后缀） */
 function baseNameOf(providerId, members) {
   const meta = metaFor({ provider: providerId });
@@ -449,60 +430,34 @@ function baseNameOf(providerId, members) {
 }
 
 /**
- * 哪些平台需要按站点拆行：同一 provider 的快照里出现了多于一种 region。
+ * 「按平台」子菜单与命令面板的行模型：一个平台一行（同一平台的多个账号合一行）。
  *
- * 只有这类平台才需要「Qoder CN / Qoder 国际版」两行；CodeBuddy 两个账号都是 cn，
- * 语义上就是一个平台，合并成一行才是对的。
- */
-function crossRegionProviders(providers) {
-  const seen = new Map();
-  for (const provider of providers) {
-    if (!seen.has(provider.provider)) seen.set(provider.provider, new Set());
-    seen.get(provider.provider).add(provider.region);
-  }
-  const cross = new Set();
-  for (const [id, regions] of seen) {
-    if (regions.size > 1) cross.add(id);
-  }
-  return cross;
-}
-
-/**
- * 「按平台」子菜单与命令面板的行模型：一个平台一行；跨站点平台按站点拆行。
- *
- * 返回 `[{ key, provider, region, label, members }]`，其中 region 为 null 表示
- * 未拆站点的整平台行。行数口径 = 平台数（跨站点平台按站点计），与「按平台」一致。
+ * 返回 `[{ key, provider, label, members }]`。国内站 / 国际站在这里就是两个平台——
+ * 拆分后它们是两个适配器（`qoder` / `qoder-intl`），显示名自带「国内版 / 国际版」，
+ * 不再需要按 region 拆行：行数口径 = 平台数。
  */
 function platformGroups(data) {
   const providers = data?.providers ?? [];
   if (providers.length === 0) return [];
 
-  const cross = crossRegionProviders(providers);
   const buckets = new Map();
-
   for (const provider of providers) {
-    const split = cross.has(provider.provider);
-    const key = split ? `${provider.provider}#${provider.region}` : provider.provider;
-    const bucket = buckets.get(key);
+    const bucket = buckets.get(provider.provider);
     if (bucket) {
       bucket.members.push(provider);
     } else {
-      buckets.set(key, {
-        key,
+      buckets.set(provider.provider, {
+        key: provider.provider,
         provider: provider.provider,
-        region: split ? provider.region : null,
         members: [provider],
       });
     }
   }
 
-  return [...buckets.values()].map((group) => {
-    const baseName = baseNameOf(group.provider, group.members);
-    return {
-      ...group,
-      label: group.region ? siteFilterTerm(baseName, group.region) : baseName,
-    };
-  });
+  return [...buckets.values()].map((group) => ({
+    ...group,
+    label: baseNameOf(group.provider, group.members),
+  }));
 }
 
 /**
@@ -530,20 +485,13 @@ function sortedProviders(data) {
   const thresholds = data.expiryThresholds;
   const query = state.query.trim().toLowerCase();
   let providers = data.providers;
-  // 跨站点平台（如 Qoder）的卡片要能被「Qoder CN / Qoder 国际版」精确命中：
-  // 卡片标题里没有站点字样，所以在这里补上站点筛选词（与子菜单同源）
-  const crossRegion = crossRegionProviders(providers);
 
   if (query) {
     providers = providers.filter((provider) => {
-      const siteText = crossRegion.has(provider.provider)
-        ? siteFilterTerm(baseNameOf(provider.provider, [provider]), provider.region)
-        : '';
       const haystack = [
         provider.displayName,
         provider.provider,
         provider.plan ?? '',
-        siteText,
         currencyFor(provider),
         ...provider.credits.map((lot) => lot.label),
       ]
@@ -614,16 +562,14 @@ function renderGrid(data) {
   }
 
   const fragment = document.createDocumentFragment();
-  // 跨站点平台（如 Qoder）的卡片徽标要显示站点标签，与「按平台」子菜单的行文案对齐
-  const crossRegion = crossRegionProviders(providers);
   for (const provider of providers) {
-    fragment.append(buildCard(provider, thresholds, crossRegion));
+    fragment.append(buildCard(provider, thresholds));
   }
   els.grid.append(fragment);
   applyStagger(els.grid, 'grid');
 }
 
-function buildCard(provider, thresholds, crossRegion = new Set()) {
+function buildCard(provider, thresholds) {
   const node = els.cardTemplate.content.firstElementChild.cloneNode(true);
   const healthy = provider.status === 'ok' || provider.status === 'demo';
   node.dataset.state = healthy ? 'ok' : 'failed';
@@ -632,13 +578,8 @@ function buildCard(provider, thresholds, crossRegion = new Set()) {
   node.querySelector('.card__name').textContent = provider.displayName;
 
   const tags = node.querySelector('.card__tags');
-  // 同平台跨站点时（Qoder 国内 / 国际），徽标说「CN / 国际版」才和左侧子菜单对得上；
-  // 只有一个站点的平台保持原「国内 / 国际」，不为没有歧义的地方造新词
-  const regionText = crossRegion.has(provider.provider)
-    ? (SITE_LABELS[provider.region] ?? String(provider.region ?? '').toUpperCase())
-    : provider.region === 'cn'
-      ? '国内'
-      : '国际';
+  // 一个平台一个站点：徽标就是该平台归属的区域，不再有「同平台跨站点」需要区分
+  const regionText = provider.region === 'cn' ? '国内' : '国际';
   tags.append(element('span', `chip chip--${provider.region}`, regionText));
   if (provider.status === 'demo') tags.append(element('span', 'chip chip--demo', '示例数据'));
   if (provider.stale) tags.append(element('span', 'chip chip--warning', '数据可能过期'));
@@ -972,18 +913,15 @@ function cardTarget(provider) {
   };
 }
 
-function dialogTarget(platform, site = null) {
+function dialogTarget(platform) {
   return {
     provider: {
       provider: platform.id,
       displayName: platform.displayName,
       manageAccounts: platform.manageAccounts,
     },
-    // 站点行各自一个键：结果提示、展开态、登录清理都按行隔离
-    key: site ? `platform#${platform.id}#${site}` : `platform#${platform.id}`,
+    key: `platform#${platform.id}`,
     currentAccountId: null,
-    /** 站点锁定值（null = 该平台没有站点维度，或该行不提供添加） */
-    siteScope: site,
     alwaysOpen: true,
     async refresh() {
       state.platformOverview = null;
@@ -1098,12 +1036,6 @@ const LOGIN_STATUS_TEXT = {
 
 const LOGIN_TERMINAL = new Set(['ready', 'expired', 'failed', 'cancelled', 'invalid']);
 
-/** 登录站点下拉的展示文案（值仍用适配器声明的 cn / global） */
-const LOGIN_SITE_LABELS = {
-  cn: '国内站 qoder.com.cn',
-  global: '国际站 qoder.com',
-};
-
 /**
  * 一个平台的登录块：按钮组（按 loginMethods 声明渲染）→ 申请会话 →
  * 画二维码 / 给链接 / 等网页抓取 → 轮询 → 刷新看板。
@@ -1113,9 +1045,11 @@ const LOGIN_SITE_LABELS = {
  *     Qoder 的「网页端登录」由服务端驱动本机 Chrome，也不产生二维码）；
  *   - 面板状态存 `state.login`，按「providerId + method」记——同一平台的
  *     扫码与网页端登录是两个会话，互不挤占；卡片与弹窗共享同一会话；
- *   - 同一方法只保留一个会话：再点同方法按钮会先取消旧会话。
+ *   - 同一方法只保留一个会话：再点同方法按钮会先取消旧会话；
+ *   - **站点不在登录块里选**：国内站 / 国际站已是两个平台（qoder / qoder-intl），
+ *     登录目标由 provider 决定，请求体只带 provider。
  */
-function renderLogin(box, target, loginMeta, siteField = null) {
+function renderLogin(box, target, loginMeta) {
   const panel = box.querySelector('.login__panel');
   const canvas = box.querySelector('.login__canvas');
   const qrFallback = box.querySelector('.login__qr-fallback');
@@ -1137,12 +1071,6 @@ function renderLogin(box, target, loginMeta, siteField = null) {
     state.login?.providerId === providerId && state.login.method === methodId
       ? state.login.session
       : null;
-
-  // 站点选择：只有「声明了站点 option 的平台」（Qoder）才渲染，选项直接取
-  // manageFields 的 choices，与手工表单同源。
-  const siteBox = box.querySelector('.login__site');
-  const siteSelect = box.querySelector('.login__site-select');
-  siteBox.hidden = !siteField;
 
   // 按钮组：方法清单来自 /api/providers 的 loginMethods（前端不认平台名）。
   // loginMeta 兼容旧字段：声明了 loginMethods 的平台以它为准。
@@ -1228,34 +1156,12 @@ function renderLogin(box, target, loginMeta, siteField = null) {
     }
   };
 
-  // 初绘：把当前会话（如有）画到它自己的方法按钮上；站点下拉只认当前会话
+  // 初绘：把当前会话（如有）画到它自己的方法按钮上
   const currentSession = methodButtons.map((m) => sessionOf(m.id)).find(Boolean) ?? null;
   if (currentSession) {
     paint(currentSession, currentSession.method);
   } else {
     paint(null, null);
-  }
-  if (siteField) {
-    if (siteSelect.options.length === 0) {
-      // 登录只支持「具体站点」：auto 是探测策略，不是登录目标，过滤掉
-      for (const choice of siteField.choices ?? []) {
-        if (choice === 'auto') continue;
-        const option = document.createElement('option');
-        option.value = choice;
-        option.textContent = LOGIN_SITE_LABELS[choice] ?? choice;
-        if (choice === (siteField.defaultValue ?? 'cn')) option.selected = true;
-        siteSelect.append(option);
-      }
-    }
-    siteSelect.disabled = Boolean(currentSession && !LOGIN_TERMINAL.has(currentSession.status));
-    // 从站点行进来的：站点锁定（站点行本身就是「我要加国际版」的入口），
-    // 否则回显会话实际申请的站点（卡片重建 / 弹窗切换后仍对得上）
-    if (target.siteScope) {
-      siteSelect.value = target.siteScope;
-      siteSelect.disabled = true;
-    } else if (currentSession?.site) {
-      siteSelect.value = currentSession.site;
-    }
   }
 
   for (const method of methodButtons) {
@@ -1273,14 +1179,12 @@ function renderLogin(box, target, loginMeta, siteField = null) {
           if (state.login.timer) clearTimeout(state.login.timer);
           state.login = null;
         }
-        // 站点随会话一起提交：登录结果落库时带同一站点，之后 probe 走对应 origin
-        const options = {};
-        if (siteField) options[siteField.key] = siteSelect.value;
+        // 登录目标站点由 provider 决定（国内版 qoder / 国际版 qoder-intl），
+        // 请求体不再带站点选项
         const payload = await loginRequest('/api/login/start', {
           body: {
             provider: providerId,
             ...(methodId === 'default' ? {} : { method: methodId }),
-            ...(siteField ? { options } : {}),
           },
         });
         const view = payload.session;
@@ -1376,7 +1280,7 @@ function scheduleLoginPoll(providerId) {
         if (els.platformsDialog.open) await renderPlatformDialog();
       } else {
         // 失败 / 过期 / 取消：收起管理区，避免二维码面板一直占着卡片。
-        // 弹窗的键形如 `platform#<provider>` 或 `platform#<provider>#<site>`（站点行），
+        // 弹窗的键形如 `platform#<provider>`，卡片的键形如 `<provider>#<账号>`，
         // 所以按前缀匹配，不能只比全等。
         for (const key of [...state.manageOpen]) {
           if (key.startsWith(`${providerId}#`) || key.startsWith(`platform#${providerId}`)) {
@@ -1449,19 +1353,12 @@ function renderManage(root, target, options = {}) {
   // loginMeta.methods 来自 /api/providers 的 loginMethods（后端对未声明多方法的
   // 平台自动回退为单方法清单），renderLogin 据此渲染按钮组。
   const loginMeta = meta?.login ? { ...meta.login, methods: meta.loginMethods ?? [] } : null;
-  // 多站点平台的登录站点选择：取 manageFields 里「有 choices 的第一个 option 字段」，
-  // 前端不认平台名——Qoder 的 site（cn / global / auto）之外，
-  // 未来别的平台声明站点字段也能直接复用这块 UI。
-  const siteField =
-    (meta?.manageFields ?? []).find(
-      (field) => field.target === 'option' && Array.isArray(field.choices) && field.choices.length > 0,
-    ) ?? null;
   loginBox.hidden = !loginMeta;
   if (loginMeta) {
     loginHint.textContent = loginMeta.hint;
     loginHint.hidden = !loginMeta.hint;
     manual.querySelector('summary').textContent = '手工填写凭证（兜底）';
-    renderLogin(loginBox, target, loginMeta, siteField);
+    renderLogin(loginBox, target, loginMeta);
   } else {
     // 没有登录能力：表单就是唯一入口，不再叫「兜底」
     manual.querySelector('summary').textContent = '填写凭证';
@@ -1481,8 +1378,8 @@ function renderManage(root, target, options = {}) {
     status.textContent = text;
   };
 
-  // 字段声明：有 choices 的渲染成下拉框（如 Qoder 的站点 cn / global / auto），
-  // 长文本（Cookie 可达数 KB）用 textarea，其余用密码框
+  // 字段声明：有 choices 的渲染成下拉框，长文本（Cookie 可达数 KB）用
+  // textarea，其余用密码框
   const fields = meta?.manageFields ?? [];
   fieldsBox.replaceChildren();
   for (const field of fields) {
@@ -1510,19 +1407,6 @@ function renderManage(root, target, options = {}) {
     }
     input.name = field.key;
     if (field.placeholder) input.placeholder = field.placeholder;
-    // 从「平台与账号」的站点行进来时，站点已选定：预置并置灰，
-    // 避免「点了国际版入口却把账号加进国内版」
-    if (target.siteScope && siteField && field.key === siteField.key) {
-      input.value = target.siteScope;
-      input.disabled = true;
-      label.append(
-        element(
-          'span',
-          'manage__field-hint',
-          `已按「${SITE_LABELS[target.siteScope] ?? target.siteScope}」添加，不能在此切换`,
-        ),
-      );
-    }
     label.append(input);
     // 必填标记：成组字段（CodeArts 的 SecretKey）随配对字段的填写状态变化，
     // 所以单独挂一个可更新的 <span>，由 updateGroupRules 统一刷新
@@ -1629,16 +1513,9 @@ function renderManage(root, target, options = {}) {
     };
   }
 
-  /**
-   * 表单重置。站点被锁定时必须把站点值压回去：`form.reset()` 会把下拉恢复成
-   * 声明里的默认值（cn），于是「国际版入口」连续添加第二个账号时会静默变回国内版。
-   */
+  /** 表单重置：回到声明的默认值（站点已由 provider 表达，不再有需要压回的值） */
   const resetForm = () => {
     form.reset();
-    if (target.siteScope && siteField) {
-      const input = form.elements[siteField.key];
-      if (input) input.value = target.siteScope;
-    }
   };
 
   cancel.onclick = () => {
@@ -1685,7 +1562,8 @@ function renderManage(root, target, options = {}) {
       const optionText = Object.entries(result.options ?? {})
         .map(([key, value]) => `${key}=${value}`)
         .join(' · ');
-      // 变量名跟着站点走（国际站写 QODER_GLOBAL_*），回显出来让人知道凭证落在哪
+      // 凭证变量名由适配器声明（国内版平台写 QODER_*，国际版写 QODER_GLOBAL_*），
+      // 回显出来让人知道凭证落在哪
       const envText = (result.envRefs ?? []).join(' / ');
       setManageMessage(
         target.key,
@@ -1733,24 +1611,20 @@ function renderManage(root, target, options = {}) {
  *     在界面上就删不掉了。
  */
 function renderConfiguredAccounts(box, target, accounts) {
-  // 弹窗里服务的是整个平台（没有「当前卡片」），卡片里则要标出自己
+  // 弹窗里服务的是整个平台（没有「当前卡片」），卡片里则要标出自己。
+  // 「整个平台」= 这一个 provider：国内站 / 国际站已拆成两个 provider，
+  // /api/accounts?provider= 返回的就是该站点的账号，前端不再按站点二次筛选。
   const currentAccountId = target.currentAccountId;
-  // 从站点行进来的管理视图只列该站点的账号，避免两行内容一模一样
-  const scope = target.siteScope ?? null;
-  const scoped = scope ? accounts.filter((account) => account.options?.site === scope) : accounts;
   const shown = new Set(
     currentAccountId === null ? [] : ((currentAccountId && target.provider.entries) || []).map((entry) => entry.id),
   );
   const single = currentAccountId !== null && shown.size === 0;
-  const list = single ? scoped : scoped.filter((account) => !shown.has(account.id));
+  const list = single ? accounts : accounts.filter((account) => !shown.has(account.id));
 
   box.hidden = list.length === 0;
-  const scopeText = scope ? `${SITE_LABELS[scope] ?? scope}` : '';
   box.querySelector('.manage__hidden-title').textContent =
     currentAccountId === null
-      ? scope
-        ? `本平台${scopeText}已配置的账号：`
-        : '本平台已配置的账号：'
+      ? '本平台已配置的账号：'
       : single
         ? '本平台已配置的账号（当前卡片已标出）：'
         : '以下账号已配置但未显示在卡片上（已停用或缺凭证）：';
@@ -1791,80 +1665,8 @@ async function loadPlatformOverview(force = false) {
   return payload;
 }
 
-/**
- * 平台的「站点字段」声明：`manageFields` 里第一个 `target === 'option'` 且带 `choices`
- * 的字段（Qoder 的 `site`）。返回 null 表示该平台没有站点维度——弹窗保持一行。
- *
- * 入参可以是 `/api/accounts/overview` 的平台对象，也可以是 `/api/providers` 的元信息，
- * 两者都带 `manageFields`；前端不认平台名，只认这个声明。
- */
-function siteFieldOf(platformOrMeta) {
-  const fields = platformOrMeta?.manageFields ?? [];
-  return (
-    fields.find(
-      (field) =>
-        field.target === 'option' && Array.isArray(field.choices) && field.choices.length > 0,
-    ) ?? null
-  );
-}
-
-/**
- * 「平台与账号」弹窗的行模型：声明了站点字段的平台按站点拆行，其余平台一行。
- *
- * 返回 `[{ key, platform, site, label, accounts, addable }]`：
- *   - `site`：该行锁定的站点值；`null` = 该行不是「某个具体站点」
- *   - `addable`：是否给「登录 / 添加账号」入口。`auto` 是探测策略不是登录目标
- *     （登录下拉本来就过滤它），未声明站点的历史账号同理——只列出来、能删，不能加
- *   - 站点行**即使 0 个账号也保留**：那正是「我要加国际版」的入口
- */
-function platformSections(platform) {
-  const accounts = platform.accounts ?? [];
-  const field = siteFieldOf(platform);
-  // 账号没带 options = 后端还是旧版（服务未重启，没下发 declaredOptionsOf 的结果）。
-  // 此时无法分桶，退回「一行」，否则所有账号会全落进「其他站点」，比不拆更误导。
-  const canSplit = Boolean(field) && accounts.every((account) => account.options !== undefined);
-  if (!field || !canSplit) {
-    return [
-      {
-        key: platform.id,
-        platform,
-        site: null,
-        label: platform.displayName,
-        accounts,
-        addable: true,
-      },
-    ];
-  }
-
-  const sites = (field.choices ?? []).filter((choice) => choice !== 'auto');
-  const sections = sites.map((site) => ({
-    key: `${platform.id}#${site}`,
-    platform,
-    site,
-    label: siteFilterTerm(platform.displayName, site),
-    accounts: accounts.filter((account) => account.options?.[field.key] === site),
-    addable: true,
-  }));
-
-  // 站点值不在声明里（auto / 空 / 历史取值）的账号单独一行：
-  // 不能丢——它们还得能在这里删掉；但也不该被算进某个站点
-  const rest = accounts.filter((account) => !sites.includes(account.options?.[field.key]));
-  if (rest.length > 0) {
-    sections.push({
-      key: `${platform.id}#other`,
-      platform,
-      site: null,
-      label: `${platform.displayName} 其他站点`,
-      accounts: rest,
-      addable: false,
-    });
-  }
-  return sections;
-}
-
-function openPlatformsDialog(providerId = null, site = null) {
+function openPlatformsDialog(providerId = null) {
   state.dialog.providerId = providerId;
-  state.dialog.site = site;
   if (!els.platformsDialog.open) els.platformsDialog.showModal();
   void renderPlatformDialog();
 }
@@ -1895,17 +1697,9 @@ async function renderPlatformDialog() {
     const platform = platforms.find((item) => item.id === providerId);
     if (!platform) {
       state.dialog.providerId = null;
-      state.dialog.site = null;
       return renderPlatformDialog();
     }
-    // 按站点定位到具体那一行：站点从入口带进来（Qoder 国内版 / 国际版）
-    const sections = platformSections(platform);
-    const section =
-      sections.find(
-        (item) =>
-          item.key === (state.dialog.site ? `${platform.id}#${state.dialog.site}` : platform.id),
-      ) ?? sections[0];
-    renderPlatformManage(section);
+    renderPlatformManage(platform);
     return;
   }
 
@@ -1915,10 +1709,8 @@ async function renderPlatformDialog() {
     `${platforms.length} 个平台 · 已配置 ${totalAccounts} 个账号 · 所有操作都在本机完成`;
 
   const list = element('div', 'platforms');
-  // 一个平台可能拆成多行（声明了站点字段的平台按站点拆），行数 ≠ 平台数
-  for (const platform of platforms) {
-    for (const section of platformSections(platform)) list.append(buildPlatformRow(section));
-  }
+  // 一个平台一行：国内站 / 国际站拆成两个平台后，行数就是平台数
+  for (const platform of platforms) list.append(buildPlatformRow(platform));
   els.platformsBody.append(list);
 
   // 配置文件 / 环境变量层面的问题一并透出，省得再去看服务日志
@@ -1946,26 +1738,19 @@ async function renderPlatformDialog() {
 /**
  * 平台列表里的一行：身份 + 账号清单 + 操作入口。
  *
- * `section` 来自 `platformSections()`：声明了站点字段的平台会拆成「国内版 / 国际版」
- * 各一行，每行只列该站点的账号、只带该站点锁定的添加入口。
+ * 一个平台一行。国内站 / 国际站是两个平台（`qoder` / `qoder-intl`），
+ * 显示名里已带「国内版 / 国际版」，所以既不再拆行、也不在账号行上标站点。
  */
-function buildPlatformRow(section) {
-  const { platform, site, accounts, addable } = section;
-  const split = Boolean(siteFieldOf(platform));
+function buildPlatformRow(platform) {
+  const accounts = platform.accounts ?? [];
   const row = element('div', 'platform');
   const head = element('div', 'platform__head');
 
   const title = element('div', 'platform__title');
   title.append(element('span', 'platform__name', platform.displayName));
-  // 站点行显示「国内版 / 国际版」（与「按平台」子菜单同一份文案）；
-  // 没拆站点的平台保持原来的「国内 / 国际」区域徽标
-  const regionText = site
-    ? (SITE_LABELS[site] ?? site)
-    : platform.region === 'cn'
-      ? '国内'
-      : '国际';
-  const regionClass = site ?? platform.region;
-  title.append(element('span', `chip chip--${regionClass}`, regionText));
+  // 徽标就是该平台归属的区域（国内 / 国际）
+  const regionText = platform.region === 'cn' ? '国内' : '国际';
+  title.append(element('span', `chip chip--${platform.region}`, regionText));
   title.append(
     element(
       'span',
@@ -1978,34 +1763,26 @@ function buildPlatformRow(section) {
   // 与后端 addManagedAccount 的放行条件一致：没有 manageFields 的平台即便声明了
   // manageAccounts 也无法通过通用接口落库，所以这里不假装可以网页添加
   const supported = platform.manageAccounts && (platform.manageFields ?? []).length > 0;
-  if (supported && addable) {
+  if (supported) {
     const open = element('button', 'secret__btn secret__btn--primary', '登录 / 添加账号');
     open.type = 'button';
     open.addEventListener('click', () => {
       state.dialog.providerId = platform.id;
-      state.dialog.site = site;
       void renderPlatformDialog();
     });
     head.append(open);
-  } else if (supported && !addable) {
-    // 「其他站点」行：这些账号的站点值不是具体站点（auto / 未指定），
-    // 没有可锁定的添加目标，只保留删除能力
-    head.append(element('span', 'platform__unsupported', '站点未指定，暂不支持在此添加'));
   } else {
     head.append(element('span', 'platform__unsupported', '暂不支持网页添加'));
   }
   row.append(head);
 
   if (accounts.length > 0) {
-    const target = dialogTarget(platform, site);
+    const target = dialogTarget(platform);
     const listNode = element('div', 'platform__accounts');
     for (const account of accounts) {
       const accountRow = element('div', 'hidden-account');
       accountRow.append(element('span', 'hidden-account__name', account.label));
       const flags = [];
-      // 未拆站点的平台在账号行上标出站点（拆过站的平台已由行标题表达）
-      const accountSite = account.options?.site;
-      if (!site && accountSite) flags.push(SITE_LABELS[accountSite] ?? accountSite);
       if (!account.enabled) flags.push('已停用');
       if (!account.complete) flags.push('缺凭证');
       const preview = Object.values(account.previews ?? {}).filter(Boolean)[0];
@@ -2017,10 +1794,9 @@ function buildPlatformRow(section) {
       listNode.append(accountRow);
     }
     row.append(listNode);
-  } else if (!split) {
+  } else {
     // 没有网页入口的平台（CodeArts / MiniMax / custom）：把「怎么做」直接摆在页面上
     // （只引用变量名与抓取命令，不含任何明文凭证）
-    // 拆过站点的平台不重复贴这段长文案——两行各贴一遍只会把弹窗撑爆
     row.append(element('p', 'platform__hint', platform.credentialHint));
   }
   return row;
@@ -2028,30 +1804,24 @@ function buildPlatformRow(section) {
 
 /**
  * 平台的管理视图：复用卡片里的同一套登录 / 表单 / 账号列表。
- * 从站点行进来时（`section.site` 非空）标题写清版本，站点在表单与登录块里锁定。
+ * 站点由平台本身表达（国内版 / 国际版各是一个平台），表单与登录块不再有站点维度。
  */
-function renderPlatformManage(section) {
-  const { platform, site, label } = section;
-  els.platformsTitle.textContent = label;
-  const siteNote = site
-    ? `站点已锁定为「${SITE_LABELS[site] ?? site}」，此处只会添加该站点的账号。`
-    : '';
+function renderPlatformManage(platform) {
+  els.platformsTitle.textContent = platform.displayName;
   els.platformsSubtitle.textContent =
-    siteNote + (platform.manageHint || '登录或填写凭证，验证通过后写入本机配置');
+    platform.manageHint || '登录或填写凭证，验证通过后写入本机配置';
 
   const back = element('button', 'secret__btn dialog__back', '← 返回平台列表');
   back.type = 'button';
   back.addEventListener('click', () => {
     state.dialog.providerId = null;
-    state.dialog.site = null;
     void renderPlatformDialog();
   });
   els.platformsBody.append(back);
 
   const root = els.manageTemplate.content.firstElementChild.cloneNode(true);
   els.platformsBody.append(root);
-  // 站点随 target 传入：手工表单与登录块都会预置并置灰该站点
-  renderManage(root, dialogTarget(platform, site));
+  renderManage(root, dialogTarget(platform));
 }
 
 /**
@@ -2370,8 +2140,8 @@ function countDiagnostics(data) {
 }
 
 /**
- * 「按平台」子菜单：一行一个平台（同一平台的多个账号合成一行），
- * 跨站点的平台（Qoder 国内 / 国际）按站点拆行，标签为 `Qoder CN` / `Qoder 国际版`。
+ * 「按平台」子菜单：一行一个平台（同一平台的多个账号合成一行）。
+ * 国内站 / 国际站是两个平台，各自一行（显示名已带「国内版 / 国际版」）。
  * 右侧是该组金额合计与组内最紧急的到期状态点。
  * data 为 null（首屏接口还没回来）时保持空清单，不写占位行。
  */
@@ -2388,9 +2158,8 @@ function renderNavPlatforms(data) {
       const amount = groupBalance(group.members);
       const row = element('button', 'nav__sub-item');
       row.type = 'button';
-      // 点行 = 把组标签写进筛选框（跨站点行即「Qoder CN」这类站点筛选词）
+      // 点行 = 把平台标签写进筛选框（标签就是适配器显示名）
       row.dataset.provider = group.provider;
-      if (group.region) row.dataset.region = group.region;
       row.dataset.filter = group.label;
 
       const dot = element('span', 'nav__sub-dot');
@@ -2631,8 +2400,7 @@ function buildCommands() {
     { label: '打开平台与账号', hint: '操作', run: () => openPlatformsDialog() },
     { label: '切换自动刷新', hint: '操作', run: () => toggleAutoRefresh() },
   ];
-  // 平台命令与「按平台」子菜单同源（platformGroups）：跨站点平台出两条
-  // 「查看 Qoder CN / 查看 Qoder 国际版」，不拆站点的平台仍是一条
+  // 平台命令与「按平台」子菜单同源（platformGroups）：一个平台一条「查看 X」
   for (const group of platformGroups(state.data)) {
     items.push({
       label: `查看 ${group.label}`,
@@ -2868,7 +2636,6 @@ els.platformsDialog.addEventListener('click', (event) => {
 });
 els.platformsDialog.addEventListener('close', () => {
   state.dialog.providerId = null;
-  state.dialog.site = null;
 });
 els.autoRefresh.addEventListener('change', (event) => {
   state.autoRefresh = event.target.checked;
