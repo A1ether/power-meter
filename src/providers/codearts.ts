@@ -59,6 +59,20 @@ function withStamp(path: string): string {
   return `${CA_BASE}${path}${path.includes('?') ? '&' : '?'}_=${Date.now()}`;
 }
 
+/**
+ * 按天用量的诊断日志：明细与探测同 TTL（默认 5 分钟一轮），同样的结论反复打印会
+ * 把真正有用的日志淹掉，因此**同一进程内只在结论变化时打印一次**。
+ *
+ * 为什么值得留痕：「余额在跌、今日用量却是 0」这类问题只能靠它区分
+ * 「上游当天没出数」与「接口结构变了」，见 docs/fixes/用量明细-CodeArts今日用量恒为0-修复方案.md。
+ */
+let lastDailyUseNote = '';
+function logDailyUse(ctx: ProbeContext, note: string): void {
+  if (note === lastDailyUseNote) return;
+  lastDailyUseNote = note;
+  ctx.log(`CodeArts 按天用量：${note}`);
+}
+
 /** 控制台 portal 请求头（Cookie + cftk 推导；缺 x-requested-with 会被网关当路由、返回 HTML） */
 export function consoleHeaders(account: AccountConfig, cookie: string): Record<string, string> {
   const cftk = optString(account, 'cftk') || cookieValue(cookie, CFTK_COOKIE_NAME);
@@ -561,24 +575,50 @@ export const codeartsAdapter: ProviderAdapter = {
         },
       );
       if (!isRecord(body)) {
-        ctx.log('CodeArts 控制台按天用量返回空响应（登录态可能已失效），退回本地采样');
+        logDailyUse(ctx, '控制台按天用量返回空响应（登录态可能已失效），退回本地采样');
       }
       const data = pick(body, 'data');
       const series = isRecord(data) ? pick(data, 'series') : undefined;
       const creditsSeries = Array.isArray(series)
         ? series.find((item) => isRecord(item) && /credit/i.test(String(pick(item, 'name') ?? '')))
         : undefined;
-      if (isRecord(creditsSeries)) {
-        const cells = pick(creditsSeries, 'cells');
-        if (Array.isArray(cells)) {
-          for (const cell of cells) {
-            if (!isRecord(cell)) continue;
-            const at = localNoonOf(String(pick(cell, 'xLabel', 'x_label') ?? ''));
-            const amount = firstNumber(pick(cell, 'value'));
-            if (at === null || amount === null || amount <= 0) continue;
-            records.push({ at, kind: 'use', amount });
+      const cells = isRecord(creditsSeries) ? pick(creditsSeries, 'cells') : undefined;
+      if (!Array.isArray(cells) || cells.length === 0) {
+        // 找不到积分序列（或没有格子）：接口结构可能已变 —— 必须*不*声明覆盖，
+        // 否则「今天/昨天没有记录」会被上游口径补成确定的 0（余额在跌却显示 0）
+        logDailyUse(ctx, '按天用量里没有可用的积分格子（接口结构可能已变），退回本地采样');
+      } else {
+        let unparsed = 0;
+        let todayCells = 0;
+        const todayStart = startOfDay(ctx.now);
+        for (const cell of cells) {
+          if (!isRecord(cell)) {
+            unparsed += 1;
+            continue;
           }
+          const at = localNoonOf(String(pick(cell, 'xLabel', 'x_label') ?? ''));
+          const amount = firstNumber(pick(cell, 'value'));
+          // 解析不出的格子既不能当 0、也不能当覆盖依据；解析得出的 0 是有效值（当天确实没消耗）
+          if (at === null || amount === null) {
+            unparsed += 1;
+            continue;
+          }
+          if (at >= todayStart) todayCells += 1;
+          if (amount <= 0) continue;
+          records.push({ at, kind: 'use', amount });
+        }
+        if (unparsed === cells.length) {
+          logDailyUse(
+            ctx,
+            `按天用量 ${cells.length} 格全部无法解析（xLabel 结构可能已变），退回本地采样`,
+          );
+        } else {
           useCovered = true;
+          // 上游按天聚合当天可能尚未出数：不在这里纠偏（编排层会用本地观测兜底），
+          // 但要留痕，便于把「今日用量为什么来自本地观测」对上时间点
+          if (todayCells === 0) {
+            logDailyUse(ctx, '按天用量没有「今天」这一格（上游当天未出数），今日用量交给本地观测兜底');
+          }
         }
       }
     } catch (error) {
