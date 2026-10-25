@@ -1670,6 +1670,16 @@ kbd {
   font-variant-numeric: tabular-nums;
 }
 
+/* 额度后的人民币估值（各平台官方单价折算；口径与出处见悬停）：次要信息，别抢额度本身 */
+.timeline__cny {
+  margin-left: 6px;
+  color: var(--text-3);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
 .timeline__badge {
   min-width: 58px;
   color: var(--text-3);

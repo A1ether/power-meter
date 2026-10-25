@@ -1,4 +1,5 @@
 import { daysBetween } from './lib/json.js';
+import { cnyValueFor } from './credit-value.js';
 import { mergeSources } from './usage-ledger.js';
 import type {
   Currency,
@@ -206,6 +207,24 @@ export function buildTotals(snapshots: ProviderSnapshot[]): DashboardTotals {
 export function buildExpiryTimeline(snapshots: ProviderSnapshot[], now: number): ExpiryHit[] {
   const hits: ExpiryHit[] = [];
 
+  /**
+   * 一笔额度的人民币估值 + 换算口径（见 src/credit-value.ts）。
+   * 只在事件生成时算一次：前端拿到现成数字，不重复实现换算。
+   */
+  const cnyOf = (
+    snapshot: ProviderSnapshot,
+    currency: Currency,
+    amount: number,
+  ): Pick<ExpiryHit, 'cny' | 'cnyNote'> => {
+    const value = cnyValueFor({
+      provider: snapshot.provider,
+      region: snapshot.region,
+      currency,
+      amount,
+    });
+    return { cny: value?.cny ?? null, cnyNote: value?.note ?? null };
+  };
+
   for (const snapshot of snapshots) {
     const futureLots = snapshot.credits
       .filter((lot) => lot.expiresAt !== null && lot.amount > 0)
@@ -223,6 +242,7 @@ export function buildExpiryTimeline(snapshots: ProviderSnapshot[], now: number):
         currency: lot.currency,
         expiresAt: lot.expiresAt as string,
         inDays: daysBetween(now, lot.expiresAt as string),
+        ...cnyOf(snapshot, lot.currency, lot.amount),
       });
       // ts 已参与排序，这里显式引用避免未使用变量
       void ts;
@@ -234,15 +254,19 @@ export function buildExpiryTimeline(snapshots: ProviderSnapshot[], now: number):
       const ts = Date.parse(snapshot.nextExpiryAt);
       if (Number.isFinite(ts) && ts >= now) {
         const totalAmount = snapshot.credits.reduce((sum, lot) => sum + lot.amount, 0);
+        const boundaryAmount = round(totalAmount || snapshot.balance?.amount || 0);
+        const boundaryCurrency =
+          snapshot.credits[0]?.currency ?? snapshot.balance?.currency ?? 'CREDITS';
         hits.push({
           provider: snapshot.provider,
           displayName: snapshot.displayName,
           lotId: 'window-boundary',
           lotLabel: '本期额度重置（未用完即作废）',
-          amount: round(totalAmount || snapshot.balance?.amount || 0),
-          currency: snapshot.credits[0]?.currency ?? snapshot.balance?.currency ?? 'CREDITS',
+          amount: boundaryAmount,
+          currency: boundaryCurrency,
           expiresAt: snapshot.nextExpiryAt,
           inDays: daysBetween(now, snapshot.nextExpiryAt),
+          ...cnyOf(snapshot, boundaryCurrency, boundaryAmount),
         });
       }
     }

@@ -175,6 +175,11 @@ const els = {
 };
 
 const numberFormat = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 });
+/* 人民币估值用两位小数：¥0.05 单价的小额批次也要看得见差别 */
+const cnyFormat = new Intl.NumberFormat('zh-CN', {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
 const dateFormat = new Intl.DateTimeFormat('zh-CN', {
   year: 'numeric',
   month: '2-digit',
@@ -186,6 +191,12 @@ const dateFormat = new Intl.DateTimeFormat('zh-CN', {
 function fmtNumber(value) {
   if (value === null || value === undefined || Number.isNaN(value)) return '–';
   return numberFormat.format(value);
+}
+
+/** 人民币估值：空值返回空串（整块不渲染，别在界面上留「¥–」） */
+function fmtCny(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return '';
+  return `¥${cnyFormat.format(value)}`;
 }
 
 function fmtDate(iso) {
@@ -2205,10 +2216,19 @@ function renderTimeline(data) {
     const level = levelFor(hit.inDays, data.expiryThresholds);
     const item = element('li');
     item.dataset.level = level;
+
+    // 额度 + 人民币估值：估值与口径来自后端（src/credit-value.ts），前端只负责显示
+    const amount = element('span', 'timeline__amount', `${fmtNumber(hit.amount)} ${hit.currency}`);
+    if (typeof hit.cny === 'number') {
+      const cny = element('em', 'timeline__cny', `≈ ${fmtCny(hit.cny)}`);
+      if (hit.cnyNote) cny.title = hit.cnyNote;
+      amount.append(' ', cny);
+    }
+
     item.append(
       element('span', 'timeline__when', fmtDate(hit.expiresAt)),
       element('span', 'timeline__name', `${hit.displayName} · ${hit.lotLabel}`),
-      element('span', 'timeline__amount', `${fmtNumber(hit.amount)} ${hit.currency}`),
+      amount,
       element('span', 'timeline__badge', expiryText(hit.inDays)),
     );
     fragment.append(item);

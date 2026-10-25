@@ -216,6 +216,13 @@ export interface ExpiryHit {
   currency: Currency;
   expiresAt: string;
   inDays: number;
+  /**
+   * 该笔额度的人民币估值（元）——各平台官方「积分包 / 增购积分」单价折算，
+   * 见 `src/credit-value.ts`。`null` = 不折算（非 CREDITS 单位，或该平台没有官方单价）。
+   */
+  cny: number | null;
+  /** 上面这个数字的换算口径明细（多行文本，前端直接用作悬停说明）；不折算时为 null */
+  cnyNote: string | null;
 }
 
 export interface DashboardTotals {
