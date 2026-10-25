@@ -57,6 +57,10 @@ function describe(body: unknown): string {
     if (Array.isArray(items)) extra = `；data.items 长度 = ${items.length}`;
     const benefits = dataRecord.benefits;
     if (Array.isArray(benefits)) extra = `；data.benefits 长度 = ${benefits.length}`;
+    // 活动明细是分页接口：total 是「该活动全部笔数」，与 benefits 长度不等即发生截断
+    // （见 docs/fixes/CodeArts-活动奖励逐笔分页截断-修复方案.md）
+    const total = dataRecord.total;
+    if (typeof total === 'number') extra += `；data.total = ${total}`;
   }
   return `顶层字段：${keys}${extra}`;
 }
@@ -211,11 +215,32 @@ async function main(): Promise<void> {
       : undefined;
 
   if (Array.isArray(items) && items.length > 0) {
+    let firstCampaignId: string | null = null;
     for (const item of items.slice(0, 3)) {
       if (item === null || typeof item !== 'object') continue;
       const id = (item as Record<string, unknown>).campaignId ?? (item as Record<string, unknown>).campaign_id;
       if (id === undefined || id === null) continue;
+      if (firstCampaignId === null) firstCampaignId = String(id);
       await call(headers, `/portal/promptcenter/v1/ops/credit/campaign/${String(id)}`, 8_000);
+    }
+    // 分页对照：默认页 vs 显式带分页参数。若后者笔数更多，即确认「超出默认页的批次被截断」，
+    // 批次数应以 `data.total`（或活动列表 claimCount）为准。
+    if (firstCampaignId !== null) {
+      console.log('\n—— 分页对照（判断默认页是否被截断）——');
+      for (const style of [
+        { page: 'page', size: 'size' },
+        { page: 'pageNum', size: 'pageSize' },
+      ]) {
+        await call(
+          headers,
+          `/portal/promptcenter/v1/ops/credit/campaign/${firstCampaignId}?${style.page}=1&${style.size}=100`,
+          8_000,
+        );
+      }
+      console.log(
+        '  判读：任一组合的 benefits 长度 = data.total（或活动列表 claimCount）即取全；' +
+          '若都等于默认页长度，说明分页参数不被识别（需另找命名）。',
+      );
     }
   } else {
     console.log('\n活动列表为空：逐笔明细没有来源（既可能是真的没有进行中的活动，也可能是接口口径变化）');

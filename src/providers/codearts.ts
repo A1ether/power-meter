@@ -89,8 +89,96 @@ export function consoleHeaders(account: AccountConfig, cookie: string): Record<s
 }
 
 /**
+ * ⑤ 单个活动下的全部逐笔（分页取全）。
+ *
+ * 为什么必须翻页：`campaign/{id}` 分页返回，不带参数只给**上游默认页**（实测 20 笔）。
+ * 账号签到笔数超过一页时，缺的批次会被「账户级桶 − 逐笔合计」差额吞并成一条
+ * 「活动奖励积分（未明细部分）」——见
+ * docs/fixes/CodeArts-活动奖励逐笔分页截断-修复方案.md。
+ *
+ * 取全判据（known）：响应 `total` 优先，其次活动列表的 `claimCount`。
+ * 判定不出来时不声明已取全（宁可显式说「未取全」，也不把截断伪装成「只有这些」）。
+ */
+async function fetchCampaignBenefitEntries(
+  headers: Record<string, string>,
+  campaign: CreditCampaign,
+  timeoutMs: number,
+  ctx: ProbeContext,
+): Promise<{
+  entries: CampaignBenefit[];
+  enumerated: number;
+  expected: number | null;
+  complete: boolean;
+}> {
+  const expectedFromList = campaign.claimCount > 0 ? campaign.claimCount : null;
+  let best: { entries: CampaignBenefit[]; total: number | null } = { entries: [], total: null };
+  let lastError: Error | null = null;
+
+  /**
+   * 依次尝试：`page`/`size` → `pageNum`/`pageSize` → **不带参数（历史行为兜底）**。
+   * 末位兜底很关键：若上游拒绝未知查询参数（或分页参数名全猜错），至少拿到默认页，
+   * 不会因为「加参数」这件事本身把整块活动明细弄丢。
+   */
+  const attempts: Array<{ label: string; query: (page: number) => string }> = [
+    ...CAMPAIGN_PAGE_STYLES.map((style) => ({
+      label: `${style.page}/${style.size}`,
+      query: (page: number) => `?${style.page}=${page}&${style.size}=${CAMPAIGN_PAGE_SIZE}`,
+    })),
+    { label: '默认页（无参数）', query: () => '' },
+  ];
+
+  for (const attempt of attempts) {
+    const isPlain = attempt.label === '默认页（无参数）';
+    const seen = new Map<string, CampaignBenefit>();
+    let total: number | null = null;
+    for (let page = 1; page <= (isPlain ? 1 : MAX_CAMPAIGN_PAGES); page += 1) {
+      let parsed: { entries: CampaignBenefit[]; total: number | null };
+      try {
+        const { body } = await fetchJson(
+          withStamp(
+            `/portal/promptcenter/v1/ops/credit/campaign/${campaign.id}${attempt.query(page)}`,
+          ),
+          { headers, timeoutMs: Math.min(timeoutMs, 8_000) },
+        );
+        assertBusinessOk(body);
+        parsed = parseCampaignBenefitEntries(body);
+      } catch (error) {
+        lastError = error as Error;
+        ctx.log(
+          `CodeArts 活动 ${campaign.id} 按「${attempt.label}」取逐笔失败：${lastError.message}`,
+        );
+        break;
+      }
+      if (parsed.total !== null) total = parsed.total;
+      const before = seen.size;
+      for (const entry of parsed.entries) {
+        if (!seen.has(entry.benefitId)) seen.set(entry.benefitId, entry);
+      }
+      const known = total ?? expectedFromList;
+      if (known !== null && seen.size >= known) {
+        return { entries: [...seen.values()], enumerated: seen.size, expected: known, complete: true };
+      }
+      // 本页零新增：该命名不被识别（或确实只有这些）——换下一种再试
+      if (seen.size === before) break;
+    }
+    const entries = [...seen.values()];
+    if (entries.length > best.entries.length) best = { entries, total };
+  }
+
+  // 连默认页都没拿到（网络/业务错误）：抛出去由上层降级，与加参数之前的行为一致
+  if (best.entries.length === 0 && lastError) throw lastError;
+
+  const expected = best.total ?? expectedFromList;
+  ctx.log(
+    `CodeArts 活动 ${campaign.id}（${campaign.title}）逐笔未取全：枚举 ${best.entries.length} 笔` +
+      `${expected !== null ? `，上游声称 ${expected} 笔` : '，上游未给 total'}`,
+  );
+  return { entries: best.entries, enumerated: best.entries.length, expected, complete: false };
+}
+
+/**
  * ④⑤ 活动福利逐笔（登录态口径）：
- * overview 拿活动列表 → campaign/{id} 拿每一笔的 claimedAt / expireAt。
+ * overview 拿活动列表 → campaign/{id} 分页拿每一笔的 claimedAt / expireAt。
  * 失败直接抛错，由调用方决定降级（纯 Cookie 路径退回聚合口径；
  * 混合模式由 AK/SK 兜底余额，只把活动批次降级）。
  */
@@ -98,9 +186,19 @@ async function fetchCampaignBenefits(
   headers: Record<string, string>,
   timeoutMs: number,
   ctx: ProbeContext,
-): Promise<{ lots: CreditLot[]; benefitTotal: number; campaignCount: number }> {
+): Promise<{
+  lots: CreditLot[];
+  benefitTotal: number;
+  campaignCount: number;
+  /** 逐笔未取全时的说明（供「未明细部分」调节项 note 引用）；取全时为 null */
+  coverageNote: string | null;
+}> {
   const lots: CreditLot[] = [];
   let benefitTotal = 0;
+  let enumerated = 0;
+  let expected = 0;
+  let expectedKnown = true;
+  let incomplete = 0;
   const listResponse = await fetchJson(withStamp('/portal/promptcenter/v1/ops/credit/overview'), {
     headers,
     timeoutMs,
@@ -117,12 +215,14 @@ async function fetchCampaignBenefits(
   const campaigns = parseCampaignList(listResponse.body).slice(0, MAX_CAMPAIGNS);
 
   for (const campaign of campaigns) {
-    const detailResponse = await fetchJson(
-      withStamp(`/portal/promptcenter/v1/ops/credit/campaign/${campaign.id}`),
-      { headers, timeoutMs: Math.min(timeoutMs, 8_000) },
-    );
-    assertBusinessOk(detailResponse.body);
-    for (const benefit of parseCampaignBenefits(detailResponse.body)) {
+    const detail = await fetchCampaignBenefitEntries(headers, campaign, timeoutMs, ctx);
+    enumerated += detail.enumerated;
+    if (detail.expected !== null) expected += detail.expected;
+    else expectedKnown = false;
+    if (!detail.complete) incomplete += 1;
+    for (const benefit of detail.entries) {
+      // 已用尽/已过期批次（剩余 ≤ 0）不进列表：既不影响合计，也不该显示为可用额度
+      if (benefit.amount <= 0) continue;
       benefitTotal += benefit.amount;
       lots.push(
         makeLot({
@@ -142,15 +242,37 @@ async function fetchCampaignBenefits(
     }
   }
   ctx.log(
-    `CodeArts 活动逐笔：活动 ${campaigns.length} 个，逐笔 ${lots.length} 笔，合计 ${benefitTotal} 积分`,
+    `CodeArts 活动逐笔：活动 ${campaigns.length} 个，枚举 ${enumerated} 笔（有剩余 ${lots.length} 笔）` +
+      `${expectedKnown ? `，上游声称 ${expected} 笔` : ''}，合计 ${benefitTotal} 积分` +
+      (incomplete > 0 ? `（⚠️ ${incomplete} 个活动未取全，缺额并入「未明细部分」）` : ''),
   );
-  return { lots, benefitTotal, campaignCount: campaigns.length };
+  const coverageNote =
+    incomplete > 0
+      ? `上游分页未取全：枚举 ${enumerated} 笔` +
+        `${expectedKnown ? ` / 上游声称 ${expected} 笔` : ''}，涉及 ${incomplete} 个活动`
+      : null;
+  return { lots, benefitTotal, campaignCount: campaigns.length, coverageNote };
 }
 const CA_TIMEOUT_FALLBACK = 12_000;
 const CFTK_COOKIE_NAME = 'devclouddevuibjtcftk';
 const DEFAULT_RESOURCE_TYPE = 'hws.resource.type.codearts.snap';
 /** 活动数量上限，避免异常账号拉出几百个请求 */
 const MAX_CAMPAIGNS = 20;
+/** ⑤ 明细分页一次取多少笔：取 100 让常见规模（数十笔）一页取全，避免逐笔翻页 */
+const CAMPAIGN_PAGE_SIZE = 100;
+/** ⑤ 单活动最多翻页数（防御上游忽略分页参数时的死循环） */
+const MAX_CAMPAIGN_PAGES = 10;
+/**
+ * ⑤ 分页参数命名候选，按序尝试。
+ * 首选 `page` / `size`：同属 promptcenter 服务的 `credit/admin/usage` 在仓库内已有
+ * 抓包结论使用该命名（docs/plans/供应商卡片-用量与增量字段-开发设计方案.md:44）；
+ * `pageNum` / `pageSize` 作兜底。**不知道命名时不能只看第一页** —— 上游默认页只有
+ * 20 笔，会静默丢掉超出部分（见 docs/fixes/CodeArts-活动奖励逐笔分页截断-修复方案.md）。
+ */
+const CAMPAIGN_PAGE_STYLES = [
+  { page: 'page', size: 'size' },
+  { page: 'pageNum', size: 'pageSize' },
+] as const;
 
 /* ------------------------------------------------------------------ *
  * 「网页端登录」（kind: 'web'）：与 Qoder 同构的登录方法。
@@ -247,7 +369,10 @@ export interface CreditCampaign {
 
 export interface CampaignBenefit {
   benefitId: string;
+  /** 仍有剩余的额度 = claimed − consumed − expired（可能 ≤ 0，表示已用尽/已过期） */
   amount: number;
+  /** 本次领取总量（用量明细的「获取」口径用这个，而不是剩余） */
+  claimedAmount: number;
   expiresAt: string | null;
   claimedAt: string | null;
   validDuration: string;
@@ -274,43 +399,40 @@ export function parseCampaignList(body: unknown): CreditCampaign[] {
   return campaigns;
 }
 
-/** ⑤ 单个活动下每一笔的明细（含各自 expireAt） */
-export function parseCampaignBenefits(body: unknown): CampaignBenefit[] {
+/**
+ * ⑤ 单页响应 → 全部条目 + 上游声称的总笔数。
+ *
+ * **不过滤 `amount ≤ 0`**：翻页进度必须按「本页出现过的全部 benefitId」判定
+ * （已用尽/已过期批次也要计入），否则遇到已用尽批次会被误判成「已到末页」。
+ * 过滤交给调用方（批次列表要正的、用量明细要 claimedAmount）。
+ */
+export function parseCampaignBenefitEntries(body: unknown): {
+  entries: CampaignBenefit[];
+  total: number | null;
+} {
   const data = pick(body, 'data');
   const benefits = isRecord(data) ? pick(data, 'benefits') : undefined;
-  if (!Array.isArray(benefits)) return [];
-  const out: CampaignBenefit[] = [];
+  const total = isRecord(data)
+    ? firstNumber(pick(data, 'total', 'totalCount', 'total_count'))
+    : null;
+  if (!Array.isArray(benefits)) return { entries: [], total };
+  const entries: CampaignBenefit[] = [];
   for (const raw of benefits) {
     if (!isRecord(raw)) continue;
     const claimed = firstNumber(pick(raw, 'claimedAmount', 'claimed_amount')) ?? 0;
     const consumed = firstNumber(pick(raw, 'consumedAmount', 'consumed_amount')) ?? 0;
     const expired = firstNumber(pick(raw, 'expiredAmount', 'expired_amount')) ?? 0;
-    const amount = claimed - consumed - expired;
-    if (amount <= 0) continue;
-    out.push({
-      benefitId: firstString(pick(raw, 'benefitId', 'benefit_id')) || `${out.length}`,
-      amount,
+    entries.push({
+      benefitId:
+        firstString(pick(raw, 'benefitId', 'benefit_id')) || `${raw.length ?? entries.length}`,
+      amount: claimed - consumed - expired,
+      claimedAmount: claimed,
       expiresAt: toIso(pick(raw, 'expireAt', 'expire_at')),
       claimedAt: toIso(pick(raw, 'claimedAt', 'claimed_at')),
       validDuration: firstString(pick(raw, 'validDuration', 'valid_duration')),
     });
   }
-  return out;
-}
-
-/** ⑤ 活动奖励的「获取」记录：claimedAmount（本次领取总量）+ claimedAt，用于日级增量 */
-export function parseCampaignClaims(body: unknown): Array<{ amount: number; claimedAt: string | null }> {
-  const data = pick(body, 'data');
-  const benefits = isRecord(data) ? pick(data, 'benefits') : undefined;
-  if (!Array.isArray(benefits)) return [];
-  const out: Array<{ amount: number; claimedAt: string | null }> = [];
-  for (const raw of benefits) {
-    if (!isRecord(raw)) continue;
-    const amount = firstNumber(pick(raw, 'claimedAmount', 'claimed_amount')) ?? 0;
-    if (amount <= 0) continue;
-    out.push({ amount, claimedAt: toIso(pick(raw, 'claimedAt', 'claimed_at')) });
-  }
-  return out;
+  return { entries, total };
 }
 
 /** countdown 接口把详情塞在 JSON 字符串里 */
@@ -639,19 +761,23 @@ export const codeartsAdapter: ProviderAdapter = {
         // 若这里声明已覆盖，余额明明涨了 1000 也会被压成 0 —— 交给本地采样兜底。
         ctx.log('CodeArts 活动列表为空，获取明细降级为本地采样');
       } else {
+        // 与批次列表共用同一条分页取全路径：漏页会让「获取」增量少算（历史缺陷同源）
+        let grantIncomplete = 0;
         for (const campaign of campaigns) {
-          const detail = await fetchJson(
-            withStamp(`/portal/promptcenter/v1/ops/credit/campaign/${campaign.id}`),
-            { headers, timeoutMs: Math.min(timeoutMs, 8_000) },
-          );
-          assertBusinessOk(detail.body);
-          for (const claim of parseCampaignClaims(detail.body)) {
-            const at = claim.claimedAt ? Date.parse(claim.claimedAt) : Number.NaN;
+          const detail = await fetchCampaignBenefitEntries(headers, campaign, timeoutMs, ctx);
+          if (!detail.complete) grantIncomplete += 1;
+          for (const entry of detail.entries) {
+            if (entry.claimedAmount <= 0) continue;
+            const at = entry.claimedAt ? Date.parse(entry.claimedAt) : Number.NaN;
             if (!Number.isFinite(at)) continue;
-            records.push({ at, kind: 'grant', amount: claim.amount });
+            records.push({ at, kind: 'grant', amount: entry.claimedAmount });
           }
         }
-        grantCovered = true;
+        // 未取全时**不声明已覆盖**：宁可让本地采样兜底，也不把截断后的合适当成完整日增量
+        grantCovered = grantIncomplete === 0;
+        if (!grantCovered) {
+          ctx.log(`CodeArts 获取明细有 ${grantIncomplete} 个活动未取全，该维度退回本地采样`);
+        }
       }
     } catch (error) {
       ctx.log(`CodeArts 获取明细获取失败（退回本地采样）：${(error as Error).message}`);
@@ -782,11 +908,13 @@ export const codeartsAdapter: ProviderAdapter = {
       // ④⑤ 逐笔明细：把 bonus 桶展开成每笔活动奖励
       const lots: CreditLot[] = [];
       let campaignNote: string | null = null;
+      let coverageNote: string | null = null;
       let benefitTotal = 0;
 
       try {
         const detail = await fetchCampaignBenefits(headers, timeoutMs, ctx);
         benefitTotal = detail.benefitTotal;
+        coverageNote = detail.coverageNote;
         lots.push(...detail.lots);
       } catch (error) {
         campaignNote = `活动明细获取失败，已退回聚合口径：${(error as Error).message}`;
@@ -806,8 +934,11 @@ export const codeartsAdapter: ProviderAdapter = {
           }),
         );
       }
-      // 活动奖励桶与账户级 bonus 对账：明细拉不到就退回聚合口径，差值补一条调节项
+      // 活动奖励桶与账户级 bonus 对账：明细拉不到就退回聚合口径，差值补一条调节项。
+      // 取全了逐笔（coverageNote 为 null）时这条 gap 通常为 0，自然不出现。
       const bonusRemain = Math.round((overview.bonus?.remain ?? 0) * 100) / 100;
+      const withCoverage = (base: string): string =>
+        coverageNote ? `${base}；${coverageNote}` : base;
       if (benefitTotal <= 0 && bonusRemain > 0) {
         lots.push(
           makeLot({
@@ -816,7 +947,7 @@ export const codeartsAdapter: ProviderAdapter = {
             amount: bonusRemain,
             currency: 'CREDITS',
             expiresAt: subscriptionExpiry,
-            note: '活动明细不可用，已退回聚合额度',
+            note: withCoverage('活动明细不可用，已退回聚合额度'),
           }),
         );
       } else {
@@ -829,7 +960,9 @@ export const codeartsAdapter: ProviderAdapter = {
               amount: gap,
               currency: 'CREDITS',
               expiresAt: subscriptionExpiry,
-              note: `活动明细合计 ${benefitTotal}，与聚合额度 ${bonusRemain} 的差额`,
+              note: withCoverage(
+                `活动明细合计 ${benefitTotal}，与聚合额度 ${bonusRemain} 的差额`,
+              ),
             }),
           );
         }

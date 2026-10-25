@@ -73,6 +73,8 @@ export interface CodeArtsSubscription {
 export interface CodeArtsCampaignDetail {
   lots: CreditLot[];
   benefitTotal: number;
+  /** 逐笔未取全时的说明（`fetchCampaignBenefits` 回传），取全为 null/缺省 */
+  coverageNote?: string | null;
 }
 
 /**
@@ -218,6 +220,7 @@ export function buildCodeArtsSnapshot(
     lots.push(...detail.lots);
     const gap = round2(bonusRemain - detail.benefitTotal);
     if (gap >= 1) {
+      const base = `活动明细合计 ${detail.benefitTotal}，与账户级 ${bonusRemain} 的差额`;
       lots.push(
         makeLot({
           id: 'codearts-bonus-gap',
@@ -225,7 +228,7 @@ export function buildCodeArtsSnapshot(
           amount: gap,
           currency: 'CREDITS',
           expiresAt: subscription.periodEnd,
-          note: `活动明细合计 ${detail.benefitTotal}，与账户级 ${bonusRemain} 的差额`,
+          note: detail.coverageNote ? `${base}；${detail.coverageNote}` : base,
         }),
       );
     }
