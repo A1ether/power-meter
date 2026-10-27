@@ -354,6 +354,17 @@ const TARGETS: Target[] = [
     cookieRefreshTokenName: 'raccoon_refresh_token',
     refreshTokenEnvKey: 'XIAOHUANXIONG_REFRESH_TOKEN',
   },
+  {
+    // 千问办公：鉴权只认网页登录态 Cookie（生产环境不带 Authorization），
+    // 因此与 Qoder / CodeBuddy 同属「纯 Cookie」目标，不需要 tokenEnvKey。
+    // 用量页是 /app/settings/usage，请求 /user/* 时浏览器会带上登录态。
+    id: 'qwenwork',
+    label: '千问办公',
+    envKey: 'QWENWORK_COOKIE',
+    cookieSites: ['qwenwork.cn'],
+    usageUrl: 'https://qwenwork.cn/app/settings/usage',
+    apiHost: 'qwenwork.cn',
+  },
 ];
 
 // ---------------------------------------------------------------- .env 读写

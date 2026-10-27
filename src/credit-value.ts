@@ -134,6 +134,21 @@ export const CREDIT_PEGS: ReadonlyArray<{
         '小浣熊按「算力积分」计费（一次对话约 1~5 积分），未公布 DeepSeek V4.1 Flash 的 token 单价或模型系数，无法按该模型基准折算',
     },
   },
+  {
+    provider: 'qwenwork',
+    peg: {
+      // 千问办公没有单独卖「积分包」的公开价，官方口径取**订阅套餐的固定月积分**：
+      // 个人标准版 ¥78 / 月 含 2,000 通用积分（基础版 ¥22.4/200、高级版 ¥158/4,000，
+      // 三者折算后 0.039 ~ 0.112 元/积分，取最常见的标准版）。
+      cnyPerUnit: 78 / 2000,
+      official:
+        '千问办公 个人标准版 ¥78 / 月含 2,000 通用积分 = ¥0.039 / 积分' +
+        '（qwenwork.cn/app/settings/usage 套餐页；基础版 ¥22.4 / 200 积分 ≈ ¥0.112，高级版 ¥158 / 4,000 ≈ ¥0.0395）',
+      flashRatio: null,
+      flash:
+        '千问办公按「通用积分」计量、不同模型消耗系数不同，平台未公开 1 积分对应的 token 量或 DeepSeek V4.1 Flash 的系数，无法按该模型基准折算',
+    },
+  },
 ];
 
 export interface CnyValue {

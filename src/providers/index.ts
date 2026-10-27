@@ -7,6 +7,7 @@ import { demoAdapters } from './demo.js';
 import { minimaxAdapter } from './minimax.js';
 import { sessionApiAdapters } from './presets.js';
 import { qoderAdapter, qoderIntlAdapter } from './qoder.js';
+import { qwenworkAdapter } from './qwenwork.js';
 import { traeAdapter } from './trae.js';
 import { xiaohuanxiongAdapter } from './xiaohuanxiong.js';
 import { traeGlobalAdapter } from './trae-global.js';
@@ -28,6 +29,7 @@ for (const adapter of [
   a1etheropenaiAdapter,
   minimaxAdapter,
   xiaohuanxiongAdapter,
+  qwenworkAdapter,
   ...sessionApiAdapters,
   ...demoAdapters,
 ]) {
@@ -97,6 +99,13 @@ const ALIASES: Record<string, string> = {
   'www.xiaohuanxiong.com': 'xiaohuanxiong',
   'xhx': 'xiaohuanxiong',
   'raccoon': 'xiaohuanxiong',
+  'qwenwork.cn': 'qwenwork',
+  'www.qwenwork.cn': 'qwenwork',
+  'qwenwork.ai': 'qwenwork',
+  'www.qwenwork.ai': 'qwenwork',
+  'qwen-office': 'qwenwork',
+  'qianwen': 'qwenwork',
+  'qw': 'qwenwork',
 };
 
 export function describeRegistry(): Array<{

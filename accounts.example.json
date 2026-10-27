@@ -4,7 +4,7 @@
     "推荐流程：npm run chrome:debug → 在弹出窗口登录 → npm run capture 自动抓取凭证。",
     "credentials 用 ${ENV_VAR} 引用 .env，避免把凭证明文写进文件。",
     "保存后服务会自动热加载，无需重启。",
-    "provider 支持：qoder / qoder-intl / trae / trae-global / codebuddy / codebuddy-intl / codearts / a1etheropenai / minimax / xiaohuanxiong / custom / demo:*",
+    "provider 支持：qoder / qoder-intl / trae / trae-global / codebuddy / codebuddy-intl / codearts / a1etheropenai / minimax / xiaohuanxiong / qwenwork / custom / demo:*",
     "Trae 国内站与国际站同样独立：provider 取 trae（trae.cn，凭证 TRAE_*）或",
     "     trae-global（trae.ai，凭证 TRAE_GLOBAL_*），npm run capture -- trae-global 抓取国际站。",
     "Qoder 国内站与国际站是两个独立平台：provider 取 qoder（qoder.com.cn，凭证 QODER_*）或",
@@ -22,6 +22,10 @@
     "     npm run capture -- xiaohuanxiong（写入 XIAOHUANXIONG_COOKIE / _TOKEN / _REFRESH_TOKEN）。",
     "     卡片按官方四类积分拆批次：每日赠送（当日 24:00 失效，登录后延长至 7 天）、",
     "     每月赠送（随订阅周期）、加油包（永久有效）、奖励积分（1 年）。",
+    "千问办公（qwenwork）也是网页登录态 Cookie（生产环境不带 Authorization）：",
+    "     推荐卡片上的「网页端登录」，或 npm run capture -- qwenwork（写入 QWENWORK_COOKIE）。",
+    "     卡片按页面三桶拆批次：每日刷新（北京时间 00:00 刷新）、每月订阅（随 next_refresh_date）、",
+    "     长期积分（充值 / 活动赠送，拿不到到期时间就不标）。",
     "CodeArts 华为云推荐用 AK/SK（credentials.accessKey/secretKey，读 .env 的 CODEARTS_AK/CODEARTS_SK）：",
     "     走 snap-access 网关、长期有效，不像控制台登录态那样会过期；cookie 可留作兜底，",
     "     也可用 options.authMode 强制 \"aksk\" 或 \"cookie\"。",
@@ -144,6 +148,15 @@
         "token": "${XIAOHUANXIONG_TOKEN}",
         "refreshToken": "${XIAOHUANXIONG_REFRESH_TOKEN}",
         "cookie": "${XIAOHUANXIONG_COOKIE}"
+      },
+      "options": {}
+    },
+    {
+      "provider": "qwenwork",
+      "displayName": "千问办公",
+      "enabled": false,
+      "credentials": {
+        "cookie": "${QWENWORK_COOKIE}"
       },
       "options": {}
     },

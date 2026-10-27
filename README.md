@@ -61,9 +61,10 @@ npm start
 ```bash
 npm run chrome:debug     # ① 弹出一个调试专用 Chrome 窗口
                          #   ② 在里面登录 Qoder / Trae / CodeBuddy / CodeArts / MiniMax Code /
-                         #      商汤小浣熊，并各自打开「用量 / 账单」页面
+                         #      商汤小浣熊 / 千问办公，并各自打开「用量 / 账单」页面
                          #      （MiniMax Code 停在 agent.minimax.cn；小浣熊停在
-                         #      xiaohuanxiong.com/work/settings/resource；
+                         #      xiaohuanxiong.com/work/settings/resource；千问办公停在
+                         #      qwenwork.cn/app/settings/usage；
                          #      Qoder 国际站账号停在 qoder.com/account/usage，用
                          #      npm run capture -- qoder-intl 抓取；
                          #      Trae 国际版账号停在 trae.ai/account-setting#usage，用
@@ -74,7 +75,7 @@ npm run probe            # ④ 验证取数是否正常
 ```
 
 除 A1etherOpenAi（API 密钥）、MiniMax Code（网页端登录态 token + Cookie）与商汤小浣熊
-（令牌藏在登录态 Cookie 里）外，其余平台都只需要**一个 Cookie**，
+（令牌藏在登录态 Cookie 里）外，其余平台（含千问办公）都只需要**一个 Cookie**，
 其余全部自动完成 —— 包括 Trae 那个只有 1 天有效期的 JWT，由适配器用 Cookie 自动续签，不需要手工维护。
 
 > 调试窗口用的是独立 profile（`~/.power-meter/chrome-profile`），与你日常的 Chrome 完全隔离。
@@ -92,6 +93,7 @@ npm run probe            # ④ 验证取数是否正常
 | `npm run capture -- qoder-intl` | 抓 Qoder 国际站（qoder.com）登录态，写进 `QODER_GLOBAL_COOKIE`（国内站用 `npm run capture -- qoder` → `QODER_COOKIE`）|
 | `npm run capture -- trae-global` | 抓 Trae 国际版（trae.ai）登录态，写进 `TRAE_GLOBAL_COOKIE`（国内站用 `npm run capture -- trae` → `TRAE_COOKIE`）|
 | `npm run capture -- xiaohuanxiong` | 抓商汤小浣熊登录态，一次写入 `XIAOHUANXIONG_COOKIE` / `XIAOHUANXIONG_TOKEN` / `XIAOHUANXIONG_REFRESH_TOKEN` |
+| `npm run capture -- qwenwork` | 抓千问办公登录态，写入 `QWENWORK_COOKIE`（也可用卡片上的「网页端登录」）|
 | `npm run migrate:qoder-sites --dry-run` | 预览 Qoder 旧站点配置（`options.site`）的迁移；去掉 `--dry-run` 才写入（自动备份到 `.run/`）|
 | `npm run capture -- --dry-run` | 只预览，不写文件 |
 | `npm run probe` | **命令行探测取数是否正常**（改配置后先跑这个最快）|
@@ -223,7 +225,7 @@ interface ProviderSnapshot {
 
 | 口径 | 含义 | 数据来源 |
 | --- | --- | --- |
-| **官方口径**（界面主数字） | 平台自己卖的「积分包 / 增购积分」单价 | Trae / CodeBuddy / CodeArts 均 ¥50 / 1,000 积分 = ¥0.05/积分；Qoder CN 专业版 ¥59 / 月含 2,000 Credits = ¥0.0295；MiniMax 积分包 ≈ ¥7 / 1,000 积分；Qoder 国际站 $20 / 1,500 Credits 按 `USD_CNY = 7.1` 折人民币 |
+| **官方口径**（界面主数字） | 平台自己卖的「积分包 / 增购积分」单价 | Trae / CodeBuddy / CodeArts 均 ¥50 / 1,000 积分 = ¥0.05/积分；Qoder CN 专业版 ¥59 / 月含 2,000 Credits = ¥0.0295；MiniMax 积分包 ≈ ¥7 / 1,000 积分；商汤小浣熊加油包大包 ¥19.9 / 1,200 积分 ≈ ¥16.58 / 1,000；千问办公标准版 ¥78 / 月含 2,000 积分 = ¥0.039/积分；Qoder 国际站 $20 / 1,500 Credits 按 `USD_CNY = 7.1` 折人民币 |
 | **DeepSeek V4.1 Flash 基准**（悬停里的补充） | 假设这些积分全部用在 DeepSeek V4.1 Flash 上，这批用量若直接接 DeepSeek 官方要花多少钱 | 算法 = 官方金额 × 比值，比值 = DeepSeek 官方单价 ÷ 平台该模型 token 单价。**只有平台公布了该模型 token 单价才能算**（输入 / 输出 / 缓存三项比值一致，用量里输入输出的配比会自动消掉） |
 
 - 目前**只有 Trae 能算出基准口径**：Trae 公布该模型 token 单价 ¥2 / ¥8 / ¥0.04 每百万
@@ -322,7 +324,7 @@ interface ProviderSnapshot {
 ### 各平台配置
 
 除 A1etherOpenAi（API 密钥）、MiniMax Code（网页端登录态 token）、商汤小浣熊（令牌藏在 Cookie 里）
-与 CodeArts（推荐 AK/SK）外，其余平台的凭证都只需要 **一个 Cookie**：
+与 CodeArts（推荐 AK/SK）外，其余平台（含千问办公）的凭证都只需要 **一个 Cookie**：
 
 | 平台 | `provider` | 需要的凭证 | 关键 `options` |
 | --- | --- | --- | --- |
@@ -334,6 +336,7 @@ interface ProviderSnapshot {
 | WorkBuddy 国际版 | `codebuddy-intl` / `codebuddy.ai` / `workbuddy.ai` | `cookie`（**必须含 `www` 子域**，写 `CODEBUDDY_GLOBAL_COOKIE`）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`CODEBUDDY_GLOBAL_ACCESS_TOKEN` / `CODEBUDDY_GLOBAL_REFRESH_TOKEN`）| 站点固定 `codebuddy.ai`，与国内版互不通用 |
 | CodeArts | `codearts` | **网页端登录（推荐，一键添加）**：卡片上点「网页端登录」，在自动打开的调试 Chrome 里登录华为云即可，Cookie 自动落 `CODEARTS_COOKIE` 并由 `npm run codearts:refresh` 定时续期<br>`accessKey` + `secretKey`（长期有效，多账号路径）<br>`cookie`（兼容，会话过期需重抓） | 可选 `authMode: "auto" \| "aksk" \| "cookie"`、`resourceType`、`region` |
 | MiniMax Code | `minimax` / `minimax-code` / `agent.minimax.cn` | `token`（`_token`）+ `cookie`（SSO）+ 真实身份 `userId`/`opTicket`/`uuid`（capture 一并抓取，缺一不可）| `site: "cn"`（默认）或 `"global"` |
+| 千问办公 | `qwenwork` / `qwenwork.cn` / `qwen-office` | `cookie`（`QWENWORK_COOKIE`，网页登录态；生产环境不带 `Authorization`）| 无；`origin` 可覆盖为代理地址 |
 | 商汤小浣熊 | `xiaohuanxiong` / `xiaohuanxiong.com` / `raccoon` | `token`（`XIAOHUANXIONG_TOKEN`，可从 Cookie 的 `xhx_token` / `raccoon_token` 推导）+ `cookie` + `refreshToken`（capture / 网页端登录一并写入）| 无；`origin` 可覆盖为代理地址 |
 | A1etherOpenAi | `a1etheropenai` / `d1v.ai`（上游服务域名保持不变，也是它的解析别名） | `apiKey`（查余额）<br>`paiApiKey`（托管复制） | `baseUrl`、`revealApiKey` |
 | 任意平台 | `custom` | 按需 `headers` | `providerId`、`endpoint`、`mapping` |
@@ -660,6 +663,17 @@ Trae 的 OAuth 回调 `/authorize` 是唯一例外：浏览器从 trae.cn 跳回
   真实身份参数（user_id/op_ticket/uuid，服务端会与 token 交叉校验，不能用 0 顶替），
   `npm run capture -- minimax` 会一次性全部抓取；登录态失效后卡片显示 `unauthorized`，
   重新抓取即可。
+- **千问办公取的是网页端内部接口**（没有公开查询 API）：
+  `GET /user/balance` 给「剩余可用」，`GET /user/wallets` 给三桶构成
+  （`daily_credits` / `monthly_credits` / `longterm_credits` 各自的 `total_balance`），
+  `GET /user/billings` 给逐笔流水。卡片按页面的三桶拆批次：**每日刷新积分**（北京时间 00:00 刷新，
+  当日未用完失效）、**每月订阅积分**（`plan.next_refresh_date`；取不到时按「北京时间本月末」推算并注明）、
+  **长期积分**（充值 / 活动赠送，有效期「以具体规则为准」，拿不到日期就不标，不参与「最快到期」）。
+  鉴权只认**登录态 Cookie**（手机验证码 / Google / 钉钉登录都会写入），所以
+  `npm run capture -- qwenwork` 只写 `QWENWORK_COOKIE`；登录态 Cookie 名随登录方式而变，
+  看板「网页端登录」用「页面自己请求 `/user/balance` 拿到 2xx」作为登录判据。
+  企业版配额（`/biz/user/v1/settings/enterprise/quota`）是另一套鉴权与口径，本轮未纳入，
+  企业账号仍能看到个人积分三桶。
 - **商汤小浣熊取的是网页端内部接口**（官方只公开「积分规则」，没有查询 API）：
   `GET /api/web/points/v1/balance` 给四类积分的当前剩余，`GET /api/web/points/v2/bills`
   给发放 / 消耗流水。卡片按官方口径拆成四个批次：**每日赠送**（当日 24:00 失效，当天登录延长至
