@@ -50,7 +50,8 @@ npm start
 | WorkBuddy 国际版 | 手机扫码 / 网页端登录 | 目标固定 `codebuddy.ai`；令牌写入 `CODEBUDDY_GLOBAL_*`；网页端登录会自动打开调试 Chrome 抓 Cookie（批次明细更全） |
 | Qoder 国内版 | 手机 Qoder App 扫码 / 新窗口打开链接 | 目标固定 `qoder.com.cn`；令牌写入 `QODER_*` |
 | Qoder 国际版 | 手机 Qoder App 扫码 / 新窗口打开链接 | 目标固定 `qoder.com`；令牌写入 `QODER_GLOBAL_*`（国际站设备流未实测，网页端登录更稳） |
-| Trae | 新窗口打开链接 | 回调固定 `127.0.0.1`，必须在本机浏览器完成 |
+| Trae | 新窗口打开链接 | 回调固定 `127.0.0.1`，必须在本机浏览器完成；令牌写入 `TRAE_*` |
+| Trae 国际版 | 新窗口打开链接 | 目标固定 `trae.ai`，回调同样固定 `127.0.0.1`；令牌写入 `TRAE_GLOBAL_*`，与国内版互不通用 |
 
 授权成功后服务端会先验证取数、再把令牌写入 `.env` 并注册账号，**一个账号一张卡片**；
 同一账号再次登录只刷新凭证，不会多出一张卡。令牌过期时会自动续期并写回 `.env`。
@@ -62,7 +63,9 @@ npm run chrome:debug     # ① 弹出一个调试专用 Chrome 窗口
                          #   ② 在里面登录 Qoder / Trae / CodeBuddy / CodeArts / MiniMax Code
                          #      并各自打开「用量 / 账单」页面（MiniMax Code 停在 agent.minimax.cn；
                          #      Qoder 国际站账号停在 qoder.com/account/usage，用
-                         #      npm run capture -- qoder-intl 抓取）
+                         #      npm run capture -- qoder-intl 抓取；
+                         #      Trae 国际版账号停在 trae.ai/account-setting#usage，用
+                         #      npm run capture -- trae-global 抓取）
 npm run capture          # ③ 自动抓取各平台的登录态，写入 .env
 npm run probe            # ④ 验证取数是否正常
 # 刷新 http://127.0.0.1:48213
@@ -84,6 +87,7 @@ npm run probe            # ④ 验证取数是否正常
 | `npm run capture` | **自动抓取各平台的登录态并写入 `.env`** |
 | `npm run capture -- codebuddy --slot 2` | 抓第二个账号的登录态，写进 `CODEBUDDY_COOKIE_2`（多账号，见下文）|
 | `npm run capture -- qoder-intl` | 抓 Qoder 国际站（qoder.com）登录态，写进 `QODER_GLOBAL_COOKIE`（国内站用 `npm run capture -- qoder` → `QODER_COOKIE`）|
+| `npm run capture -- trae-global` | 抓 Trae 国际版（trae.ai）登录态，写进 `TRAE_GLOBAL_COOKIE`（国内站用 `npm run capture -- trae` → `TRAE_COOKIE`）|
 | `npm run migrate:qoder-sites --dry-run` | 预览 Qoder 旧站点配置（`options.site`）的迁移；去掉 `--dry-run` 才写入（自动备份到 `.run/`）|
 | `npm run capture -- --dry-run` | 只预览，不写文件 |
 | `npm run probe` | **命令行探测取数是否正常**（改配置后先跑这个最快）|
@@ -319,7 +323,8 @@ interface ProviderSnapshot {
 | --- | --- | --- | --- |
 | Qoder 国内版 | `qoder` / `qoder.cn` | `cookie`（`QODER_COOKIE`）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`QODER_ACCESS_TOKEN` / `QODER_REFRESH_TOKEN`） | 站点固定 `qoder.com.cn`，无站点选项；`origin` 可覆盖为自定义域名/代理。两种凭证模式都会拆积分批次：Cookie 模式给出逐包明细（`quota_detail[]`），令牌模式只能给出账户级分桶 + 可选的 `dedicated_resource_packages[]`（逐包明细需 Cookie） |
 | Qoder 国际版 | `qoder-intl` / `qoder.com` / `qoder-global` | `cookie`（`QODER_GLOBAL_COOKIE`）<br>或登录写入的 `accessToken` + `refreshToken`（`QODER_GLOBAL_ACCESS_TOKEN` / `QODER_GLOBAL_REFRESH_TOKEN`） | 站点固定 `qoder.com`，无站点选项；`origin` 可覆盖。积分批次口径与国内版一致 |
-| Trae | `trae` / `trae.cn` | `cookie`<br>或「打开链接登录」写入的 `accessToken` + `refreshToken` + `deviceKey`（`TRAE_ACCESS_TOKEN` / `TRAE_REFRESH_TOKEN` / `TRAE_DEVICE_KEY`） | JWT 由 Cookie 自动续签；令牌模式由 `deviceKey` 签名续期 |
+| Trae | `trae` / `trae.cn` | `cookie`（`TRAE_COOKIE`）<br>或「打开链接登录」写入的 `accessToken` + `refreshToken` + `deviceKey`（`TRAE_ACCESS_TOKEN` / `TRAE_REFRESH_TOKEN` / `TRAE_DEVICE_KEY`） | JWT 由 Cookie 自动续签；令牌模式由 `deviceKey` 签名续期 |
+| Trae 国际版 | `trae-global` / `trae.ai` | `cookie`（`TRAE_GLOBAL_COOKIE`）<br>或「打开链接登录」写入的 `accessToken` + `refreshToken` + `deviceKey`（`TRAE_GLOBAL_ACCESS_TOKEN` / `TRAE_GLOBAL_REFRESH_TOKEN` / `TRAE_GLOBAL_DEVICE_KEY`） | 站点固定 `trae.ai`，与国内版互不通用；计费面是 v1 `user_current_entitlement_list`，余额按账户口径显示美元 / 积分 / 请求次数（`options.apiHost`、`options.usageUrl` 可覆盖主机） |
 | CodeBuddy | `codebuddy` | `cookie`（**必须含 `www` 子域**）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`CODEBUDDY_ACCESS_TOKEN` / `CODEBUDDY_REFRESH_TOKEN`）| — |
 | WorkBuddy 国际版 | `codebuddy-intl` / `codebuddy.ai` / `workbuddy.ai` | `cookie`（**必须含 `www` 子域**，写 `CODEBUDDY_GLOBAL_COOKIE`）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`CODEBUDDY_GLOBAL_ACCESS_TOKEN` / `CODEBUDDY_GLOBAL_REFRESH_TOKEN`）| 站点固定 `codebuddy.ai`，与国内版互不通用 |
 | CodeArts | `codearts` | **网页端登录（推荐，一键添加）**：卡片上点「网页端登录」，在自动打开的调试 Chrome 里登录华为云即可，Cookie 自动落 `CODEARTS_COOKIE` 并由 `npm run codearts:refresh` 定时续期<br>`accessKey` + `secretKey`（长期有效，多账号路径）<br>`cookie`（兼容，会话过期需重抓） | 可选 `authMode: "auto" \| "aksk" \| "cookie"`、`resourceType`、`region` |

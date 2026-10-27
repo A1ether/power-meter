@@ -4,7 +4,9 @@
     "推荐流程：npm run chrome:debug → 在弹出窗口登录 → npm run capture 自动抓取凭证。",
     "credentials 用 ${ENV_VAR} 引用 .env，避免把凭证明文写进文件。",
     "保存后服务会自动热加载，无需重启。",
-    "provider 支持：qoder / trae / codebuddy / codearts / a1etheropenai / minimax / custom / demo:*",
+    "provider 支持：qoder / qoder-intl / trae / trae-global / codebuddy / codebuddy-intl / codearts / a1etheropenai / minimax / custom / demo:*",
+    "Trae 国内站与国际站同样独立：provider 取 trae（trae.cn，凭证 TRAE_*）或",
+    "     trae-global（trae.ai，凭证 TRAE_GLOBAL_*），npm run capture -- trae-global 抓取国际站。",
     "Qoder 国内站与国际站是两个独立平台：provider 取 qoder（qoder.com.cn，凭证 QODER_*）或",
     "     qoder-intl（qoder.com，凭证 QODER_GLOBAL_*）。站点由平台决定，不再有 options.site，",
     "     一个平台的账号只出现在该平台的卡片上。",
@@ -64,6 +66,15 @@
       "enabled": true,
       "credentials": {
         "cookie": "${TRAE_COOKIE}"
+      },
+      "options": {}
+    },
+    {
+      "provider": "trae-global",
+      "displayName": "Trae 国际版",
+      "enabled": false,
+      "credentials": {
+        "cookie": "${TRAE_GLOBAL_COOKIE}"
       },
       "options": {}
     },

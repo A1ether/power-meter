@@ -13,9 +13,11 @@
  *   - 多账号：`--slot 2` 把抓到的凭证写进带 `_2` 后缀的变量
  *     （如 CODEBUDDY_COOKIE_2），因此不会覆盖槽位 1 的账号；
  *     抓完再用 `npm run account -- --provider <平台> --env <变量名>` 注册成账号。
- *   - 多站点：Qoder 国内站与国际站是两个平台——
+ *   - 多站点：Qoder 与 Trae 的国内站 / 国际站都是两个平台——
  *     `npm run capture -- qoder`（或 `--site cn`）抓国内站，写 QODER_COOKIE；
  *     `npm run capture -- qoder-intl`（或兼容写法 `--site global`）抓国际站，写 QODER_GLOBAL_COOKIE。
+ *     `npm run capture -- trae` 抓 trae.cn，写 TRAE_COOKIE；
+ *     `npm run capture -- trae-global`（或兼容写法 `--site global`）抓 trae.ai，写 TRAE_GLOBAL_COOKIE。
  *     两者互不覆盖，注册时用对应的 provider id：
  *     `npm run account -- --provider qoder-intl --env QODER_GLOBAL_COOKIE`。
  *
@@ -249,6 +251,26 @@ const TARGETS: Target[] = [
     cookieSites: ['trae.cn'],
     usageUrl: 'https://www.trae.cn/dashboard#usage',
     apiHost: 'api.trae.cn',
+    // 兼容写法：`--site global` 等价于 `npm run capture -- trae-global`
+    siteVariants: {
+      global: {
+        label: 'Trae 国际版',
+        envKey: 'TRAE_GLOBAL_COOKIE',
+        cookieSites: ['trae.ai'],
+        usageUrl: 'https://www.trae.ai/account-setting#usage',
+        apiHost: 'www.trae.ai',
+        providerId: 'trae-global',
+      },
+    },
+  },
+  {
+    // 国际站：独立平台（provider id = trae-global），凭证与国内站完全分开
+    id: 'trae-global',
+    label: 'Trae 国际版',
+    envKey: 'TRAE_GLOBAL_COOKIE',
+    cookieSites: ['trae.ai'],
+    usageUrl: 'https://www.trae.ai/account-setting#usage',
+    apiHost: 'www.trae.ai',
   },
   {
     id: 'codebuddy',

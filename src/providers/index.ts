@@ -8,6 +8,7 @@ import { minimaxAdapter } from './minimax.js';
 import { sessionApiAdapters } from './presets.js';
 import { qoderAdapter, qoderIntlAdapter } from './qoder.js';
 import { traeAdapter } from './trae.js';
+import { traeGlobalAdapter } from './trae-global.js';
 
 /**
  * 适配器注册表。新增平台 = 新增一个 ProviderAdapter + 在这里注册一行。
@@ -19,6 +20,7 @@ for (const adapter of [
   qoderAdapter,
   qoderIntlAdapter,
   traeAdapter,
+  traeGlobalAdapter,
   codebuddyAdapter,
   codebuddyIntlAdapter,
   codeartsAdapter,
@@ -36,12 +38,13 @@ export function listAdapters(): ProviderAdapter[] {
 
 /**
  * 按 provider id 找适配器，支持：
- *   - 精确匹配（qoder / qoder-intl / trae / codebuddy / codearts / custom / demo:qoder ...）
+ *   - 精确匹配（qoder / qoder-intl / trae / trae-global / codebuddy / codearts / custom / demo:qoder ...）
  *   - 别名回退：qoder-cn / qoder.com.cn -> qoder，qoder-global / qoder.com -> qoder-intl，
- *     trae-cn -> trae
+ *     trae-cn -> trae，trae.ai / www.trae.ai -> trae-global
  *
- * Qoder 的两个站点是两个平台（`qoder` 国内版 / `qoder-intl` 国际版），
- * 别名按域名归属分流，不再有「一个平台带站点选项」的写法。
+ * Qoder 与 Trae 的两个站点都是两个平台（`qoder` 国内版 / `qoder-intl` 国际版，
+ * `trae` 国内版 / `trae-global` 国际版），别名按域名归属分流，
+ * 不再有「一个平台带站点选项」的写法。
  */
 export function resolveAdapter(providerId: string): ProviderAdapter | null {
   const normalized = providerId.trim().toLowerCase();
@@ -64,6 +67,9 @@ const ALIASES: Record<string, string> = {
   'trae.com.cn': 'trae',
   'trae-cn': 'trae',
   'www.trae.cn': 'trae',
+  'trae.ai': 'trae-global',
+  'www.trae.ai': 'trae-global',
+  'trae-intl': 'trae-global',
   'codebuddy.cn': 'codebuddy',
   'www.codebuddy.cn': 'codebuddy',
   'copilot.tencent.com': 'codebuddy',

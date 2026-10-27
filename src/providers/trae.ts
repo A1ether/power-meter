@@ -69,13 +69,19 @@ const TRAE_LOGIN_TTL_MS = 5 * 60 * 1000;
 /** 与官方 IDE 的 `appVersion` 同形；上游只做展示/兼容，不参与签名 */
 const TRAE_IDE_VERSION = '1.107.1';
 
-interface TraeDeviceKey {
+/**
+ * 设备密钥对（EC P-256）。
+ *
+ * 国内版与国际版（`trae-global.ts`）共用同一套 OAuth / DeviceProof 密码学，
+ * 因此这里连同下面的工具函数一起导出；国际版只换主机与计费面，不复制实现。
+ */
+export interface TraeDeviceKey {
   /** PKCS8 PEM（base64 后写进 .env，避免多行变量） */
   privateKeyPem: string;
   publicKeyPem: string;
 }
 
-function traeDeviceKeyFromPem(privateKeyPem: string): TraeDeviceKey {
+export function traeDeviceKeyFromPem(privateKeyPem: string): TraeDeviceKey {
   const publicKeyPem = createPublicKey(privateKeyPem)
     .export({ type: 'spki', format: 'pem' })
     .toString();
@@ -83,7 +89,7 @@ function traeDeviceKeyFromPem(privateKeyPem: string): TraeDeviceKey {
 }
 
 /** 生成 EC P-256 密钥对（与官方 `Oxe()` 同一参数） */
-function traeGenerateDeviceKey(): TraeDeviceKey {
+export function traeGenerateDeviceKey(): TraeDeviceKey {
   const { privateKey, publicKey } = generateKeyPairSync('ec', {
     namedCurve: 'P-256',
     publicKeyEncoding: { type: 'spki', format: 'pem' },
@@ -93,7 +99,7 @@ function traeGenerateDeviceKey(): TraeDeviceKey {
 }
 
 /** PKCE：verifier = base64url(random 48 bytes)，challenge = base64url(sha256(verifier)) */
-function traePkce(): { verifier: string; challenge: string } {
+export function traePkce(): { verifier: string; challenge: string } {
   const verifier = randomBytes(48).toString('base64url');
   const challenge = createHash('sha256').update(verifier).digest('base64url');
   return { verifier, challenge };
@@ -103,7 +109,7 @@ function traePkce(): { verifier: string; challenge: string } {
  * DeviceProof：时间戳用**秒**，nonce 16 字节 hex，
  * 签名内容逐行拼接后 ECDSA-SHA256，再 base64。
  */
-function traeDeviceProof(
+export function traeDeviceProof(
   method: string,
   path: string,
   clientId: string,
@@ -118,7 +124,7 @@ function traeDeviceProof(
 }
 
 /** `DeviceInfo`：字段名是协议事实，不能改风格（PascalCase） */
-function traeDeviceInfo(account: AccountConfig, key: TraeDeviceKey): Record<string, string> {
+export function traeDeviceInfo(account: AccountConfig, key: TraeDeviceKey): Record<string, string> {
   return {
     DeviceID: optString(account, 'deviceId') || randomUUID(),
     MachineID: optString(account, 'machineId') || randomUUID(),
@@ -218,7 +224,7 @@ async function traeFetchUserInfo(
  * `host` / `consoleHost` 追加到 `auth_callback_url`。`authCodeInfo` 可能是
  * URL 编码的 JSON，也可能被拆成 `authCodeInfo[AuthCode]=...` 形式，两种都兼容。
  */
-function traeReadCallback(query: URLSearchParams): {
+export function traeReadCallback(query: URLSearchParams): {
   authCode: string;
   userJwt: string;
   userInfo: string;
@@ -257,7 +263,7 @@ function traeReadCallback(query: URLSearchParams): {
  * （无查询串、主机名必须是字面量 `127.0.0.1`），所以这里把回环主机统一成
  * `127.0.0.1`——它同样能连到监听 `0.0.0.0` 或 `localhost` 的服务。
  */
-function traeCallbackUrl(callbackBase: string): string {
+export function traeCallbackUrl(callbackBase: string): string {
   let port = '';
   try {
     port = new URL(callbackBase).port;
@@ -268,8 +274,17 @@ function traeCallbackUrl(callbackBase: string): string {
   return `http://127.0.0.1:${port}/authorize`;
 }
 
-/** Trae 回调域名白名单：只接受 trae.cn / trae.com.cn 及其子域，防止 SSRF/令牌外送 */
-function traeHostAllowed(value: string, fallback: string): string {
+/**
+ * Trae 回调域名白名单：只接受 Trae 自己的域名及其子域，防止 SSRF/令牌外送。
+ *
+ * `domainPattern` 让国际版复用同一份校验，只把域名换成 `trae.ai`；
+ * 不传时行为与国内版完全一致（`trae.cn` / `trae.com.cn`）。
+ */
+export function traeHostAllowed(
+  value: string,
+  fallback: string,
+  domainPattern = /(^|\.)trae\.(cn|com\.cn)$/,
+): string {
   const candidate = value || fallback;
   let hostname = '';
   try {
@@ -277,7 +292,7 @@ function traeHostAllowed(value: string, fallback: string): string {
   } catch {
     return fallback;
   }
-  return /(^|\.)trae\.(cn|com\.cn)$/.test(hostname) ? candidate.replace(/\/+$/, '') : fallback;
+  return domainPattern.test(hostname) ? candidate.replace(/\/+$/, '') : fallback;
 }
 
 interface CachedToken {
@@ -369,8 +384,18 @@ export function parseTraeUsage(body: unknown): TraeUsage {
   };
 }
 
-/** 把同名且同时到期的包归并成一条，避免签到类平台出现几十条重复批次 */
-export function mergeLots(packs: TraePack[]): CreditLot[] {
+/**
+ * 把同名且同时到期的包归并成一条，避免签到类平台出现几十条重复批次。
+ *
+ * `currency` / `idPrefix` 让国际版复用同一份归并逻辑：国际版按美元或次数计量，
+ * 批次 id 也必须带自己的前缀，否则两个平台的批次 id 会撞。
+ */
+export function mergeLots(
+  packs: TraePack[],
+  options: { currency?: CreditLot['currency']; idPrefix?: string } = {},
+): CreditLot[] {
+  const currency = options.currency ?? 'CREDITS';
+  const idPrefix = options.idPrefix ?? 'trae';
   const grouped = new Map<
     string,
     { label: string; expiresAt: string | null; remaining: number; limit: number; count: number }
@@ -401,10 +426,10 @@ export function mergeLots(packs: TraePack[]): CreditLot[] {
     })
     .map(([key, entry]) =>
       makeLot({
-        id: `trae-${key}`,
+        id: `${idPrefix}-${key}`,
         label: entry.label,
         amount: entry.remaining,
-        currency: 'CREDITS',
+        currency,
         expiresAt: entry.expiresAt,
         note:
           entry.count > 1
