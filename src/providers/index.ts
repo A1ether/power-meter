@@ -8,6 +8,7 @@ import { minimaxAdapter } from './minimax.js';
 import { sessionApiAdapters } from './presets.js';
 import { qoderAdapter, qoderIntlAdapter } from './qoder.js';
 import { traeAdapter } from './trae.js';
+import { xiaohuanxiongAdapter } from './xiaohuanxiong.js';
 import { traeGlobalAdapter } from './trae-global.js';
 
 /**
@@ -26,6 +27,7 @@ for (const adapter of [
   codeartsAdapter,
   a1etheropenaiAdapter,
   minimaxAdapter,
+  xiaohuanxiongAdapter,
   ...sessionApiAdapters,
   ...demoAdapters,
 ]) {
@@ -91,6 +93,10 @@ const ALIASES: Record<string, string> = {
   'minimax.io': 'minimax',
   'agent.minimax.cn': 'minimax',
   'agent.minimax.io': 'minimax',
+  'xiaohuanxiong.com': 'xiaohuanxiong',
+  'www.xiaohuanxiong.com': 'xiaohuanxiong',
+  'xhx': 'xiaohuanxiong',
+  'raccoon': 'xiaohuanxiong',
 };
 
 export function describeRegistry(): Array<{

@@ -120,6 +120,20 @@ export const CREDIT_PEGS: ReadonlyArray<{
       flash: 'MiniMax 官方规则是「积分按各模型 API 刊例价折算」，平台不提供 DeepSeek V4.1 Flash，无法按该模型基准折算',
     },
   },
+  {
+    provider: 'xiaohuanxiong',
+    peg: {
+      // 加油包小包 500 积分 ¥9.9 = ¥19.8/1,000；大包 1,200 积分 ¥19.9 = ¥16.58/1,000。
+      // 取更划算的大包单价作为官方口径（用户实际会按大包购买）。
+      cnyPerUnit: 19.9 / 1200,
+      official:
+        '商汤小浣熊 加油包大包 ¥19.9 / 1,200 积分 ≈ ¥16.58 / 1,000 积分' +
+        '（xiaohuanxiong.com/pricing；小包 ¥9.9 / 500 积分 ≈ ¥19.8 / 1,000）',
+      flashRatio: null,
+      flash:
+        '小浣熊按「算力积分」计费（一次对话约 1~5 积分），未公布 DeepSeek V4.1 Flash 的 token 单价或模型系数，无法按该模型基准折算',
+    },
+  },
 ];
 
 export interface CnyValue {

@@ -540,6 +540,11 @@ export async function addManagedAccount(input: AddManagedInput): Promise<AddMana
   if (missingFields.length > 0) {
     return fail(400, 'input', `请填写：${missingFields.join('、')}。`);
   }
+  // 所有凭证字段都声明为可选时（如商汤小浣熊的「Cookie 或 令牌」二选一），
+  // 空表单也能通过上面的逐字段校验——这里兜一层，给出比「验证失败」更明确的提示
+  if (Object.keys(values).length === 0) {
+    return fail(400, 'input', `请至少填写一个凭证字段：${credentialFields.map((f) => f.label).join(' / ')}。`);
+  }
 
   // ① 真实验证：用适配器自己的 probe（连同 option 取值，如站点），
   //    命令行 / 页面 / 接口拿到的是同一份结果

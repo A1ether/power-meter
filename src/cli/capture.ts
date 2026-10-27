@@ -184,6 +184,19 @@ interface Target {
   /** token 写进 .env 的变量名（配合 tokenStorageKey 使用；envKey 留给 Cookie） */
   tokenEnvKey?: string;
   /**
+   * 登录态令牌藏在 Cookie 里的平台（商汤小浣熊：`xhx_token` / `raccoon_token`）。
+   *
+   * 与 `tokenStorageKey` 的区别：那里从 localStorage 读，这里从**已经抓到的
+   * Cookie 头**里按顺序找第一个非空值，再写进 `tokenEnvKey`。接口只认
+   * `Authorization: Bearer`，Cookie 本身不参与鉴权，但令牌就在里面——
+   * 一次抓取同时落盘 Cookie（留作续期 / 会话旁证）与令牌（真正用于取数）。
+   */
+  cookieTokenNames?: string[];
+  /** 刷新令牌在 Cookie 里的名字（商汤小浣熊：`raccoon_refresh_token`） */
+  cookieRefreshTokenName?: string;
+  /** 刷新令牌写进 .env 的变量名 */
+  refreshTokenEnvKey?: string;
+  /**
    * 登录身份参数来源（MiniMax Code）：公共查询参数里的 user_id/op_ticket/uuid
    * 必须与真实登录身份一致，写死 0 或臆造值会被服务端 401 拒绝。
    */
@@ -328,9 +341,41 @@ const TARGETS: Target[] = [
       },
     },
   },
+  {
+    id: 'xiaohuanxiong',
+    label: '商汤小浣熊',
+    envKey: 'XIAOHUANXIONG_COOKIE',
+    cookieSites: ['xiaohuanxiong.com'],
+    usageUrl: 'https://xiaohuanxiong.com/work/settings/resource',
+    apiHost: 'xiaohuanxiong.com',
+    // 令牌在 Cookie 里：接口只认 Authorization: Bearer，Cookie 不参与鉴权
+    cookieTokenNames: ['xhx_token', 'raccoon_token'],
+    tokenEnvKey: 'XIAOHUANXIONG_TOKEN',
+    cookieRefreshTokenName: 'raccoon_refresh_token',
+    refreshTokenEnvKey: 'XIAOHUANXIONG_REFRESH_TOKEN',
+  },
 ];
 
 // ---------------------------------------------------------------- .env 读写
+
+/**
+ * 从 Cookie 头里取单个 Cookie 的值（不区分大小写、容忍空白）。
+ *
+ * 为什么在这里另写一份而不复用适配器的 `cookieValueOf`：`capture.ts` 是
+ * 「引入即执行整个脚本」的 CLI（文件末尾裸 `main()`），从 `src/providers/`
+ * 反向引入会把适配器注册表也一并加载进来；这十行不值得那个代价。
+ */
+function cookieValueOf(header: string, name: string): string {
+  for (const part of header.split(';')) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) continue;
+    if (trimmed.slice(0, eq).trim() !== name) continue;
+    return trimmed.slice(eq + 1).trim();
+  }
+  return '';
+}
 
 function upsertEnvFile(entries: Map<string, string>): {
   path: string;
@@ -665,6 +710,46 @@ function captureTarget(target: Target, pool: BrowserCookie[]): Result {
     source = `由 cookie jar 拼装（${cookies.length} 个）`;
   }
 
+  // ⑤ Cookie 里藏令牌的平台（商汤小浣熊）：Cookie 只做旁证，真正取数用令牌。
+  //    必须放在「跳过判定」之前——Cookie 一个都没抓到、但 localStorage 里有令牌时，
+  //    这次抓取仍然有效。
+  let refreshToken = '';
+  if (!token && target.cookieTokenNames) {
+    // 首选 Cookie（网页端默认 `NEXT_PUBLIC_STORAGE_TYPE=cookie`）
+    for (const name of target.cookieTokenNames) {
+      if (!header) break;
+      const value = cookieValueOf(header, name);
+      if (!value) continue;
+      token = value;
+      console.log(`  token: ${token.length} 字节 ← Cookie.${name}`);
+      console.log(`  值：${mask(token)}`);
+      break;
+    }
+    // 兜底：同一套名字也可能落在 localStorage（存储类型为 localstorage 时）
+    if (!token) {
+      for (const name of target.cookieTokenNames) {
+        const value = readLocalStorageValue(name);
+        if (!value) continue;
+        token = value;
+        console.log(`  token: ${token.length} 字节 ← localStorage.${name}`);
+        console.log(`  值：${mask(token)}`);
+        break;
+      }
+    }
+    if (!token) {
+      console.log(
+        `  token: 未找到（Cookie 与 localStorage 里都没有 ${target.cookieTokenNames.join(' / ')}，可能还没登录）`,
+      );
+    }
+  }
+  if (target.cookieRefreshTokenName) {
+    refreshToken = header ? cookieValueOf(header, target.cookieRefreshTokenName) : '';
+    if (!refreshToken) refreshToken = readLocalStorageValue(target.cookieRefreshTokenName);
+    if (refreshToken) {
+      console.log(`  刷新令牌: ${mask(refreshToken)} ← ${target.cookieRefreshTokenName}`);
+    }
+  }
+
   if (!header && !token) {
     console.log('  Cookie: 未找到（可能还没登录）');
     return {
@@ -689,6 +774,9 @@ function captureTarget(target: Target, pool: BrowserCookie[]): Result {
 
   const extraEnv: Array<{ key: string; value: string }> = [];
   if (token && target.tokenEnvKey) extraEnv.push({ key: target.tokenEnvKey, value: token });
+  if (refreshToken && target.refreshTokenEnvKey) {
+    extraEnv.push({ key: target.refreshTokenEnvKey, value: refreshToken });
+  }
   if (target.identityStorage) {
     const keys = target.identityStorage.envKeys;
     if (identityUserId) extraEnv.push({ key: keys.userId, value: identityUserId });
@@ -866,19 +954,34 @@ function main(): void {
   }
   if (!DRY_RUN) console.log(`详细报告：${REPORT_PATH}`);
 
-  // 槽位 ≥2 的凭证还没有对应的账号，给出下一步命令（单凭证平台才能一条命令搞定）
+  // 槽位 ≥2 的凭证还没有对应的账号，给出下一步命令
+  // （单凭证平台一条命令搞定；Cookie 里藏令牌的平台也能给出完整的逐字段引用）
   if (SLOT_SUFFIX) {
     const registerable = results.filter(
-      (result) => result.status === 'ok' && !result.target.tokenEnvKey && !result.target.identityStorage,
+      (result) =>
+        result.status === 'ok' &&
+        (!result.target.tokenEnvKey || result.target.cookieTokenNames) &&
+        !result.target.identityStorage,
     );
     if (registerable.length > 0) {
       console.log(`\n槽位 ${SLOT} 的凭证还没有对应的账号，注册它（同样会先真实验证）：`);
       for (const result of registerable) {
         // provider id 可能与抓取目标 id 不同（Qoder 国际站：目标 qoder --site global → 平台 qoder-intl）
         const provider = result.target.providerId ?? result.target.id;
+        // 多凭证平台（商汤小浣熊：Cookie + 令牌 + 刷新令牌）必须逐个字段指明变量名，
+        // 否则 `--env VAR` 只会落到第一个字段上
+        const refs =
+          result.target.cookieTokenNames && result.target.tokenEnvKey
+            ? [
+                `--env token=${result.target.tokenEnvKey}${SLOT_SUFFIX}`,
+                `--env cookie=${result.target.envKey}${SLOT_SUFFIX}`,
+                ...(result.target.refreshTokenEnvKey
+                  ? [`--env refreshToken=${result.target.refreshTokenEnvKey}${SLOT_SUFFIX}`]
+                  : []),
+              ]
+            : [`--env ${result.target.envKey}${SLOT_SUFFIX}`];
         console.log(
-          `  npm run account -- --provider ${provider}` +
-            ` --env ${result.target.envKey}${SLOT_SUFFIX}` +
+          `  npm run account -- --provider ${provider} ${refs.join(' ')}` +
             ` --name "${result.target.label} · 账号 ${SLOT}"`,
         );
       }
