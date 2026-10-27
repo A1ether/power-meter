@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { ensureDebugChrome, openCookieCollector, type CookieCollector } from '../lib/cdp.js';
 import { assertBusinessOk, fetchJson, HttpError } from '../lib/http.js';
 import { clamp, firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
+import { fetchAllPages, incompleteNote } from '../lib/pagination.js';
 import { localDateKey, startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
 import type { AccountConfig } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
@@ -613,33 +614,44 @@ async function cbTokenRequestUsage(
 
   const fetchPages = async (base: string): Promise<UsageRecord[]> => {
     const url = `${base}/billing/meter/get-user-request-usage`;
-    const out: UsageRecord[] = [];
-    for (let pageNum = 1; pageNum <= 10; pageNum += 1) {
-      const { body } = await fetchJson(url, {
-        method: 'POST',
-        headers: tokenHeaders,
-        body: JSON.stringify({
-          startTime: `${startDay} 00:00:00`,
-          endTime: `${endDay} 23:59:59`,
-          pageNum,
-          pageSize,
-        }),
-        timeoutMs,
-      });
-      assertBusinessOk(body);
-      const data = isRecord(body) ? pick(body, 'data') : undefined;
-      const list = isRecord(data) ? pick(data, 'data', 'Data') : undefined;
-      if (!Array.isArray(list) || list.length === 0) break;
-      for (const raw of list) {
-        if (!isRecord(raw)) continue;
-        const at = toIso(pick(raw, 'requestTime', 'request_time'));
-        const amount = firstNumber(pick(raw, 'credit', 'credits'));
-        if (!at || amount === null || amount <= 0) continue;
-        out.push({ at: Date.parse(at), kind: 'use', amount });
-      }
-      if (list.length < pageSize) break;
+    const result = await fetchAllPages<UsageRecord>({
+      pageSize,
+      maxPages: 10,
+      label: `${site.label} 令牌模式用量明细`,
+      fetchPage: async (pageNum) => {
+        const { body } = await fetchJson(url, {
+          method: 'POST',
+          headers: tokenHeaders,
+          body: JSON.stringify({
+            startTime: `${startDay} 00:00:00`,
+            endTime: `${endDay} 23:59:59`,
+            pageNum,
+            pageSize,
+          }),
+          timeoutMs,
+        });
+        assertBusinessOk(body);
+        const data = isRecord(body) ? pick(body, 'data') : undefined;
+        const list = isRecord(data) ? pick(data, 'data', 'Data') : undefined;
+        const total = isRecord(data) ? firstNumber(pick(data, 'total', 'totalCount')) : null;
+        const items: UsageRecord[] = [];
+        if (Array.isArray(list)) {
+          for (const raw of list) {
+            if (!isRecord(raw)) continue;
+            const at = toIso(pick(raw, 'requestTime', 'request_time'));
+            const amount = firstNumber(pick(raw, 'credit', 'credits'));
+            if (!at || amount === null || amount <= 0) continue;
+            items.push({ at: Date.parse(at), kind: 'use', amount });
+          }
+        }
+        return { items, total };
+      },
+    });
+    if (!result.complete) {
+      // 未取全就不能当作「该日用量已覆盖」——由调用方把 use 维度退回本地采样
+      throw new Error(`用量明细分页未取全（${incompleteNote(result)}）`);
     }
-    return out;
+    return result.items;
   };
 
   try {
@@ -1118,30 +1130,45 @@ function createCodeBuddyAdapter(siteId: CodeBuddySiteId): ProviderAdapter {
       const endDay = localDateKey(ctx.now);
       const pageSize = 100;
       const requestUsageUrl = `${site.billingOrigin}/billing/meter/get-user-request-usage`;
-      for (let pageNum = 1; pageNum <= 10; pageNum += 1) {
-        const { body } = await fetchJson(requestUsageUrl, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            startTime: `${startDay} 00:00:00`,
-            endTime: `${endDay} 23:59:59`,
-            pageNum,
-            pageSize,
-          }),
-          timeoutMs,
-        });
-        assertBusinessOk(body);
-        const data = isRecord(body) ? pick(body, 'data') : undefined;
-        const list = isRecord(data) ? pick(data, 'data') : undefined;
-        if (!Array.isArray(list) || list.length === 0) break;
-        for (const raw of list) {
-          if (!isRecord(raw)) continue;
-          const at = toIso(pick(raw, 'requestTime', 'request_time'));
-          const amount = firstNumber(pick(raw, 'credit', 'credits'));
-          if (!at || amount === null || amount <= 0) continue;
-          records.push({ at: Date.parse(at), kind: 'use', amount });
-        }
-        if (list.length < pageSize) break;
+      const usePages = await fetchAllPages<UsageRecord>({
+        pageSize,
+        maxPages: 10,
+        label: `${adapter.displayName} 用量明细`,
+        fetchPage: async (pageNum) => {
+          const { body } = await fetchJson(requestUsageUrl, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              startTime: `${startDay} 00:00:00`,
+              endTime: `${endDay} 23:59:59`,
+              pageNum,
+              pageSize,
+            }),
+            timeoutMs,
+          });
+          assertBusinessOk(body);
+          const data = isRecord(body) ? pick(body, 'data') : undefined;
+          const list = isRecord(data) ? pick(data, 'data') : undefined;
+          const total = isRecord(data) ? firstNumber(pick(data, 'total', 'totalCount')) : null;
+          const items: UsageRecord[] = [];
+          if (Array.isArray(list)) {
+            for (const raw of list) {
+              if (!isRecord(raw)) continue;
+              const at = toIso(pick(raw, 'requestTime', 'request_time'));
+              const amount = firstNumber(pick(raw, 'credit', 'credits'));
+              if (!at || amount === null || amount <= 0) continue;
+              items.push({ at: Date.parse(at), kind: 'use', amount });
+            }
+          }
+          return { items, total };
+        },
+      });
+      records.push(...usePages.items);
+      // 翻到上限仍没取全时**不能声明覆盖**：否则「缺记录 = 0」会把没取到的用量压成 0。
+      // （与 CodeArts 活动逐笔截断同源，见 docs/fixes/CodeArts-活动奖励逐笔分页截断-修复方案.md）
+      const useCovered = usePages.complete;
+      if (!useCovered) {
+        ctx.log(`${adapter.displayName} 用量明细分页未取全（${incompleteNote(usePages)}），该维度退回本地采样`);
       }
 
       // ②③ 获取记录：任一步失败即放弃覆盖声明（grant 回退本地采样）
@@ -1206,7 +1233,7 @@ function createCodeBuddyAdapter(siteId: CodeBuddySiteId): ProviderAdapter {
         ctx.log(`${adapter.displayName} 礼包明细获取失败（退回本地采样）：${(error as Error).message}`);
       }
 
-      return { records, covers: { use: true, grant: grantCovered } };
+      return { records, covers: { use: useCovered, grant: grantCovered } };
     },
 
     /** 默认登录方法（扫码）；完整清单在对象外组装成 `loginMethods` */

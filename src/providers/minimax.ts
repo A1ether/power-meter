@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { assertBusinessOk, fetchJson, HttpError } from '../lib/http.js';
 import { asNumber, firstNumber, isRecord, pick, toIso } from '../lib/json.js';
+import { fetchAllPages } from '../lib/pagination.js';
 import { startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
 import type { AccountConfig } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
@@ -285,28 +286,39 @@ export async function fetchMinimaxCreditDetails(
   ctx: ProbeContext,
   maxPages = MAX_PAGES,
 ): Promise<MinimaxDetailsResult> {
-  const items: MinimaxCreditDetail[] = [];
-  let totalCount = 0;
-  for (let page = 1; page <= maxPages; page += 1) {
-    const body = await minimaxGet(account, ctx, '/minimax-cloud/api/v1/credit/details', [
-      ['page_number', page],
-      ['page_size', DETAILS_PAGE_SIZE],
-      ['include_expired', 'true'],
-    ]);
-    assertBaseResp(body, '积分明细请求失败');
-    const source = isRecord(body) && isRecord(body.data) ? body.data : body;
-    const list = pick(source, 'details');
-    if (!Array.isArray(list)) {
-      throw new Error('积分明细响应缺少 details 字段（token 可能已失效）');
-    }
-    totalCount = firstNumber(pick(source, 'total_count', 'totalCount')) ?? totalCount;
-    for (const raw of list) {
-      const detail = parseDetail(raw);
-      if (detail) items.push(detail);
-    }
-    if (items.length >= totalCount || list.length < DETAILS_PAGE_SIZE) break;
-  }
-  return { items, totalCount, complete: items.length >= totalCount };
+  let totalCount: number | null = null;
+  const result = await fetchAllPages<MinimaxCreditDetail>({
+    pageSize: DETAILS_PAGE_SIZE,
+    maxPages,
+    label: 'MiniMax 积分明细',
+    fetchPage: async (page) => {
+      const body = await minimaxGet(account, ctx, '/minimax-cloud/api/v1/credit/details', [
+        ['page_number', page],
+        ['page_size', DETAILS_PAGE_SIZE],
+        ['include_expired', 'true'],
+      ]);
+      assertBaseResp(body, '积分明细请求失败');
+      const source = isRecord(body) && isRecord(body.data) ? body.data : body;
+      const list = pick(source, 'details');
+      if (!Array.isArray(list)) {
+        throw new Error('积分明细响应缺少 details 字段（token 可能已失效）');
+      }
+      const total = firstNumber(pick(source, 'total_count', 'totalCount'));
+      if (total !== null) totalCount = total;
+      return {
+        // parseDetail 会跳过无法解析的条目：跳过项不参与翻页判据，但会体现在 total 差额里
+        items: list.map(parseDetail).filter((item): item is MinimaxCreditDetail => item !== null),
+        total,
+      };
+    },
+  });
+
+  /**
+   * 历史缺陷：`totalCount` 缺省为 0 时 `items.length >= totalCount` 恒真，
+   * 「翻页到上限被截断」会被判成 complete —— 恰好会放过「只取到一半」的情况。
+   * 现在由 `fetchAllPages` 给出 complete（无 total 时用短页判据，与 total 矛盾则不判取全）。
+   */
+  return { items: result.items, totalCount: totalCount ?? 0, complete: result.complete };
 }
 
 export interface MinimaxSigninState {

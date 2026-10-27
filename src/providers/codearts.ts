@@ -1,5 +1,6 @@
 import { assertBusinessOk, fetchJson, HttpError } from '../lib/http.js';
 import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
+import { fetchAllPages, incompleteNote, type PagedResult } from '../lib/pagination.js';
 import { localDateKey, localNoonOf, startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
 import type { AccountConfig } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
@@ -96,8 +97,10 @@ export function consoleHeaders(account: AccountConfig, cookie: string): Record<s
  * 「活动奖励积分（未明细部分）」——见
  * docs/fixes/CodeArts-活动奖励逐笔分页截断-修复方案.md。
  *
- * 取全判据（known）：响应 `total` 优先，其次活动列表的 `claimCount`。
- * 判定不出来时不声明已取全（宁可显式说「未取全」，也不把截断伪装成「只有这些」）。
+ * 翻页本身交给 `fetchAllPages()`（公共不变式，见 `src/lib/pagination.ts`），
+ * 这里只负责「分页参数名探测」：`page/size` → `pageNum/pageSize` → 不带参数（兜底）。
+ * 末位兜底很关键：若上游拒绝未知查询参数（或命名全猜错），至少拿到默认页，
+ * 不会因为「加了参数」把整块活动明细弄丢。
  */
 async function fetchCampaignBenefitEntries(
   headers: Record<string, string>,
@@ -109,71 +112,78 @@ async function fetchCampaignBenefitEntries(
   enumerated: number;
   expected: number | null;
   complete: boolean;
+  incompleteReason: string | null;
 }> {
   const expectedFromList = campaign.claimCount > 0 ? campaign.claimCount : null;
-  let best: { entries: CampaignBenefit[]; total: number | null } = { entries: [], total: null };
-  let lastError: Error | null = null;
-
-  /**
-   * 依次尝试：`page`/`size` → `pageNum`/`pageSize` → **不带参数（历史行为兜底）**。
-   * 末位兜底很关键：若上游拒绝未知查询参数（或分页参数名全猜错），至少拿到默认页，
-   * 不会因为「加参数」这件事本身把整块活动明细弄丢。
-   */
-  const attempts: Array<{ label: string; query: (page: number) => string }> = [
+  const attempts: Array<{ label: string; query: (page: number) => string; maxPages: number }> = [
     ...CAMPAIGN_PAGE_STYLES.map((style) => ({
       label: `${style.page}/${style.size}`,
       query: (page: number) => `?${style.page}=${page}&${style.size}=${CAMPAIGN_PAGE_SIZE}`,
+      maxPages: MAX_CAMPAIGN_PAGES,
     })),
-    { label: '默认页（无参数）', query: () => '' },
+    { label: '默认页（无参数）', query: () => '', maxPages: 1 },
   ];
 
+  let best: PagedResult<CampaignBenefit> | null = null;
+  let firstError: Error | null = null;
+
   for (const attempt of attempts) {
-    const isPlain = attempt.label === '默认页（无参数）';
-    const seen = new Map<string, CampaignBenefit>();
-    let total: number | null = null;
-    for (let page = 1; page <= (isPlain ? 1 : MAX_CAMPAIGN_PAGES); page += 1) {
-      let parsed: { entries: CampaignBenefit[]; total: number | null };
-      try {
-        const { body } = await fetchJson(
-          withStamp(
-            `/portal/promptcenter/v1/ops/credit/campaign/${campaign.id}${attempt.query(page)}`,
-          ),
-          { headers, timeoutMs: Math.min(timeoutMs, 8_000) },
-        );
-        assertBusinessOk(body);
-        parsed = parseCampaignBenefitEntries(body);
-      } catch (error) {
-        lastError = error as Error;
-        ctx.log(
-          `CodeArts 活动 ${campaign.id} 按「${attempt.label}」取逐笔失败：${lastError.message}`,
-        );
-        break;
+    try {
+      const result = await fetchAllPages<CampaignBenefit>({
+        pageSize: CAMPAIGN_PAGE_SIZE,
+        maxPages: attempt.maxPages,
+        keyOf: (entry) => entry.benefitId,
+        label: `活动 ${campaign.id}（${attempt.label}）`,
+        fetchPage: async (page) => {
+          const { body } = await fetchJson(
+            withStamp(
+              `/portal/promptcenter/v1/ops/credit/campaign/${campaign.id}${attempt.query(page)}`,
+            ),
+            { headers, timeoutMs: Math.min(timeoutMs, 8_000) },
+          );
+          assertBusinessOk(body);
+          const parsed = parseCampaignBenefitEntries(body);
+          return { items: parsed.entries, total: parsed.total };
+        },
+      });
+      // 取全即止；否则留下「枚举最多」的那次（默认页兜底通常最少）
+      if (result.complete) {
+        return {
+          entries: result.items,
+          enumerated: result.items.length,
+          expected: result.expected ?? expectedFromList,
+          complete: true,
+          incompleteReason: null,
+        };
       }
-      if (parsed.total !== null) total = parsed.total;
-      const before = seen.size;
-      for (const entry of parsed.entries) {
-        if (!seen.has(entry.benefitId)) seen.set(entry.benefitId, entry);
-      }
-      const known = total ?? expectedFromList;
-      if (known !== null && seen.size >= known) {
-        return { entries: [...seen.values()], enumerated: seen.size, expected: known, complete: true };
-      }
-      // 本页零新增：该命名不被识别（或确实只有这些）——换下一种再试
-      if (seen.size === before) break;
+      if (!best || result.items.length > best.items.length) best = result;
+    } catch (error) {
+      firstError = firstError ?? (error as Error);
+      ctx.log(
+        `CodeArts 活动 ${campaign.id} 按「${attempt.label}」取逐笔失败：${(error as Error).message}`,
+      );
     }
-    const entries = [...seen.values()];
-    if (entries.length > best.entries.length) best = { entries, total };
   }
 
-  // 连默认页都没拿到（网络/业务错误）：抛出去由上层降级，与加参数之前的行为一致
-  if (best.entries.length === 0 && lastError) throw lastError;
+  // 三种方式都失败（连默认页都拿不到）：抛出去由上层降级，与加参数之前的行为一致
+  if (!best) throw firstError ?? new Error(`活动 ${campaign.id} 逐笔明细获取失败`);
 
-  const expected = best.total ?? expectedFromList;
+  const expected = best.expected ?? expectedFromList;
+  // 活动列表自报的 claimCount 也作为完整性交叉校验：上游 total 缺失或被过滤时仍能发现缺额
+  const complete = best.complete || (expected !== null && best.items.length >= expected);
+  const reason = incompleteNote(best, '笔');
   ctx.log(
-    `CodeArts 活动 ${campaign.id}（${campaign.title}）逐笔未取全：枚举 ${best.entries.length} 笔` +
-      `${expected !== null ? `，上游声称 ${expected} 笔` : '，上游未给 total'}`,
+    `CodeArts 活动 ${campaign.id}（${campaign.title}）逐笔未取全：枚举 ${best.items.length} 笔` +
+      `${expected !== null ? `，上游声称 ${expected} 笔` : '，上游未给 total'}` +
+      `${reason ? `；${reason}` : ''}`,
   );
-  return { entries: best.entries, enumerated: best.entries.length, expected, complete: false };
+  return {
+    entries: best.items,
+    enumerated: best.items.length,
+    expected,
+    complete,
+    incompleteReason: reason,
+  };
 }
 
 /**

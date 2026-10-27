@@ -21,6 +21,7 @@
     "codearts:schedule": "bash tools/install-codearts-refresh-launchd.sh",
     "chrome:debug": "tools/chrome-debug.sh",
     "typecheck": "tsc --noEmit",
+    "test:pagination": "tsx src/cli/test-pagination.ts",
     "build": "tsc -p tsconfig.json",
     "serve": "node dist/server.js",
     "serve:sidecar": "node dist/server.js --port 0 --no-static",
