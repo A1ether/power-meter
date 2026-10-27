@@ -100,6 +100,11 @@ const state = {
   /** 手工凭证 <details> 被用户展开过的卡片（同上，重建卡片时要恢复） */
   manualOpen: new Set(),
   /**
+   * 正在执行卡片级「删除」的卡片（key = cardKeyOf）。
+   * 登录轮询会重建卡片，禁用态必须存这里，否则重建出来的按钮又能点一次。
+   */
+  deleting: new Set(),
+  /**
    * 「平台与账号」弹窗的状态：
    *   - providerId = null 时显示平台列表（含一个账号都没有的平台）；
    *   - providerId 非空时显示该平台的登录 / 添加表单（与卡片内管理区同一套逻辑）。
@@ -693,7 +698,14 @@ function buildCard(provider, thresholds) {
   const manageRoot = els.manageTemplate.content.firstElementChild.cloneNode(true);
   slot.append(manageRoot);
   renderManage(manageRoot, cardTarget(provider), {
-    toggle: node.querySelector('.manage__toggle'),
+    // 卡片右上角的按钮组：合并卡片是「＋ 添加账号」，单账号卡片是「重新登录 / 删除」
+    // （分流规则见 renderManage 里「卡片右上角按钮组」一节）
+    cardActions: {
+      root: node.querySelector('.card__actions'),
+      add: node.querySelector('.manage__toggle'),
+      relogin: node.querySelector('.manage__relogin'),
+      remove: node.querySelector('.manage__remove'),
+    },
   });
 
   node.querySelector('.card__updated').textContent = `更新于 ${fmtDate(provider.updatedAt)}`;
@@ -954,14 +966,42 @@ function metaFor(provider) {
   return (state.adapterMeta ?? new Map()).get(provider.provider) ?? null;
 }
 
-async function removeAccount(provider, entry, target = cardTarget(provider)) {
+/**
+ * 删除一个账号（条目行 / 弹窗账号列表 / 卡片右上角共用）。
+ *
+ * 返回 `'cancelled' | 'removed' | 'failed'`：调用方要区分「用户取消」与「真失败」，
+ * 取消时不该重绘（否则手工表单里已输入的内容会被清掉）。
+ *
+ * `onSettled` 是可选的结果回调：卡片级删除会把这张卡删掉，结果提示随之失去宿主，
+ * 调用方传 `flashNotice` 让提示落到「诊断」区；不传则照旧写在管理区的结果行上。
+ */
+async function removeAccount(provider, entry, target = cardTarget(provider), onSettled = null) {
   const label = entry.label || entry.id || '未命名';
-  const platform = target.provider.displayName ?? provider.displayName;
+  // 平台名优先取适配器声明：单账号卡片的 displayName 是「CodeBuddy · 账号 1」，
+  // 拿它当平台名会和账号名重复一遍
+  const platform =
+    metaFor(target.provider)?.displayName ?? target.provider.displayName ?? provider.displayName;
   const confirmed = window.confirm(
     `删除 ${platform} 账号「${label}」？\n\n` +
       '会同时清掉 .env 里不再被其它账号引用的凭证变量，改动前自动备份到 .run/。',
   );
-  if (!confirmed) return;
+  if (!confirmed) return 'cancelled';
+
+  /**
+   * 结果提示的时机随落点不同：
+   *   - 写进管理区（setManageMessage）必须在 refresh **之前**——refresh 会重绘，
+   *     重绘时 renderManage 才从 state 里把它画出来；
+   *   - 落「诊断」区（onSettled）必须在 refresh **之后**——renderDiagnostics 会
+   *     replaceChildren 整个诊断区，先写会被抹掉。
+   */
+  const settle = async (kind, text) => {
+    const before = !onSettled;
+    if (before) setManageMessage(target.key, kind, text);
+    // 卡片的 refresh() 会 load(true)，弹窗的 refresh() 会重拉总览，各自都能看到结果
+    await target.refresh();
+    if (!before) onSettled(kind, text);
+  };
+
   try {
     const result = await manageRequest('/api/accounts/remove', {
       provider: target.provider.provider,
@@ -970,15 +1010,78 @@ async function removeAccount(provider, entry, target = cardTarget(provider)) {
     const cleaned = result.removedEnvLines?.length
       ? `，并移除了 ${result.removedEnvLines.join(' / ')}`
       : '';
-    setManageMessage(target.key, 'ok', `已删除「${label}」${cleaned}`);
     state.configuredAccounts.delete(target.provider.provider);
     state.platformOverview = null;
-    // 卡片的 refresh() 会 load(true)，弹窗的 refresh() 会重拉总览，各自都能看到结果
-    await target.refresh();
+    await settle('ok', `已删除「${label}」${cleaned}`);
+    return 'removed';
   } catch (error) {
-    setManageMessage(target.key, 'err', `删除「${label}」失败：${error.message}`);
-    await target.refresh();
+    await settle('err', `删除「${label}」失败：${error.message}`);
+    return 'failed';
   }
+}
+
+/**
+ * 卡片右上角的「删除」：删的就是这张卡代表的那个账号。
+ *
+ * 定位键是 `provider.accountId`（= accounts.json 的 displayName，见 src/types.ts）；
+ * 为空串时后端按空名匹配，唯一则删成功、重复则返回 409，两条路径都有明确提示。
+ *
+ * 删除前先取消本平台正在进行的登录会话：否则会话终态落库时找不到原条目，
+ * 会把这个刚删掉的账号又新建回来（见 src/account-store.ts 的 landLoginAccount）。
+ */
+async function removeCardAccount(provider, target, repaint) {
+  if (state.deleting.has(target.key)) return 'cancelled';
+  state.deleting.add(target.key);
+  // 此刻 repaint 操作的还是活着的按钮节点；请求期间的重建由下面的 renderGrid 兜住
+  repaint?.();
+  /** 用户点了「取消」时不重绘：重建卡片会清掉手工表单里已输入的内容 */
+  let outcome = 'cancelled';
+  try {
+    if (state.login?.providerId === provider.provider) {
+      const id = state.login.session?.id;
+      if (state.login.timer) clearTimeout(state.login.timer);
+      state.login = null;
+      if (id) await loginRequest('/api/login/cancel', { body: { id } }).catch(() => {});
+    }
+    // 提示不再写进管理区（这张卡删掉后就没了），改落「诊断」区；
+    // removeAccount 的文案里已带账号名，这里不再前缀平台名，避免重复
+    outcome = await removeAccount(
+      provider,
+      { id: provider.accountId ?? '', label: provider.displayName },
+      target,
+      flashNotice,
+    );
+    // 删除成功：这张卡连同它的管理区一起消失，展开态不必留着
+    if (outcome === 'removed') state.manageOpen.delete(target.key);
+    return outcome;
+  } finally {
+    state.deleting.delete(target.key);
+    // 用户取消：卡片没有重建，按钮还是那个节点，就地恢复「删除」
+    repaint?.();
+    // 真发起过删除：removeAccount 内部的 refresh 发生在 state.deleting 还没清的时候，
+    // 那一轮重建出来的按钮会停在「删除中…」，所以按最新状态重画一次网格。
+    // 只重画卡片，不动诊断区（结果提示就住在那里）。
+    if (outcome !== 'cancelled' && state.data) renderGrid(state.data);
+  }
+}
+
+/**
+ * 卡片右上角按钮组全部隐藏（不可管理 / 能力清单没拉到时的兜底）。
+ * 容器也一起隐藏：它带着 margin-left:auto，留着会在额度行右侧占一个空 gap。
+ */
+function hideCardActions(actions) {
+  if (!actions) return;
+  for (const node of [actions.root, actions.add, actions.relogin, actions.remove]) {
+    if (node) node.hidden = true;
+  }
+}
+
+/**
+ * 把一次性提示落到「诊断」区（与剪贴板失败等提示同一套样式）。
+ * 卡片级操作的结果没有卡片可挂，这是它唯一的落点。
+ */
+function flashNotice(kind, text) {
+  els.diagnostics.prepend(element('div', kind === 'ok' ? 'diag' : 'diag diag--warn', text));
 }
 
 /**
@@ -1317,15 +1420,22 @@ function repaintManageTargets(providerId) {
  *
  * 登录入口同样由声明驱动：`/api/providers` 的 `login` 非空才渲染「扫码 / 打开链接登录」，
  * 手工 Cookie 表单收进 <details> 兜底（见 public/index.html 的 #manage-template）。
+ *
+ * 卡片右上角的按钮组由 `options.cardActions` 传入（弹窗不传，它有自己的入口）：
+ *   - 单账号卡片：「重新登录」+「删除」——展开面板只为登录，删除是一步直达；
+ *   - 合并卡片（`groupAccounts`）：只有「＋ 添加账号」，卡片级没有单一账号身份
+ *     （`src/aggregate.ts` 把 accountId 置空、身份下移到 entries[].id），
+ *     删除仍挂在每条账号行上；
+ *   - 不可管理的平台：三个按钮全隐藏。
  */
 function renderManage(root, target, options = {}) {
   const box = root.classList?.contains('manage') ? root : root.querySelector('.manage');
   const provider = target.provider;
   const meta = metaFor(provider);
-  const toggle = options.toggle ?? null;
+  const actions = options.cardActions ?? null;
 
-  if (toggle) toggle.hidden = !provider.manageAccounts;
   if (!provider.manageAccounts) {
+    hideCardActions(actions);
     box.hidden = true;
     return;
   }
@@ -1363,6 +1473,67 @@ function renderManage(root, target, options = {}) {
     // 没有登录能力：表单就是唯一入口，不再叫「兜底」
     manual.querySelector('summary').textContent = '填写凭证';
   }
+
+  /* ---------------------- 卡片右上角按钮组 ---------------------- */
+
+  /**
+   * 形态分流（合并卡片没有单一账号身份，卡片级删除无从下手）：
+   *   - 合并卡片：「＋ 添加账号」，删除留在每条账号行上；
+   *   - 单账号卡片 + 有登录能力：「重新登录」+「删除」；
+   *   - 单账号卡片 + 无登录能力（防御分支）：退回「＋ 添加账号」+「删除」，
+   *     否则这张卡在右上角就没有任何进入表单的入口。
+   */
+  const grouped = provider.groupAccounts === true || (provider.entries ?? []).length > 0;
+  const reloginAvailable = !grouped && Boolean(loginMeta);
+  const showAdd = !reloginAvailable;
+  const addLabel = loginMeta ? '＋ 登录 / 添加账号' : '＋ 添加账号';
+
+  /**
+   * 展开态 → 按钮文案。add 与 relogin 同时只有一个可见，两者都是「展开 / 收起」开关；
+   * 登录会话进行中时「重新登录」置灰，面板已被强制展开（见下面的 state.manageOpen）。
+   */
+  const paintToggles = (open) => {
+    if (!actions) return;
+    // 会话未到终态才算「登录中」（判据与 visibilitychange 补轮询处一致）
+    const busy =
+      state.login?.providerId === provider.provider &&
+      Boolean(state.login.session) &&
+      !LOGIN_TERMINAL.has(state.login.session.status);
+    for (const button of [actions.add, actions.relogin]) {
+      if (!button || button.hidden) continue;
+      const isRelogin = button === actions.relogin;
+      // 登录进行中：这张卡的登录按钮就是那个会话的入口，置灰避免重复发起
+      let label;
+      if (isRelogin && busy) label = '登录中…';
+      else if (open) label = '收起';
+      else label = isRelogin ? '重新登录' : addLabel;
+      button.textContent = label;
+      button.disabled = isRelogin && busy;
+      button.setAttribute('aria-expanded', String(open));
+    }
+  };
+
+  /** 「删除」的禁用态存 state.deleting：登录轮询会重建卡片，禁用态写在 DOM 上会丢 */
+  const paintRemove = () => {
+    const button = actions?.remove;
+    if (!button || button.hidden) return;
+    // 与确认框同一个名字（removeAccount 用的是 entry.label = 卡片标题）
+    const label = provider.displayName || provider.accountId || '未命名';
+    const busy = state.deleting.has(target.key);
+    button.disabled = busy;
+    button.textContent = busy ? '删除中…' : '删除';
+    button.title = `删除账号「${label}」`;
+    button.setAttribute('aria-label', `删除账号 ${label}`);
+    button.onclick = () => void removeCardAccount(provider, target, paintRemove);
+  };
+
+  if (actions) {
+    actions.add.hidden = !showAdd;
+    actions.relogin.hidden = showAdd;
+    actions.remove.hidden = grouped;
+    if (actions.root) actions.root.hidden = false;
+  }
+  paintRemove();
 
   const message = state.manageMessages.get(target.key);
   status.hidden = !message;
@@ -1453,7 +1624,8 @@ function renderManage(root, target, options = {}) {
     manual.hidden = true;
     listTitle.textContent = '尚未加载账号清单';
     listNode.replaceChildren();
-    if (toggle) toggle.hidden = true;
+    // 能力清单没拉到：右上角一律不给入口（连「删除」也不给——删错了没法加回来）
+    hideCardActions(actions);
     box.hidden = false;
     return;
   }
@@ -1475,22 +1647,15 @@ function renderManage(root, target, options = {}) {
   // 登录会话还挂在同一个平台上时，卡片的管理区必须保持展开——二维码 / 状态就住在里面
   if (state.login?.providerId === provider.provider) state.manageOpen.add(target.key);
 
-  const toggleLabel = loginMeta ? '＋ 登录 / 添加账号' : '＋ 添加账号';
   const collapse = () => {
     state.manageOpen.delete(target.key);
     form.hidden = true;
-    if (toggle) {
-      toggle.textContent = toggleLabel;
-      toggle.setAttribute('aria-expanded', 'false');
-    }
+    paintToggles(false);
   };
   const expand = () => {
     state.manageOpen.add(target.key);
     form.hidden = false;
-    if (toggle) {
-      toggle.textContent = '收起';
-      toggle.setAttribute('aria-expanded', 'true');
-    }
+    paintToggles(true);
   };
 
   if (target.alwaysOpen || state.manageOpen.has(target.key)) {
@@ -1501,17 +1666,18 @@ function renderManage(root, target, options = {}) {
     collapse();
   }
 
-  if (toggle) {
-    toggle.onclick = async () => {
-      if (state.manageOpen.has(target.key)) {
-        collapse();
-        return;
-      }
-      box.hidden = false;
-      expand();
-      await paintAccounts();
-    };
-  }
+  // 「＋ 添加账号」与「重新登录」是同一个开关的两种文案（同时只有一个可见）
+  const onToggle = async () => {
+    if (state.manageOpen.has(target.key)) {
+      collapse();
+      return;
+    }
+    box.hidden = false;
+    expand();
+    await paintAccounts();
+  };
+  if (actions?.add) actions.add.onclick = onToggle;
+  if (actions?.relogin) actions.relogin.onclick = onToggle;
 
   /** 表单重置：回到声明的默认值（站点已由 provider 表达，不再有需要压回的值） */
   const resetForm = () => {

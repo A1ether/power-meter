@@ -185,9 +185,21 @@
         <div class="card__balance">
           <span class="card__amount">–</span>
           <span class="card__currency"></span>
-          <!-- 增删账号的入口贴着额度右侧；表单展开在下面（见适配器的 manageAccounts） -->
-          <button class="secret__btn secret__btn--primary manage__toggle" type="button"
-                  aria-expanded="false" hidden>＋ 添加账号</button>
+          <!--
+            卡片级账号操作贴着额度右侧，三种形态由 app.js 按快照分流（见 buildCard）：
+              - 单账号卡片：「重新登录」（凭证过期）+「删除」（删掉这张卡的账号）；
+              - 合并卡片（A1etherOpenAi）：只有「＋ 添加账号」，删除挂在每条账号行上；
+              - 不可管理的平台：三个按钮全隐藏。
+            展开的面板（登录块 + 手工凭证兜底）在下面 .manage-slot 里。
+          -->
+          <div class="card__actions">
+            <button class="secret__btn secret__btn--primary manage__toggle" type="button"
+                    aria-expanded="false" hidden>＋ 添加账号</button>
+            <button class="secret__btn manage__relogin" type="button"
+                    aria-expanded="false" hidden>重新登录</button>
+            <button class="secret__btn secret__btn--danger manage__remove" type="button"
+                    hidden>删除</button>
+          </div>
         </div>
         <p class="card__plan muted"></p>
 

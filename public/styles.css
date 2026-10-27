@@ -1098,10 +1098,25 @@ kbd {
   font-size: 11.5px;
 }
 
-/* 「＋ 添加账号」贴着额度行右侧 */
-.manage__toggle {
+/* 卡片级账号操作（重新登录 / 删除 / ＋ 添加账号）贴着额度行右侧 */
+.card__actions {
   margin-left: auto;
   align-self: center;
+  display: flex;
+  flex: none;
+  gap: 6px;
+}
+
+/* 三个按钮全隐藏时容器也要退出布局：否则它在 .card__balance 的 flex gap 里
+   留一个 7px 空位（类选择器的 display:flex 会盖掉 UA 的 [hidden] 规则） */
+.card__actions[hidden] {
+  display: none;
+}
+
+/* 两个按钮并排时额度数值优先：窄卡片下只截断按钮，不把额度挤走 */
+.card__actions .secret__btn {
+  padding-inline: 8px;
+  white-space: nowrap;
 }
 
 /* 日级用量 / 增量：四字段 2×2 网格。
