@@ -69,6 +69,14 @@ export interface CreditLot {
    *   此时仅用于展示「什么时候到期」，不参与汇总，避免与 balance 重复计算
    */
   basis: 'remaining' | 'granted';
+  /**
+   * 该批次的**授予总量**（平台同时给出「授予」与「剩余」时才有值，如 MiniMax）。
+   *
+   * 有它才能画「剩余 / 授予」这一笔的余量进度条；只给剩余量的平台为 `null`，
+   * 界面退回按剩余时间画。绝不从 `amount` 反推授予量 —— 那等于把「剩余 42」
+   * 当成「授予 42」，条永远是满的。
+   */
+  granted: number | null;
 }
 
 export interface MoneyBalance {
@@ -213,6 +221,8 @@ export interface ExpiryHit {
   lotId: string;
   lotLabel: string;
   amount: number;
+  /** 该批次的授予总量，见 CreditLot.granted；不知道时为 null */
+  granted: number | null;
   currency: Currency;
   expiresAt: string;
   inDays: number;

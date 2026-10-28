@@ -455,6 +455,7 @@ export const minimaxAdapter: ProviderAdapter = {
             id: `minimax-${detail.creditType}-${detail.grantedAt}-${index}`,
             label: creditLabel(detail.creditType),
             amount: detail.remaining,
+            granted: detail.granted,
             currency: 'CREDITS',
             expiresAt: toIso(detail.expiresAt),
             note: detail.consumed > 0 ? `已用 ${formatAmount(detail.consumed)}` : '',
