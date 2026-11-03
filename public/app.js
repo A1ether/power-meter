@@ -1647,14 +1647,34 @@ function renderManage(root, target, options = {}) {
   // 登录会话还挂在同一个平台上时，卡片的管理区必须保持展开——二维码 / 状态就住在里面
   if (state.login?.providerId === provider.provider) state.manageOpen.add(target.key);
 
+  /**
+   * 展开 / 收起整块管理区。
+   *
+   * 关键点：`.manage` 里除了表单还有登录块、已配置账号清单，光切 `form.hidden`
+   * 收不掉这些块（「收起」点了没反应），所以收起必须连 `box` 一起隐藏。
+   *
+   * 没有登录能力的平台（如 A1etherOpenAi）手工表单就收在 <details> 里，
+   * 只把 `form.hidden` 置 false 并不会展开折叠的 details——用户点「＋ 添加账号」
+   * 看不到「填写凭证」，只会看到下方已配置账号清单。这里展开时直接打开 details，
+   * 让唯一入口就是那张凭证表单。
+   */
   const collapse = () => {
     state.manageOpen.delete(target.key);
+    state.manualOpen.delete(target.key);
+    box.hidden = true;
     form.hidden = true;
+    manual.open = false;
     paintToggles(false);
   };
   const expand = () => {
     state.manageOpen.add(target.key);
+    box.hidden = false;
     form.hidden = false;
+    // 有登录能力时登录块是主入口，手工表单保持折叠（兜底）；没有登录能力时它就是唯一入口
+    if (!loginMeta) {
+      state.manualOpen.add(target.key);
+      manual.open = true;
+    }
     paintToggles(true);
   };
 
@@ -1672,7 +1692,6 @@ function renderManage(root, target, options = {}) {
       collapse();
       return;
     }
-    box.hidden = false;
     expand();
     await paintAccounts();
   };
@@ -1781,8 +1800,12 @@ function renderConfiguredAccounts(box, target, accounts) {
   // 「整个平台」= 这一个 provider：国内站 / 国际站已拆成两个 provider，
   // /api/accounts?provider= 返回的就是该站点的账号，前端不再按站点二次筛选。
   const currentAccountId = target.currentAccountId;
+  // 「这张卡已经显示了的账号」= 合并卡片 entries 里的那几条（单账号卡片没有 entries）。
+  // 注意合并卡片的 accountId 是空串（身份下移到 entries[].id），不能用真假值判断，
+  // 只能用 `=== null` 区分「弹窗（无当前卡片）」。否则空串会把 shown 判空，
+  // 让合并卡片错误地把全部账号当作「本平台已配置的账号」重复列出来。
   const shown = new Set(
-    currentAccountId === null ? [] : ((currentAccountId && target.provider.entries) || []).map((entry) => entry.id),
+    currentAccountId === null ? [] : (target.provider.entries ?? []).map((entry) => entry.id),
   );
   const single = currentAccountId !== null && shown.size === 0;
   const list = single ? accounts : accounts.filter((account) => !shown.has(account.id));
