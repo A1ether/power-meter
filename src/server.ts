@@ -36,6 +36,20 @@ const MIME: Record<string, string> = {
 const service = new DashboardService();
 const bootstrap = loadConfig().config;
 
+/**
+ * 服务真实监听地址的 origin。
+ *
+ * 桌面版 sidecar 固定用 `--port 0` 让内核分配空闲端口，此时 `bootstrap.server.port`
+ * 永远是 0，真实端口只有 `listen` 之后才能从 `server.address()` 读到。登录回调基址
+ * 必须带真实端口——否则 Trae 授权页回跳会打开 `http://127.0.0.1:0/authorize`，
+ * 浏览器直接以 ERR_UNSAFE_PORT 拒绝（网页版端口固定，所以不受影响）。
+ */
+function serverOrigin(): string {
+  const address = server.address();
+  const port = address && typeof address === 'object' ? address.port : bootstrap.server.port;
+  return `http://${bootstrap.server.host}:${port}`;
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body, null, 2);
   res.writeHead(status, {
@@ -562,7 +576,7 @@ const server = createServer(async (req, res) => {
         provider: adapter.id,
         method: typeof body.method === 'string' ? body.method : undefined,
         options: stringRecord(body.options),
-        callbackBase: `http://${bootstrap.server.host}:${bootstrap.server.port}`,
+        callbackBase: serverOrigin(),
         timeoutMs: bootstrap.settings.requestTimeoutMs + 6_000,
         log: (message) => console.log(message),
       });
@@ -679,10 +693,7 @@ const server = createServer(async (req, res) => {
 server.listen(bootstrap.server.port, bootstrap.server.host, () => {
   // --port 0 时让内核分配随机空闲端口，真实端口从 address() 回读（bootstrap.server.port 仍是 0）。
   // sidecar 模式下 magpie 也从 stdout 这行解析端口，格式保持稳定：<service> listening at <url>
-  const address = server.address();
-  const actualPort =
-    address && typeof address === 'object' ? address.port : bootstrap.server.port;
-  const origin = `http://${bootstrap.server.host}:${actualPort}`;
+  const origin = serverOrigin();
 
   if (sidecar.noStatic || sidecar.token || sidecar.staticDir) {
     // sidecar / 桌面模式：一行可被 magpie 或 macOS 外壳解析的就绪信号，含端口与是否启用了令牌（不打印令牌本身）
