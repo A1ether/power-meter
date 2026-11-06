@@ -20,5 +20,8 @@ start.command
 start.sh
 .run/
 
+# 设计 / 修复 / 模块梳理文档仅本地保留，不随仓库发布
+/docs/
+
 /.workbuddy
 /out

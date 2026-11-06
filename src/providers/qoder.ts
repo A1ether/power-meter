@@ -630,7 +630,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
  *   - 网页  `GET /api/v1/me`（Cookie，Cookie 模式用）      → `{ id, username, name, email, avatar }`
  *
  * **昵称只认 `name` 一类的展示名，`username` 必须排除 UUID 形态**：
- * 实测网页侧 `username` 是 `f17e9028-ba34-4e1c-8d1c-7250c0268219`（UUID），
+ * 实测网页侧 `username` 是 UUID 形态（如 `00000000-0000-4000-8000-000000000000`），
  * 直接兜底进昵称会让卡片标题变成一串 UUID；只有当它不是 UUID 时才认为它是人取的名字。
  */
 export function parseQoderIdentity(payload: unknown): { id: string; name: string } {
