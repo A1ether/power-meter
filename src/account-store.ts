@@ -26,7 +26,7 @@ import {
   removeA1etherOpenAiAccount,
   writeAccountsFile,
 } from './a1etheropenai-store.js';
-import { loadConfig, loadDotEnv } from './config.js';
+import { loadConfig, loadDotEnv, resolveDotEnvPath } from './config.js';
 import type { AccountConfig } from './config.js';
 import { isPlaceholderAccountName, maskSecret } from './providers/base.js';
 import type { ManageFieldDescriptor, ProviderAdapter } from './providers/base.js';
@@ -37,7 +37,10 @@ import type { ProviderSnapshot } from './types.js';
 const DEDICATED_PROVIDER = 'a1etheropenai';
 
 function envPath(): string {
-  return resolve(process.cwd(), '.env');
+  // 读路径由 loadDotEnv()/resolveDotEnvPath() 决定（会尊重 --config-dir），
+  // 写路径必须与之一致：桌面版 cwd 与配置目录虽相同，但命令行 `--config-dir` 时
+  // 只有统一到 resolveDotEnvPath() 才不会把新凭证写到 cwd 的另一个 .env。
+  return resolveDotEnvPath();
 }
 
 /* ------------------------------------------------------------------ *

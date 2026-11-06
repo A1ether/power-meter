@@ -13,7 +13,7 @@
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { loadConfig, loadDotEnv } from './config.js';
+import { loadConfig, loadDotEnv, resolveDotEnvPath } from './config.js';
 import { maskSecret } from './providers/base.js';
 import { a1etheropenaiAdapter, normalizeApiKey } from './providers/a1etheropenai.js';
 import type { ProviderSnapshot } from './types.js';
@@ -22,7 +22,9 @@ const PAI_DEFAULT_BASE = 'https://pai.d1v.ai/v1';
 const KEY_SHAPE = /[A-Za-z0-9_-]{24,}/g;
 
 function envPath(): string {
-  return resolve(process.cwd(), '.env');
+  // 读路径走 resolveDotEnvPath()（会尊重 --config-dir），写路径必须跟读路径一致，
+  // 否则桌面版会把凭证写到 cwd 而不是配置目录。缺省仍是 cwd/.env，CLI 行为不变。
+  return resolveDotEnvPath();
 }
 
 /** 账号清单路径以 loadConfig() 为准，这样 `.env` 里的 ACCOUNTS_PATH 生效 */

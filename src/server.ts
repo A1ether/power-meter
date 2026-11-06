@@ -15,7 +15,13 @@ import {
 import { describeRegistry, resolveAdapter } from './providers/index.js';
 import { DashboardService } from './service.js';
 
-const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
+// sidecar 选项要在 loadConfig() 之前解析：--config-dir 会重定位 .env / accounts.json 的基准目录，
+// 而 loadConfig 一进来就 loadDotEnv。独立看板（不带参数）时它们全部保持默认，行为不变。
+const sidecar = parseSidecarOptions();
+
+// 静态资源根目录：--static-dir 优先（桌面版把 public/ 放进 App Resources，bun 编译后的
+// import.meta.url 在虚拟文件系统里读不到真实目录）；缺省仍是 <dist>/../public/。
+const PUBLIC_DIR = sidecar.staticDir ?? fileURLToPath(new URL('../public/', import.meta.url));
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -27,9 +33,6 @@ const MIME: Record<string, string> = {
   '.png': 'image/png',
 };
 
-// sidecar 选项要在 loadConfig() 之前解析：--config-dir 会重定位 .env / accounts.json 的基准目录，
-// 而 loadConfig 一进来就 loadDotEnv。独立看板（不带参数）时它们全部保持默认，行为不变。
-const sidecar = parseSidecarOptions();
 const service = new DashboardService();
 const bootstrap = loadConfig().config;
 
@@ -681,11 +684,12 @@ server.listen(bootstrap.server.port, bootstrap.server.host, () => {
     address && typeof address === 'object' ? address.port : bootstrap.server.port;
   const origin = `http://${bootstrap.server.host}:${actualPort}`;
 
-  if (sidecar.noStatic || sidecar.token) {
-    // sidecar 模式：一行可被 magpie 解析的就绪信号，含端口与是否启用了令牌（不打印令牌本身）
+  if (sidecar.noStatic || sidecar.token || sidecar.staticDir) {
+    // sidecar / 桌面模式：一行可被 magpie 或 macOS 外壳解析的就绪信号，含端口与是否启用了令牌（不打印令牌本身）
     console.log(
       `[power-meter] listening at ${origin} mode=sidecar` +
-        `${sidecar.noStatic ? ' no-static' : ''} token=${sidecar.token ? 'on' : 'off'}`,
+        `${sidecar.noStatic ? ' no-static' : ''}` +
+        `${sidecar.staticDir ? ' static=app' : ''} token=${sidecar.token ? 'on' : 'off'}`,
     );
   }
   console.log(`\n  Power Meter 已启动  ${origin}`);

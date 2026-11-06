@@ -35,6 +35,13 @@ export interface SidecarOptions {
    */
   noStatic: boolean;
   /**
+   * 看板静态资源根目录（`--static-dir <d>` / `POWER_METER_STATIC_DIR`）。
+   *
+   * 桌面版把 `public/` 打进 App 资源目录，bun 编译后的 `import.meta.url` 指向虚拟文件系统
+   * 读不到真实目录，因此必须显式指定。缺省 null = 沿用 `<dist>/../public/`，浏览器/CLI 用法不变。
+   */
+  staticDir: string | null;
+  /**
    * 访问令牌（`--token <t>` / `POWER_METER_TOKEN`）。非空时，除 /api/health 与静态资源外的
    * /api/* 请求必须带 `X-Power-Meter-Token` 头（或 `?token=` 查询）匹配，否则 401。
    * 配合既有的回环 + privilegedGuard，给跨进程调用再加一层；缺省为空 = 不启用（保持兼容）。
@@ -67,6 +74,7 @@ export function resolveDotEnvPath(file = '.env'): string {
  *   --port <n>        覆盖 PORT（0 = 让内核分配随机空闲端口，server 从 address() 回读真实端口）
  *   --host <h>        覆盖 HOST
  *   --no-static       不 serve 看板静态资源
+ *   --static-dir <d>  覆盖看板静态资源根目录（桌面版把 public/ 放进 App Resources）
  *   --token <t>       启用 /api/* 访问令牌
  *   --config-dir <d>  把 .env 与 accounts.json 的默认基准目录从 cwd 换成 <d>
  *                     （显式的 ACCOUNTS_PATH 环境变量仍优先于它）
@@ -84,11 +92,17 @@ export function parseSidecarOptions(argv: string[] = process.argv.slice(2)): Sid
 
   let noStatic = process.env.POWER_METER_NO_STATIC === '1';
   let token = process.env.POWER_METER_TOKEN ?? '';
+  let staticDir: string | null = process.env.POWER_METER_STATIC_DIR
+    ? resolve(process.env.POWER_METER_STATIC_DIR)
+    : null;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--no-static') {
       noStatic = true;
+    } else if (arg === '--static-dir' || arg.startsWith('--static-dir=')) {
+      staticDir = resolve(takeValue(i, '--static-dir='));
+      if (arg === '--static-dir') i += 1;
     } else if (arg === '--port' || arg.startsWith('--port=')) {
       process.env.PORT = takeValue(i, '--port=');
       if (arg === '--port') i += 1;
@@ -110,7 +124,7 @@ export function parseSidecarOptions(argv: string[] = process.argv.slice(2)): Sid
     }
   }
 
-  return { noStatic, token, dotEnvPath: resolveDotEnvPath() };
+  return { noStatic, staticDir, token, dotEnvPath: resolveDotEnvPath() };
 }
 
 /**
@@ -122,6 +136,17 @@ export function parseSidecarOptions(argv: string[] = process.argv.slice(2)): Sid
  *   2. 绝不覆盖由 shell / launchd 真正设置的进程环境变量（它们优先级更高）。
  */
 const dotEnvOwned = new Map<string, string>();
+
+/**
+ * 是否已完成「首轮所有权登记」。
+ *
+ * Bun 会在进程启动时自动把 cwd 的 `.env` 注入 process.env（源码运行与编译后二进制均如此）。
+ * 这些键此刻看起来和 shell 变量一模一样，`dotEnvOwned` 里却没有记录，于是后续重载会命中
+ * `process.env[key] !== dotEnvOwned.get(key)` 而拒绝覆盖——桌面版登录刷新凭证后服务拿不到新值。
+ * 首轮把「当前值与文件值一致」的键登记为 .env 所有，就把这条链路接回来了。
+ * Node 下首轮这些键通常是 undefined（不会被登记），行为与修复前完全一致。
+ */
+let dotEnvPrimed = false;
 
 /** 极简 .env 解析（避免引入 dotenv 依赖）；可重复调用，后一次覆盖前一次 */
 export function loadDotEnv(file = '.env'): void {
@@ -142,6 +167,16 @@ export function loadDotEnv(file = '.env'): void {
         value = value.slice(1, -1);
       }
       next.set(key, value);
+    }
+  }
+
+  // ⓪ 首轮登记：Bun 预加载的 .env 值先认领，否则下面的 ② 永远判定「不是我们写的」
+  if (!dotEnvPrimed) {
+    dotEnvPrimed = true;
+    if ((process.versions as Record<string, string | undefined>).bun) {
+      for (const [key, value] of next) {
+        if (process.env[key] === value) dotEnvOwned.set(key, value);
+      }
     }
   }
 

@@ -23,6 +23,8 @@
     "typecheck": "tsc --noEmit",
     "test:pagination": "tsx src/cli/test-pagination.ts",
     "build": "tsc -p tsconfig.json",
+    "desktop:build": "bash tools/build-macos-app.sh",
+    "desktop:install": "bash tools/build-macos-app.sh --install",
     "serve": "node dist/server.js",
     "serve:sidecar": "node dist/server.js --port 0 --no-static",
     "build:sidecar": "npm run build && bun build --compile --minify dist/server.js --outfile dist/power-meter-sidecar"
