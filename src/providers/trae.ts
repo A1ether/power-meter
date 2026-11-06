@@ -1,3 +1,5 @@
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { createHash, createPublicKey, generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto';
 import { fetchJson, HttpError } from '../lib/http.js';
 import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
@@ -96,6 +98,71 @@ export function traeGenerateDeviceKey(): TraeDeviceKey {
     privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
   });
   return { privateKeyPem: String(privateKey), publicKeyPem: String(publicKey) };
+}
+
+/** 登录设备身份：同一台机器重复登录时必须复用，不能每次生成新设备 */
+export interface TraeLoginDeviceIdentity {
+  deviceId: string;
+  machineId: string;
+  privateKeyPem: string;
+}
+
+/**
+ * 取（必要时创建）某平台的登录设备身份。
+ *
+ * Trae 的 `ExchangeToken` 会按设备签发令牌，并对同账号的设备数量设上限；
+ * 每次登录都 `traeGenerateDeviceKey() + randomUUID()` 会被上游当成一台新设备，
+ * 多次重试后直接返回 `040034 Device limit reached`。官方 IDE 在本地固定一份
+ * 设备身份，这里同样把 `{ deviceId, machineId, privateKeyPem }` 落到
+ * `<cwd>/.run/login-device/<provider>.json`（`.run/` 已 gitignore，桌面端 cwd
+ * 是配置目录），后续每次登录复用同一份。
+ *
+ * 私钥只在服务端用于 DeviceInfo / DeviceProof，不写日志、不下发前端。
+ */
+export function traeLoginDeviceIdentity(providerId: string): TraeLoginDeviceIdentity {
+  const file = resolve(process.cwd(), '.run', 'login-device', `${providerId}.json`);
+  try {
+    const raw: unknown = JSON.parse(readFileSync(file, 'utf8'));
+    if (isRecord(raw)) {
+      const deviceId = firstString(pick(raw, 'deviceId'));
+      const machineId = firstString(pick(raw, 'machineId'));
+      const privateKeyPem = firstString(pick(raw, 'privateKeyPem'));
+      if (deviceId && machineId && privateKeyPem) {
+        // 校验私钥可解析；损坏时走下面的重建分支
+        traeDeviceKeyFromPem(privateKeyPem);
+        return { deviceId, machineId, privateKeyPem };
+      }
+    }
+  } catch {
+    // 文件不存在 / JSON 损坏 / 私钥不可解析：重建一份
+  }
+  const key = traeGenerateDeviceKey();
+  const identity: TraeLoginDeviceIdentity = {
+    deviceId: randomUUID(),
+    machineId: randomUUID(),
+    privateKeyPem: key.privateKeyPem,
+  };
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, `${JSON.stringify(identity, null, 2)}\n`, { mode: 0o600 });
+  } catch {
+    // 落盘失败不影响本次登录，只是下次会重新生成（并再占一个设备位）
+  }
+  return identity;
+}
+
+/**
+ * 把上游的「设备数量已达上限」翻译成可操作的中文提示。
+ * 其他错误返回 null，交给登录会话层按网络抖动继续重试。
+ */
+export function traeDeviceLimitMessage(error: unknown, siteLabel: string): string | null {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  if (!/040034|20401|Device limit reached/i.test(message)) return null;
+  return (
+    `${siteLabel}拒绝了本次登录：设备数量已达上限（Device limit reached / 040034）。` +
+    'Trae 官方建议等待 24 小时后从原设备重试；若仍失败，请联系平台支持重置设备限制，' +
+    '也可以改用 Cookie 方式添加。'
+  );
 }
 
 /** PKCE：verifier = base64url(random 48 bytes)，challenge = base64url(sha256(verifier)) */
@@ -667,10 +734,12 @@ export const traeAdapter: ProviderAdapter = {
       const consoleHost = TRAE_CONSOLE_HOST;
       const apiHost = TRAE_API_HOST;
       const { verifier, challenge } = traePkce();
-      const key = traeGenerateDeviceKey();
+      // 复用本机固定的设备身份：每次生成新密钥会被上游当成新设备，触发设备上限
+      const identity = traeLoginDeviceIdentity('trae');
+      const key = traeDeviceKeyFromPem(identity.privateKeyPem);
       const traceId = randomUUID();
-      const machineId = randomUUID();
-      const deviceId = randomUUID();
+      const machineId = identity.machineId;
+      const deviceId = identity.deviceId;
       const callbackUrl = traeCallbackUrl(input.callbackBase);
       const query = new URLSearchParams({
         login_version: '1',
@@ -729,31 +798,38 @@ export const traeAdapter: ProviderAdapter = {
       const apiHost = traeHostAllowed(firstString(pick(callback, 'apiHost')), TRAE_API_HOST);
 
       // ① 授权码换令牌（不需要 DeviceProof）
-      const { body } = await fetchJson(`${apiHost}/trae/api/v3/oauth/ExchangeToken`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-cloudide-token': '' },
-        body: JSON.stringify({
-          ClientID: TRAE_CLIENT_ID,
-          AuthCode: authCode,
-          CodeVerifier: verifier,
-          DeviceInfo: traeDeviceInfo(
-            {
-              provider: 'trae',
-              enabled: true,
-              displayName: null,
-              credentials: {},
-              options: {
-                deviceId: firstString(pick(secret, 'deviceId')),
-                machineId: firstString(pick(secret, 'machineId')),
+      let exchangeBody: unknown;
+      try {
+        ({ body: exchangeBody } = await fetchJson(`${apiHost}/trae/api/v3/oauth/ExchangeToken`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-cloudide-token': '' },
+          body: JSON.stringify({
+            ClientID: TRAE_CLIENT_ID,
+            AuthCode: authCode,
+            CodeVerifier: verifier,
+            DeviceInfo: traeDeviceInfo(
+              {
+                provider: 'trae',
+                enabled: true,
+                displayName: null,
+                credentials: {},
+                options: {
+                  deviceId: firstString(pick(secret, 'deviceId')),
+                  machineId: firstString(pick(secret, 'machineId')),
+                },
               },
-            },
-            key,
-          ),
-          IDEVersion: TRAE_IDE_VERSION,
-        }),
-        timeoutMs: ctx.timeoutMs || TRAE_TIMEOUT_FALLBACK,
-      });
-      const result = traeExchangeResult(body);
+              key,
+            ),
+            IDEVersion: TRAE_IDE_VERSION,
+          }),
+          timeoutMs: ctx.timeoutMs || TRAE_TIMEOUT_FALLBACK,
+        }));
+      } catch (error) {
+        const limited = traeDeviceLimitMessage(error, 'Trae');
+        if (limited) return { status: 'failed', message: limited };
+        throw error;
+      }
+      const result = traeExchangeResult(exchangeBody);
       const accessToken = firstString(pick(result, 'Token', 'token'));
       const refreshToken = firstString(pick(result, 'RefreshToken', 'refreshToken'));
       if (!accessToken) return { status: 'failed', message: 'ExchangeToken 未返回 Token，请重试。' };

@@ -2101,7 +2101,9 @@ kbd {
 
 .dialog {
   width: min(720px, calc(100vw - 32px));
+  /* 旧 WebKit 回退；支持 dvh 时用真实可视高度，避免桌面端 760px 上限把列表截断 */
   max-height: min(84vh, 760px);
+  max-height: min(calc(100dvh - 32px), 900px);
   padding: 0;
   /* 描边改影子后必须显式清掉 border：<dialog> 的 UA 默认是 3px currentColor */
   border: 0;
@@ -2172,9 +2174,14 @@ kbd {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  max-height: calc(84vh - 78px);
+  /* 旧 WebKit 回退；78px 是头部高度预留（与 .dialog 的 max-height 配套）。
+     正文上限必须同时受「对话框上限 - 头部」约束：否则在很高的窗口里正文会
+     比对话框还高，底部被 overflow:hidden 裁掉且滚不到（桌面端「显示不全」的根因）。 */
+  max-height: min(calc(84vh - 78px), 682px);
+  max-height: min(calc(100dvh - 110px), 822px);
   padding: 14px 20px 18px;
   overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .dialog__back {

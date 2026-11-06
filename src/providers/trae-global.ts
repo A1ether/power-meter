@@ -23,9 +23,10 @@ import {
   traeCallbackUrl,
   traeDeviceInfo,
   traeDeviceKeyFromPem,
+  traeDeviceLimitMessage,
   traeDeviceProof,
-  traeGenerateDeviceKey,
   traeHostAllowed,
+  traeLoginDeviceIdentity,
   traePkce,
   traeReadCallback,
   type TraeDeviceKey,
@@ -831,10 +832,12 @@ export const traeGlobalAdapter: ProviderAdapter = {
     intervalMs: 1_000,
     async start(input) {
       const { verifier, challenge } = traePkce();
-      const key = traeGenerateDeviceKey();
+      // 与国内版共用同一套持久化设备身份逻辑，但按 provider 分文件，互不覆盖
+      const identity = traeLoginDeviceIdentity('trae-global');
+      const key = traeDeviceKeyFromPem(identity.privateKeyPem);
       const traceId = randomUUID();
-      const machineId = randomUUID();
-      const deviceId = randomUUID();
+      const machineId = identity.machineId;
+      const deviceId = identity.deviceId;
       const callbackUrl = traeCallbackUrl(input.callbackBase);
       const query = new URLSearchParams({
         login_version: '1',
@@ -903,31 +906,38 @@ export const traeGlobalAdapter: ProviderAdapter = {
       );
 
       // ① 授权码换令牌（不需要 DeviceProof，与国内版同形）
-      const { body } = await fetchJson(`${apiHost}${GLOBAL_EXCHANGE_PATH}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-cloudide-token': '' },
-        body: JSON.stringify({
-          ClientID: GLOBAL_CLIENT_ID,
-          AuthCode: authCode,
-          CodeVerifier: verifier,
-          DeviceInfo: traeDeviceInfo(
-            {
-              provider: 'trae-global',
-              enabled: true,
-              displayName: null,
-              credentials: {},
-              options: {
-                deviceId: firstString(pick(secret, 'deviceId')),
-                machineId: firstString(pick(secret, 'machineId')),
+      let exchangeBody: unknown;
+      try {
+        ({ body: exchangeBody } = await fetchJson(`${apiHost}${GLOBAL_EXCHANGE_PATH}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-cloudide-token': '' },
+          body: JSON.stringify({
+            ClientID: GLOBAL_CLIENT_ID,
+            AuthCode: authCode,
+            CodeVerifier: verifier,
+            DeviceInfo: traeDeviceInfo(
+              {
+                provider: 'trae-global',
+                enabled: true,
+                displayName: null,
+                credentials: {},
+                options: {
+                  deviceId: firstString(pick(secret, 'deviceId')),
+                  machineId: firstString(pick(secret, 'machineId')),
+                },
               },
-            },
-            key,
-          ),
-          IDEVersion: GLOBAL_IDE_VERSION,
-        }),
-        timeoutMs: ctx.timeoutMs || GLOBAL_TIMEOUT_FALLBACK,
-      });
-      const result = isRecord(body) ? pick(body, 'Result', 'result') : undefined;
+              key,
+            ),
+            IDEVersion: GLOBAL_IDE_VERSION,
+          }),
+          timeoutMs: ctx.timeoutMs || GLOBAL_TIMEOUT_FALLBACK,
+        }));
+      } catch (error) {
+        const limited = traeDeviceLimitMessage(error, 'Trae 国际版');
+        if (limited) return { status: 'failed', message: limited };
+        throw error;
+      }
+      const result = isRecord(exchangeBody) ? pick(exchangeBody, 'Result', 'result') : undefined;
       if (!isRecord(result)) return { status: 'failed', message: 'ExchangeToken 响应缺少 Result，请重试。' };
       const accessToken = firstString(pick(result, 'Token', 'token'));
       const refreshToken = firstString(pick(result, 'RefreshToken', 'refreshToken'));

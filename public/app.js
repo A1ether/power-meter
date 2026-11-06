@@ -110,7 +110,7 @@ const state = {
    *   - providerId 非空时显示该平台的登录 / 添加表单（与卡片内管理区同一套逻辑）。
    * 国内站 / 国际站是两个平台，所以这里只有 provider 一个维度，没有站点。
    */
-  dialog: { providerId: null },
+  dialog: { providerId: null, viewKey: null },
   /** GET /api/accounts/overview 的缓存；增删 / 登录成功后置空重拉 */
   platformOverview: null,
   /**
@@ -948,18 +948,28 @@ function dialogTarget(platform) {
  * 适配器元信息（`/api/providers`）：管理表单的字段声明（manageFields）与提示文案都来自它。
  * 它是静态声明、不随刷新变化，所以只拉一次；拉取失败则留空并允许下次重试。
  */
+let adapterMetaInFlight = null;
 async function loadAdapterMeta() {
   if (state.adapterMeta) return state.adapterMeta;
+  // 并发重绘会同时进来：共用同一次请求，避免重复打 /api/providers
+  if (adapterMetaInFlight) return adapterMetaInFlight;
+  adapterMetaInFlight = (async () => {
+    try {
+      const response = await fetch('/api/providers', { headers: { Accept: 'application/json' } });
+      if (!response.ok) throw new Error(`接口返回 ${response.status}`);
+      const providers = (await response.json()).providers ?? [];
+      state.adapterMeta = new Map(providers.map((item) => [item.id, item]));
+    } catch (error) {
+      state.adapterMeta = null;
+      void error;
+    }
+    return state.adapterMeta ?? new Map();
+  })();
   try {
-    const response = await fetch('/api/providers', { headers: { Accept: 'application/json' } });
-    if (!response.ok) throw new Error(`接口返回 ${response.status}`);
-    const providers = (await response.json()).providers ?? [];
-    state.adapterMeta = new Map(providers.map((item) => [item.id, item]));
-  } catch (error) {
-    state.adapterMeta = null;
-    void error;
+    return await adapterMetaInFlight;
+  } finally {
+    adapterMetaInFlight = null;
   }
-  return state.adapterMeta ?? new Map();
 }
 
 function metaFor(provider) {
@@ -1381,8 +1391,8 @@ function scheduleLoginPoll(providerId) {
         // 会话本身留给下次重绘消费（renderManage 会把表单收起来，并把 state.login 置空）。
         if (state.data) await load(true);
         if (els.platformsDialog.open) await renderPlatformDialog();
-      } else {
-        // 失败 / 过期 / 取消：收起管理区，避免二维码面板一直占着卡片。
+      } else if (view.status === 'cancelled') {
+        // 主动取消：收起管理区，避免二维码面板一直占着卡片。
         // 弹窗的键形如 `platform#<provider>`，卡片的键形如 `<provider>#<账号>`，
         // 所以按前缀匹配，不能只比全等。
         for (const key of [...state.manageOpen]) {
@@ -1391,6 +1401,11 @@ function scheduleLoginPoll(providerId) {
           }
         }
         state.login = null;
+        repaintManageTargets(providerId);
+      } else {
+        // failed / expired / invalid：**保留**会话。登录面板只在 state.login 存在时
+        // 才画得出错误原因（见 renderLogin 的 paint）；一旦在这里清空，用户只能看到
+        // 按钮恢复原状，上游返回的「Device limit reached」之类信息就全丢了。
         repaintManageTargets(providerId);
       }
       return;
@@ -1843,32 +1858,67 @@ function renderConfiguredAccounts(box, target, accounts) {
  *
  * 平台能力（能不能网页添加、有没有登录）全部来自后端声明，前端不认平台名。
  */
+let platformOverviewInFlight = null;
 async function loadPlatformOverview(force = false) {
   if (!force && state.platformOverview) return state.platformOverview;
-  const response = await fetch('/api/accounts/overview', {
-    headers: { Accept: 'application/json', 'X-Power-Meter-Intent': 'read' },
-  });
-  const payload = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(payload?.error || `接口返回 ${response.status}`);
-  state.platformOverview = payload;
-  return payload;
+  // 登录轮询会连续触发重绘：共用同一次请求，避免并发 render 各拉一份清单
+  if (!force && platformOverviewInFlight) return platformOverviewInFlight;
+  const inFlight = (async () => {
+    const response = await fetch('/api/accounts/overview', {
+      headers: { Accept: 'application/json', 'X-Power-Meter-Intent': 'read' },
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(payload?.error || `接口返回 ${response.status}`);
+    state.platformOverview = payload;
+    return payload;
+  })();
+  platformOverviewInFlight = inFlight;
+  try {
+    return await inFlight;
+  } finally {
+    if (platformOverviewInFlight === inFlight) platformOverviewInFlight = null;
+  }
 }
 
 function openPlatformsDialog(providerId = null) {
   state.dialog.providerId = providerId;
-  if (!els.platformsDialog.open) els.platformsDialog.showModal();
+  if (!els.platformsDialog.open) {
+    // 每次重新打开都从顶部开始，不复用上一次的滚动位置与视图键
+    state.dialog.viewKey = null;
+    els.platformsBody.scrollTop = 0;
+    els.platformsDialog.showModal();
+  }
   void renderPlatformDialog();
 }
 
+/**
+ * 重绘代次：登录轮询会在同一轮里多次调用本函数（repaintManageTargets 是 void 调用，
+ * 终态分支随后还会再 await 一次）。每个调用都要先 await 清单接口，若不加保护，
+ * 先完成的调用会把「返回按钮 + 管理区」追加进已被后一个调用清空的正文，出现两份。
+ * 只有最后一次调用（seq 最大）有资格写 DOM。
+ */
+let dialogRenderSeq = 0;
+
 async function renderPlatformDialog() {
   if (!els.platformsDialog.open) return;
+  const seq = ++dialogRenderSeq;
   const providerId = state.dialog.providerId;
-  els.platformsBody.replaceChildren();
+  const viewKey = providerId ? `manage:${providerId}` : 'list';
+  const viewChanged = state.dialog.viewKey !== viewKey;
+  state.dialog.viewKey = viewKey;
+
+  // replaceChildren 会把 scrollTop 压回 0：先记下当前位置，非视图切换时原样恢复，
+  // 否则登录轮询每 1.5s 重绘一次，用户根本没法滚动列表。
+  // 注意：这里**先不清空**——并发调用中只有最后一次能写 DOM，过早清空会让
+  // 后来的调用读到 0，滚动位置反而丢失。
+  const previousScrollTop = els.platformsBody.scrollTop;
 
   let overview;
   try {
     overview = await loadPlatformOverview();
   } catch (error) {
+    if (seq !== dialogRenderSeq) return;
+    els.platformsBody.replaceChildren();
     els.platformsTitle.textContent = '平台与账号';
     els.platformsSubtitle.textContent = '读取平台清单失败';
     els.platformsBody.append(
@@ -1876,10 +1926,14 @@ async function renderPlatformDialog() {
     );
     return;
   }
+  if (seq !== dialogRenderSeq || !els.platformsDialog.open) return;
 
   // 管理视图的表单字段来自 /api/providers（与卡片同一份 metaFor）：先确保它已就位，
   // 否则冷启动后直接点弹窗会误报「能力清单加载失败」。
-  if (providerId && !state.adapterMeta) await loadAdapterMeta();
+  if (providerId && !state.adapterMeta) {
+    await loadAdapterMeta();
+    if (seq !== dialogRenderSeq || !els.platformsDialog.open) return;
+  }
 
   const platforms = overview.providers ?? [];
   if (providerId) {
@@ -1888,10 +1942,13 @@ async function renderPlatformDialog() {
       state.dialog.providerId = null;
       return renderPlatformDialog();
     }
+    els.platformsBody.replaceChildren();
     renderPlatformManage(platform);
+    els.platformsBody.scrollTop = viewChanged ? 0 : previousScrollTop;
     return;
   }
 
+  els.platformsBody.replaceChildren();
   els.platformsTitle.textContent = '平台与账号';
   const totalAccounts = platforms.reduce((sum, item) => sum + (item.accounts?.length ?? 0), 0);
   els.platformsSubtitle.textContent =
@@ -1922,6 +1979,7 @@ async function renderPlatformDialog() {
       element('p', 'dialog__path', `账号文件：${overview.accountsFilePath}`),
     );
   }
+  els.platformsBody.scrollTop = viewChanged ? 0 : previousScrollTop;
 }
 
 /**
@@ -2825,6 +2883,7 @@ els.platformsDialog.addEventListener('click', (event) => {
 });
 els.platformsDialog.addEventListener('close', () => {
   state.dialog.providerId = null;
+  state.dialog.viewKey = null;
 });
 els.autoRefresh.addEventListener('change', (event) => {
   state.autoRefresh = event.target.checked;
