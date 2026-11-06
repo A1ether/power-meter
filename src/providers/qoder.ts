@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { ensureDebugChrome, openCookieCollector, type CookieCollector } from '../lib/cdp.js';
 import { assertBusinessOk, directRetryEnabled, fetchJson, HttpError } from '../lib/http.js';
 import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
@@ -63,32 +63,23 @@ import {
 const QODER_TIMEOUT_FALLBACK = 12_000;
 
 /* ------------------------------------------------------------------ *
- * 登录（设备流）与令牌取数
+ * 登录（网页端抓 Cookie）与令牌取数
  * ------------------------------------------------------------------ */
 
 /**
- * 设备流常量（逐字取自 qodercli 1.1.63 的 `startDeviceFlow`）：
- *   authUrl = {website}/device/selectAccounts?challenge&challenge_method&nonce&machine_id&client_id
- *   poll    = GET {openapi}/api/v1/deviceToken/poll?nonce&verifier&challenge_method
- *             404 = 等待；1000ms 间隔；300s 超时
- *   refresh = POST {openapi}/api/v1/deviceToken/refresh，body { refresh_token, machine_id? }
+ * openapi 站点常量：令牌模式取数 / 续期 / 用户信息使用。
  *
- * `machine_id` 用登录时生成的随机 UUID 并写进 options——设备流只要求「稳定」，
- * 不参与业务签名，因此不必复刻 qodercli 的机器指纹派生。
+ * 扫码（设备流）登录已下线——设备令牌模式拿不到逐包批次明细，
+ * 与看板「最快到期」的核心口径不符，现只保留「网页端登录」抓 Cookie。
  */
 const QODER_LOGIN = {
   cn: {
-    website: 'https://qoder.com.cn',
     openapi: 'https://openapi.qoder.com.cn',
   },
   global: {
-    website: 'https://qoder.com',
     openapi: 'https://openapi.qoder.sh',
   },
 } as const;
-const QODER_CLIENT_ID = 'e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb';
-const QODER_LOGIN_TTL_MS = 5 * 60 * 1000;
-const QODER_POLL_INTERVAL_MS = 1_000;
 /** 网页端登录的轮询间隔：抓 Cookie 无需打上游接口，稍慢一点也无妨 */
 const QODER_WEB_POLL_INTERVAL_MS = 2_000;
 /**
@@ -104,28 +95,10 @@ const QODER_WEB_RELOAD_IDLE_MS = 20_000;
 const QODER_WEB_RELOAD_MIN_INTERVAL_MS = 15_000;
 /** 整个会话内最多主动刷新几次（用于「页面不再发请求」「跨标签页 SSO」这类兜底） */
 const QODER_WEB_RELOAD_MAX = 2;
-/** 网页端登录是人工操作（输密码 / 扫码），TTL 比扫码登录放宽一倍，避免输到一半被判超时 */
+/** 网页端登录是人工操作（输密码 / 扫码），TTL 放宽到 10 分钟，避免输到一半被判超时 */
 const QODER_WEB_LOGIN_TTL_MS = 10 * 60 * 1000;
 /** 网页侧身份接口：登录态 200、访客态 401（实测），作为站点无关的功能性登录判据 */
 const QODER_WEB_IDENTITY_PATH = '/api/v1/me';
-const PKCE_CHARS =
-  'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
-
-function pkcePair(): { verifier: string; challenge: string } {
-  const length = 43 + Math.floor(Math.random() * 86);
-  const bytes = randomBytes(length);
-  let verifier = '';
-  for (let index = 0; index < length; index += 1) {
-    verifier += PKCE_CHARS[bytes[index] % PKCE_CHARS.length];
-  }
-  const challenge = createHash('sha256')
-    .update(verifier)
-    .digest('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-  return { verifier, challenge };
-}
 
 /** 业务面请求头：只发 Bearer + Accept（禁带 cosy-*，见 QoderBridge/docs/协议参考.md §0） */
 function qoderBearerHeaders(token: string): Record<string, string> {
@@ -1401,106 +1374,6 @@ function isQoderPlaceholderName(adapter: ProviderAdapter, name: string): boolean
 }
 
 /**
- * 「扫码登录」：Qoder 设备流（qodercli 同款）。
- *
- * 授权页是 `{website}/device/selectAccounts?...`，手机扫码确认后，
- * 服务端用 `nonce + verifier` 轮询 `/api/v1/deviceToken/poll` 拿令牌。
- * 站点由工厂参数固定（`QODER_LOGIN` 里有国际站的 website / openapi，
- * 但其设备流**未实测**；拿不到令牌时用户可改用「网页端登录」）。
- *
- * 落库 options 不再写 `site`：请求打到哪个站点由 provider 决定，配置里不需要重复表达。
- */
-function makeQoderDeviceLogin(site: QoderSiteMeta): ProviderLogin {
-  const target = QODER_LOGIN[site.id];
-  return {
-    label: '扫码登录',
-    hint: `用 Qoder 手机 App 扫码授权${site.label}账号，或在浏览器里打开链接完成授权。`,
-    qr: true,
-    intervalMs: QODER_POLL_INTERVAL_MS,
-    async start(input) {
-      const { verifier, challenge } = pkcePair();
-      const nonce = randomUUID();
-      const machineId = randomUUID();
-      const query = new URLSearchParams({
-        challenge,
-        challenge_method: 'S256',
-        nonce,
-        machine_id: machineId,
-        client_id: QODER_CLIENT_ID,
-      });
-      input.log(`Qoder ${site.label}设备流已创建，等待扫码授权`);
-      return {
-        authUrl: `${target.website}/device/selectAccounts?${query.toString()}`,
-        qr: true,
-        ttlMs: QODER_LOGIN_TTL_MS,
-        hint: '扫码后在手机上确认；本页面会自动完成添加。',
-        // verifier 只留在服务端内存，绝不写日志
-        secret: { nonce, verifier, machineId },
-      };
-    },
-    async poll(secret, ctx) {
-      if (!isRecord(secret)) return { status: 'failed', message: '登录会话缺少设备流参数，请重新发起。' };
-      const nonce = firstString(pick(secret, 'nonce'));
-      const verifier = firstString(pick(secret, 'verifier'));
-      const machineId = firstString(pick(secret, 'machineId'));
-      if (!nonce || !verifier) {
-        return { status: 'failed', message: '登录会话缺少 nonce / verifier，请重新发起。' };
-      }
-      const query = new URLSearchParams({ nonce, verifier, challenge_method: 'S256' });
-      const url = `${target.openapi}/api/v1/deviceToken/poll?${query.toString()}`;
-
-      let body: unknown;
-      try {
-        ({ body } = await fetchJson(url, {
-          headers: { Accept: 'application/json' },
-          timeoutMs: ctx.timeoutMs || QODER_TIMEOUT_FALLBACK,
-        }));
-      } catch (error) {
-        // 404 = 用户还没确认，继续等待；其余错误交给会话层记为 failed
-        if (error instanceof HttpError && error.status === 404) return { status: 'waiting' };
-        throw error;
-      }
-
-      const payload = qoderPayload(body);
-      const token = firstString(isRecord(payload) ? pick(payload, 'token') : undefined);
-      if (!token) return { status: 'waiting' };
-
-      const refreshToken = firstString(
-        isRecord(payload) ? pick(payload, 'refresh_token', 'refreshToken') : undefined,
-      );
-      const userId = firstString(
-        isRecord(payload) ? pick(payload, 'user_id', 'userId', 'uid') : undefined,
-      );
-      if (!userId) {
-        return {
-          status: 'failed',
-          message: '已拿到设备令牌，但上游没有返回用户 ID，无法安全落库。请重试或改用 Cookie。',
-        };
-      }
-      // 设备流响应不一定带昵称；缺了就用 userinfo 补一次（卡片标题要显示账号名）
-      const userName =
-        firstString(isRecord(payload) ? pick(payload, 'user_name', 'userName', 'name') : undefined) ||
-        (await qoderUserInfo(site.id, token, ctx))?.name ||
-        '';
-
-      return {
-        status: 'ready',
-        account: { id: userId, name: userName },
-        credentials: {
-          accessToken: token,
-          ...(refreshToken ? { refreshToken } : {}),
-        },
-        options: {
-          userId,
-          ...(machineId ? { machineId } : {}),
-        },
-        message: '登录成功，正在验证取数并写入本机配置…',
-      };
-    },
-  };
-}
-
-/**
  * 按站点产出一个完整的 Qoder 适配器：站点在闭包内固定，登录、探测、失败文案、
  * `.env` 变量前缀全部跟着它走，不再有候选链 / 回退 / auto 探测。
  *
@@ -1509,7 +1382,6 @@ function makeQoderDeviceLogin(site: QoderSiteMeta): ProviderLogin {
  */
 function createQoderAdapter(siteId: QoderSiteId): ProviderAdapter {
   const site = QODER_SITES[siteId];
-  const login = makeQoderDeviceLogin(site);
   const webLogin = makeQoderWebLogin(site);
 
   const adapter: ProviderAdapter = {
@@ -1542,8 +1414,11 @@ function createQoderAdapter(siteId: QoderSiteId): ProviderAdapter {
       },
     ],
     manageHint: `Cookie 会先按${site.label}（${site.origin}）真实验证，通过了才写入本机配置；写入前自动备份到 .run/。`,
-    /** 默认登录方法（扫码）；完整方法清单在对象外组装成 `loginMethods`，见本文件末尾 */
-    login,
+    /**
+     * 唯一登录方法：网页端抓 Cookie（扫码 / 设备令牌已下线，见文件头说明）。
+     * `login` 仍指向它，保证不传 `method` 的旧调用与落库校验行为不变。
+     */
+    login: webLogin,
     /**
      * 用量 + 获取明细（v2）：
      *   - 用量：`/api/v1/me/usages/big_model_credits/histories` 逐笔（`time` + `credits`），
@@ -1676,12 +1551,12 @@ function createQoderAdapter(siteId: QoderSiteId): ProviderAdapter {
   };
 
   /**
-   * 登录方法清单：`login`（扫码，默认方法）+ `webLogin`（网页端抓 Cookie）。
+   * 登录方法清单：只保留 `webLogin`（网页端抓 Cookie）。
    *
-   * 声明后前端按清单渲染两个按钮，会话层按 `method` 路由；
-   * `login` 仍保留在适配器上（不传 method 时走它），行为向后兼容。
+   * 扫码（设备流）拿不到逐包批次明细，与看板「最快到期」口径不符，已下线；
+   * 前端按清单只渲染一个「网页端登录」按钮，会话层按 `method` 路由。
    */
-  adapter.loginMethods = [login, webLogin];
+  adapter.loginMethods = [webLogin];
   return adapter;
 }
 

@@ -4,7 +4,7 @@
 避免在浏览器多标签之间反复切换。
 
 - 运行时**零第三方依赖**（只用 Node 内置模块），`npm install` 只装 `tsx` / `typescript`
-- CodeBuddy / Qoder / Trae 支持**扫码或打开链接登录**，授权后自动落库，一个账号一张卡片
+- CodeBuddy / Trae 支持**扫码或打开链接登录**；Qoder 只保留**网页端登录**（自动抓 Cookie），授权后自动落库，一个账号一张卡片
 - 后端聚合 + 缓存 + 失败降级，前端纯静态（无构建步骤）
 - 凭证默认**不下发到浏览器**：只有被显式声明为「可托管」的密钥才提供
   掩码预览 + 按需复制（默认仅限本机），`accounts.json` / `.env` 改动后**热加载**，无需重启
@@ -54,8 +54,8 @@ A1etherOpenAi 是多账号合并成一张卡，卡片级没有单一账号身份
 | --- | --- | --- |
 | CodeBuddy | 手机扫码 / 新窗口打开链接 | 用 CodeBuddy 客户端或微信完成授权 |
 | WorkBuddy 国际版 | 手机扫码 / 网页端登录 | 目标固定 `codebuddy.ai`；令牌写入 `CODEBUDDY_GLOBAL_*`；网页端登录会自动打开调试 Chrome 抓 Cookie（批次明细更全） |
-| Qoder 国内版 | 手机 Qoder App 扫码 / 新窗口打开链接 | 目标固定 `qoder.com.cn`；令牌写入 `QODER_*` |
-| Qoder 国际版 | 手机 Qoder App 扫码 / 新窗口打开链接 | 目标固定 `qoder.com`；令牌写入 `QODER_GLOBAL_*`（国际站设备流未实测，网页端登录更稳） |
+| Qoder 国内版 | 网页端登录 | 目标固定 `qoder.com.cn`；自动打开调试 Chrome 抓 Cookie（`QODER_COOKIE`），扫码/设备令牌已下线（拿不到逐包批次明细） |
+| Qoder 国际版 | 网页端登录 | 目标固定 `qoder.com`；自动打开调试 Chrome 抓 Cookie（`QODER_GLOBAL_COOKIE`），同样只保留网页端登录 |
 | Trae | 新窗口打开链接 | 回调固定 `127.0.0.1`，必须在本机浏览器完成；令牌写入 `TRAE_*` |
 | Trae 国际版 | 新窗口打开链接 | 目标固定 `trae.ai`，回调同样固定 `127.0.0.1`；令牌写入 `TRAE_GLOBAL_*`，与国内版互不通用 |
 
@@ -343,8 +343,8 @@ interface ProviderSnapshot {
 
 | 平台 | `provider` | 需要的凭证 | 关键 `options` |
 | --- | --- | --- | --- |
-| Qoder 国内版 | `qoder` / `qoder.cn` | `cookie`（`QODER_COOKIE`）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`QODER_ACCESS_TOKEN` / `QODER_REFRESH_TOKEN`） | 站点固定 `qoder.com.cn`，无站点选项；`origin` 可覆盖为自定义域名/代理。两种凭证模式都会拆积分批次：Cookie 模式给出逐包明细（`quota_detail[]`），令牌模式只能给出账户级分桶 + 可选的 `dedicated_resource_packages[]`（逐包明细需 Cookie） |
-| Qoder 国际版 | `qoder-intl` / `qoder.com` / `qoder-global` | `cookie`（`QODER_GLOBAL_COOKIE`）<br>或登录写入的 `accessToken` + `refreshToken`（`QODER_GLOBAL_ACCESS_TOKEN` / `QODER_GLOBAL_REFRESH_TOKEN`） | 站点固定 `qoder.com`，无站点选项；`origin` 可覆盖。积分批次口径与国内版一致 |
+| Qoder 国内版 | `qoder` / `qoder.cn` | `cookie`（`QODER_COOKIE`）<br>或历史扫码登录写入的 `accessToken` + `refreshToken`（`QODER_ACCESS_TOKEN` / `QODER_REFRESH_TOKEN`；扫码入口已下线，仅供既有账号使用） | 站点固定 `qoder.com.cn`，无站点选项；`origin` 可覆盖为自定义域名/代理。两种凭证模式都会拆积分批次：Cookie 模式给出逐包明细（`quota_detail[]`），令牌模式只能给出账户级分桶 + 可选的 `dedicated_resource_packages[]`（逐包明细需 Cookie） |
+| Qoder 国际版 | `qoder-intl` / `qoder.com` / `qoder-global` | `cookie`（`QODER_GLOBAL_COOKIE`）<br>或历史登录写入的 `accessToken` + `refreshToken`（`QODER_GLOBAL_ACCESS_TOKEN` / `QODER_GLOBAL_REFRESH_TOKEN`；扫码入口已下线，仅供既有账号使用） | 站点固定 `qoder.com`，无站点选项；`origin` 可覆盖。积分批次口径与国内版一致 |
 | Trae | `trae` / `trae.cn` | `cookie`（`TRAE_COOKIE`）<br>或「打开链接登录」写入的 `accessToken` + `refreshToken` + `deviceKey`（`TRAE_ACCESS_TOKEN` / `TRAE_REFRESH_TOKEN` / `TRAE_DEVICE_KEY`） | JWT 由 Cookie 自动续签；令牌模式由 `deviceKey` 签名续期 |
 | Trae 国际版 | `trae-global` / `trae.ai` | `cookie`（`TRAE_GLOBAL_COOKIE`）<br>或「打开链接登录」写入的 `accessToken` + `refreshToken` + `deviceKey`（`TRAE_GLOBAL_ACCESS_TOKEN` / `TRAE_GLOBAL_REFRESH_TOKEN` / `TRAE_GLOBAL_DEVICE_KEY`） | 站点固定 `trae.ai`，与国内版互不通用；计费面是 v1 `user_current_entitlement_list`，余额按账户口径显示美元 / 积分 / 请求次数（`options.apiHost`、`options.usageUrl` 可覆盖主机） |
 | CodeBuddy | `codebuddy` | `cookie`（**必须含 `www` 子域**）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`CODEBUDDY_ACCESS_TOKEN` / `CODEBUDDY_REFRESH_TOKEN`）| — |
@@ -379,7 +379,7 @@ npm run probe -- codebuddy               # ④ 验证取数，然后刷新看板
 也可以全程在看板上完成：顶栏「平台与账号」→ 选平台 → 展开「手工填写凭证」→ 粘贴 Cookie →
 「验证并添加」，服务会自己分配 `.env` 槽位（第二个账号 = `CODEBUDDY_COOKIE_2`）并命名。
 同一份表单在卡片上也有（点「重新登录」展开），但它走的是**新增账号**接口；
-要刷新卡片自己那份凭证，用面板里的扫码 / 网页端登录（同一平台账号只更新令牌、不新增卡片）。
+要刷新卡片自己那份凭证，用面板里的登录按钮（同一平台账号只更新凭证、不新增卡片）。
 
 | 规则 | 说明 |
 | --- | --- |
