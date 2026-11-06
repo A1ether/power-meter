@@ -338,7 +338,7 @@ interface ProviderSnapshot {
 
 ### 各平台配置
 
-除 A1etherOpenAi（API 密钥）、MiniMax Code（网页端登录态 token）、商汤小浣熊（令牌藏在 Cookie 里）
+除 A1etherOpenAi（API 密钥）、MiniMax Code（网页登录态或 OAuth 令牌）、商汤小浣熊（令牌藏在 Cookie 里）
 与 CodeArts（推荐 AK/SK）外，其余平台（含千问办公）的凭证都只需要 **一个 Cookie**：
 
 | 平台 | `provider` | 需要的凭证 | 关键 `options` |
@@ -350,7 +350,7 @@ interface ProviderSnapshot {
 | CodeBuddy | `codebuddy` | `cookie`（**必须含 `www` 子域**）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`CODEBUDDY_ACCESS_TOKEN` / `CODEBUDDY_REFRESH_TOKEN`）| — |
 | WorkBuddy 国际版 | `codebuddy-intl` / `codebuddy.ai` / `workbuddy.ai` | `cookie`（**必须含 `www` 子域**，写 `CODEBUDDY_GLOBAL_COOKIE`）<br>或扫码登录写入的 `accessToken` + `refreshToken`（`CODEBUDDY_GLOBAL_ACCESS_TOKEN` / `CODEBUDDY_GLOBAL_REFRESH_TOKEN`）| 站点固定 `codebuddy.ai`，与国内版互不通用 |
 | CodeArts | `codearts` | **网页端登录（推荐，一键添加）**：卡片上点「网页端登录」，在自动打开的调试 Chrome 里登录华为云即可，Cookie 自动落 `CODEARTS_COOKIE` 并由 `npm run codearts:refresh` 定时续期<br>`accessKey` + `secretKey`（长期有效，多账号路径）<br>`cookie`（兼容，会话过期需重抓） | 可选 `authMode: "auto" \| "aksk" \| "cookie"`、`resourceType`、`region` |
-| MiniMax Code | `minimax` / `minimax-code` / `agent.minimax.cn` | `token`（`_token`）+ `cookie`（SSO）+ 真实身份 `userId`/`opTicket`/`uuid`（capture 一并抓取，缺一不可）| `site: "cn"`（默认）或 `"global"` |
+| MiniMax Code | `minimax` / `minimax-code` / `agent.minimax.cn` | **扫码登录（推荐，一键添加）**：卡片上点「扫码登录」，手机确认后写入 `accessToken` + `refreshToken`（`MINIMAX_ACCESS_TOKEN` / `MINIMAX_REFRESH_TOKEN`）<br>**网页端登录（一键添加）**：在自动打开的调试 Chrome 里登录 `agent.minimax.cn`，自动抓取 `token`（`_token`）+ `cookie`（SSO）+ 真实身份 `userId`/`opTicket`/`uuid`<br>手工兜底：`token` + `cookie` + `userId` | `site: "cn"`（默认）或 `"global"`；`authMode: "web" \| "oauth"`（登录自动写入） |
 | 千问办公 | `qwenwork` / `qwenwork.cn` / `qwen-office` | `cookie`（`QWENWORK_COOKIE`，网页登录态；生产环境不带 `Authorization`）| 无；`origin` 可覆盖为代理地址 |
 | 商汤小浣熊 | `xiaohuanxiong` / `xiaohuanxiong.com` / `raccoon` | `token`（`XIAOHUANXIONG_TOKEN`，可从 Cookie 的 `xhx_token` / `raccoon_token` 推导）+ `cookie` + `refreshToken`（capture / 网页端登录一并写入）| 无；`origin` 可覆盖为代理地址 |
 | A1etherOpenAi | `a1etheropenai` / `d1v.ai`（上游服务域名保持不变，也是它的解析别名） | `apiKey`（查余额）<br>`paiApiKey`（托管复制） | `baseUrl`、`revealApiKey` |
@@ -675,10 +675,13 @@ Trae 的 OAuth 回调 `/authorize` 是唯一例外：浏览器从 trae.cn 跳回
 - **Trae 的 JWT 只有 1 天有效**，但适配器会用 Cookie 自动续签，因此你只需保证 Cookie 有效。
 - **MiniMax Code 取的是客户端内部云接口**（官方未公开 API，对应 App 里的「积分明细」）：
   签到积分自到账起 30 天有效，过期批次会移出列表；平台控制台 `console/plan` 上的「积分」
-  是已购积分口径，与签到积分不是同一笔账，显示 0 属正常。凭证 = 请求头 token + SSO Cookie +
-  真实身份参数（user_id/op_ticket/uuid，服务端会与 token 交叉校验，不能用 0 顶替），
-  `npm run capture -- minimax` 会一次性全部抓取；登录态失效后卡片显示 `unauthorized`，
-  重新抓取即可。
+  是已购积分口径，与签到积分不是同一笔账，显示 0 属正常。两种登录态都支持：
+  - 「扫码登录」走 MiniMax Code 的 OAuth 设备码（`account.minimax.cn/oauth2/device/code`），
+    写入 `accessToken` / `refreshToken`，accessToken 临近过期时会自动续期并写回 `.env`；
+  - 「网页端登录」打开调试 Chrome，自动抓取 `_token` + SSO Cookie + 真实身份参数
+    （user_id/op_ticket/uuid，服务端会与 token 交叉校验，不能用 0 顶替）。
+  `npm run capture -- minimax` 仍可手工抓取；登录态失效后卡片显示 `unauthorized`，重新登录即可。
+  已配置的账号可在卡片右上角「删除」或「平台与账号」弹窗里删除（删除前自动备份到 `.run/`）。
 - **千问办公取的是网页端内部接口**（没有公开查询 API）：
   `GET /user/balance` 给「剩余可用」，`GET /user/wallets` 给三桶构成
   （`daily_credits` / `monthly_credits` / `longterm_credits` 各自的 `total_balance`），

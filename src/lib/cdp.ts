@@ -340,6 +340,18 @@ export interface CookieCollector {
   idleMs(): number;
   /** 重新加载当前页面，触发新一轮请求（用于用户刚登录完、页面还没发请求的场景） */
   reload(): Promise<void>;
+  /**
+   * 读取页面 `localStorage` 的字符串值；未设置 / 不可读时返回空串。
+   *
+   * 只供「登录态存在 localStorage 里」的平台使用（MiniMax 的 `_token`、
+   * `UNIQUE_USER_ID`）。值不离开服务端，也不会写进日志或 HTTP 响应。
+   */
+  localStorageItem(key: string): Promise<string>;
+  /**
+   * 读取页面 `localStorage` 里的 JSON 对象（如 MiniMax 的 `user_detail_agent`）；
+   * 不存在 / 不是合法对象时返回 null。
+   */
+  localStorageObject(key: string): Promise<Record<string, unknown> | null>;
   /** 关掉我们开出来的标签页与连接（不关闭整个浏览器） */
   close(): Promise<void>;
 }
@@ -535,6 +547,36 @@ export async function openCookieCollector(options: {
     return null;
   };
 
+  /**
+   * 在页面上下文执行一次取值表达式（只读，`returnByValue`）。
+   *
+   * 页面导航 / 权限限制 / 执行上下文销毁都会让 `Runtime.evaluate` 失败：
+   * 对登录轮询来说这只是「还没好」，返回 undefined 交给上层继续等待，
+   * 不把一次瞬时失败升级成登录失败。
+   */
+  const evaluateValue = async (expression: string): Promise<unknown> => {
+    if (closed) return undefined;
+    try {
+      const outcome = (await browser.send(
+        'Runtime.evaluate',
+        { expression, returnByValue: true, awaitPromise: true },
+        sessionId,
+        timeoutMs,
+      )) as { result?: { value?: unknown }; exceptionDetails?: unknown };
+      if (outcome?.exceptionDetails) return undefined;
+      return outcome?.result?.value;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const localStorageValue = async (key: string): Promise<string> => {
+    const raw = await evaluateValue(
+      `(() => { try { return localStorage.getItem(${JSON.stringify(key)}) ?? ''; } catch { return ''; } })()`,
+    );
+    return typeof raw === 'string' ? raw : '';
+  };
+
   return {
     cookieFor: findCookie,
     // 刻意不通过 `this.cookieFor` 调用：解构取用（const { cookieFor } = collector）时 this 会丢
@@ -556,6 +598,19 @@ export async function openCookieCollector(options: {
         await browser.send('Page.reload', {}, sessionId, timeoutMs);
       } catch {
         // 刷新失败不致命：下一轮轮询还会再试
+      }
+    },
+    localStorageItem: localStorageValue,
+    async localStorageObject(key: string): Promise<Record<string, unknown> | null> {
+      const raw = await localStorageValue(key);
+      if (!raw) return null;
+      try {
+        const parsed: unknown = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>)
+          : null;
+      } catch {
+        return null;
       }
     },
     close,
