@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Power Meter · 使用说明</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #070b12;
+    --panel: rgba(255, 255, 255, 0.045);
+    --line: rgba(255, 255, 255, 0.09);
+    --text: #e8eef7;
+    --muted: #9aa8bb;
+    --accent: #4adea8;
+    --accent-soft: rgba(74, 222, 168, 0.13);
+    --warn: #f2c66d;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background:
+      radial-gradient(1100px 620px at 15% -10%, rgba(74, 222, 168, 0.12), transparent 62%),
+      radial-gradient(900px 520px at 110% 0%, rgba(96, 165, 250, 0.10), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font: 15px/1.72 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    padding: 44px 28px 64px;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 26px; }
+  .mark {
+    width: 42px; height: 42px; border-radius: 13px;
+    background: linear-gradient(155deg, #12302a, #0a1418 70%);
+    border: 1px solid rgba(74, 222, 168, 0.35);
+    display: grid; place-items: center;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  }
+  .mark svg { width: 22px; height: 22px; }
+  h1 { font-size: 24px; letter-spacing: -0.02em; margin: 0; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  h2 {
+    font-size: 15px; letter-spacing: 0.01em; margin: 0 0 10px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  h2 .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 12px var(--accent); }
+  section {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+    padding: 20px 22px; margin: 0 0 14px;
+    backdrop-filter: blur(10px);
+  }
+  p { margin: 0 0 10px; }
+  p:last-child { margin-bottom: 0; }
+  ol, ul { margin: 0; padding-left: 20px; }
+  li { margin: 0 0 8px; }
+  li:last-child { margin-bottom: 0; }
+  code, .path {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px;
+    background: rgba(255, 255, 255, 0.06); border: 1px solid var(--line);
+    border-radius: 6px; padding: 2px 6px; color: #d7f7ea;
+  }
+  .path { display: inline-block; padding: 4px 8px; word-break: break-all; }
+  .muted { color: var(--muted); }
+  .callout {
+    border-left: 3px solid var(--warn); background: rgba(242, 198, 109, 0.07);
+    border-radius: 0 10px 10px 0; padding: 12px 14px; margin: 12px 0 0;
+    color: #f0dcb0; font-size: 13.5px;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  .foot { color: var(--muted); font-size: 12px; text-align: center; margin-top: 22px; }
+  a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <div class="mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none">
+        <path d="M13.2 2 5.4 13.1h5.2L9.6 22l8.2-11.4h-5.3L13.2 2Z" fill="#4adea8"/>
+      </svg>
+    </div>
+    <div>
+      <h1>Power Meter 使用说明</h1>
+      <div class="sub">多平台 AI 余额 / 积分看板 · 桌面版</div>
+    </div>
+  </div>
+
+  <section>
+    <h2><span class="dot"></span>第一次使用</h2>
+    <p>看板本身是一个本地服务，数据来自你自己的账号。第一次打开时账号列表是空的，跟着下面的步骤添加即可。</p>
+    <ol>
+      <li>点看板右上角的 <strong>＋ 添加账号</strong>（或空状态里的 <strong>＋ 添加平台账号</strong>）。</li>
+      <li>在平台列表里选一个平台，优先用 <strong>扫码 / 网页端登录</strong>；没有登录入口的平台，在表单里手动填写 Cookie 或令牌。</li>
+      <li>添加成功后卡片会自动出现；之后每次打开应用都会读取最新余额。</li>
+    </ol>
+    <div class="callout">扫码 / 网页登录需要在 Mac 上安装 Google Chrome。应用会拉起一个独立的调试窗口，和你的日常浏览记录完全隔离。</div>
+  </section>
+
+  <section>
+    <h2><span class="dot"></span>配置与凭证存在哪里</h2>
+    <p>所有账号与凭证只保存在这台 Mac 上，不上传、不经过任何中转服务：</p>
+    <p><span class="path">~/Library/Application Support/PowerMeter/</span></p>
+    <ul>
+      <li><code>.env</code>：凭证与设置（首次启动自动生成，权限 0600）。</li>
+      <li><code>accounts.json</code>：账号清单（首次启动为空，添加账号后自动写入）。</li>
+      <li><code>.run/usage-history.json</code>：本地用量采样，用于计算每日用量。</li>
+    </ul>
+    <p>菜单栏 <strong>Power Meter → 打开配置目录</strong> 可直接在访达里查看；<strong>打开日志</strong> 可排查启动问题。</p>
+  </section>
+
+  <section>
+    <h2><span class="dot"></span>手动配置（少数平台）</h2>
+    <p>大多数平台可以在应用内完成登录。少数只认网页登录态的平台，如果应用内登录不可用，可以编辑配置文件：</p>
+    <ol>
+      <li>菜单 <strong>Power Meter → 打开配置目录</strong>。</li>
+      <li>用文本编辑器打开 <code>.env</code>，按文件里的注释填写对应平台的变量（如 <code>QWENWORK_COOKIE</code>）。</li>
+      <li>保存后无需重启应用，服务会自动热加载；点看板的「立即刷新」即可。</li>
+    </ol>
+    <p class="muted">不要在聊天窗口或公开仓库里粘贴 Cookie / API Key。</p>
+  </section>
+
+  <section>
+    <h2><span class="dot"></span>常见问题</h2>
+    <table>
+      <tr>
+        <th>首次打开被 macOS 拦截</th>
+        <td>在访达「应用程序」里 <strong>右键点 Power Meter → 打开</strong>，再点「打开」。仍被拦截时，到 <strong>系统设置 → 隐私与安全性</strong> 点「仍要打开」。应用未做 Apple 公证，这是系统对所有未签名应用的默认提示。</td>
+      </tr>
+      <tr>
+        <th>卡片显示「未配置」</th>
+        <td>该账号的凭证为空或已过期。点卡片右上角的「重新登录」，或在平台弹窗里重新填写。</td>
+      </tr>
+      <tr>
+        <th>启动失败 / 窗口空白</th>
+        <td>打开菜单里的日志文件，通常能看到端口占用或依赖缺失的原因；关闭窗口后重新打开即可重启内置服务。</td>
+      </tr>
+      <tr>
+        <th>关闭窗口后还在运行吗</th>
+        <td>不会。关闭主窗口即退出应用并结束内置服务；下次打开会重新启动。</td>
+      </tr>
+    </table>
+  </section>
+
+  <section>
+    <h2><span class="dot"></span>说明</h2>
+    <p class="muted">本应用是本地第三方看板，与各平台官方无关；余额与到期时间以平台接口返回为准。请只添加你本人有权使用的账号。</p>
+  </section>
+
+  <div class="foot">Power Meter · 本地优先 · 凭证不出本机</div>
+</div>
+</body>
+</html>

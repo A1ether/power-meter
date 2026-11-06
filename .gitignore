@@ -2,6 +2,11 @@ node_modules/
 dist/
 # sidecar 单文件二进制（bun build --compile 产物，83M，不入库）
 dist/power-meter-sidecar
+
+# macOS 桌面版构建产物与下载缓存
+desktop/build/
+desktop/dist/
+desktop/.cache/
 .env
 accounts.json
 *.log
