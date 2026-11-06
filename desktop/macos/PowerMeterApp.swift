@@ -97,7 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         // 只落模板，不覆盖用户已有配置。
         let accounts = configDir.appendingPathComponent("accounts.json")
         if !fm.fileExists(atPath: accounts.path),
-           let seed = Bundle.main.url(forResource: "accounts", withExtension: "json", subdirectory: "seed") {
+           let seed = Bundle.main.url(forResource: "accounts.template", withExtension: "json", subdirectory: "seed") {
             try? fm.copyItem(at: seed, to: accounts)
         }
 
