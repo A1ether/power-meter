@@ -124,7 +124,7 @@ chmod +x "$APP/Contents/MacOS/PowerMeter" "$APP/Contents/Resources/power-meter-s
 ditto "$ROOT/public" "$APP/Contents/Resources/public"
 find "$APP/Contents/Resources/public" -name '.DS_Store' -delete
 cp "$ROOT/desktop/macos/help.html" "$APP/Contents/Resources/help.html"
-cp "$ROOT/desktop/macos/seed/accounts.json" "$APP/Contents/Resources/seed/accounts.json"
+cp "$ROOT/desktop/macos/seed/accounts.template.json" "$APP/Contents/Resources/seed/accounts.json"
 cp "$ROOT/.env.example" "$APP/Contents/Resources/seed/env.template"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
