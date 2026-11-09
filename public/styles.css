@@ -473,6 +473,12 @@ body {
   color: var(--text);
 }
 
+/* 当前生效的平台筛选行：与 hover 同一套填充，文字提到主色 */
+.nav__sub-item.is-active {
+  background: var(--fill-1);
+  color: var(--text);
+}
+
 .nav__sub-dot {
   flex: none;
   width: 6px;

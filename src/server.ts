@@ -558,6 +558,8 @@ const server = createServer(async (req, res) => {
         provider?: unknown;
         method?: unknown;
         options?: unknown;
+        /** 卡片级「重新登录」要更新的原账号（accounts.json displayName） */
+        targetAccountId?: unknown;
       };
       const provider = typeof body.provider === 'string' ? body.provider : '';
       const adapter = resolveAdapter(provider);
@@ -574,6 +576,8 @@ const server = createServer(async (req, res) => {
       }
       const outcome = await startLogin({
         provider: adapter.id,
+        targetAccountId:
+          typeof body.targetAccountId === 'string' ? body.targetAccountId : undefined,
         method: typeof body.method === 'string' ? body.method : undefined,
         options: stringRecord(body.options),
         callbackBase: serverOrigin(),

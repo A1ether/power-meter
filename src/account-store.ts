@@ -373,6 +373,24 @@ function effectiveOption(account: AccountConfig, field: ManageFieldDescriptor): 
 }
 
 /**
+ * 重复添加检查的比较口径：
+ *   - 折叠空白（`.env` 读回、手工粘贴的首尾 / 换行差异不算新凭证）；
+ *   - Cookie 类字段按 `;` 拆分后排序再比较——同一份 Cookie 只换个参数顺序，
+ *     语义完全相同，不该被当成新账号。
+ * 只用于比较，写入 `.env` 的仍是原值。
+ */
+function comparableCredential(key: string, value: string): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (!/cookie/i.test(key)) return normalized;
+  const parts = normalized
+    .split(';')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length < 2 || !parts.every((part) => part.includes('='))) return normalized;
+  return parts.sort().join('; ');
+}
+
+/**
  * 凭证字段在当前输入下是否必填。
  *
  * 默认逐字段必填（旧语义）。声明了 `pairedWith` / `flagGroup` 的字段按组判断：
@@ -579,7 +597,10 @@ export async function addManagedAccount(input: AddManagedInput): Promise<AddMana
   const duplicate = config.accounts.find(
     (account: AccountConfig) =>
       account.provider === adapter.id &&
-      Object.entries(values).every(([key, value]) => (account.credentials[key] ?? '') === value) &&
+      Object.entries(values).every(
+        ([key, value]) =>
+          comparableCredential(key, account.credentials[key] ?? '') === comparableCredential(key, value),
+      ) &&
       // option 也纳入比对：同一份 Cookie 加 cn 与 global 是两个账号，加两次 cn 才是重复
       optionFields.every(
         (field) =>
@@ -682,6 +703,11 @@ export interface LandLoginInput {
   provider: string;
   /** 平台账号身份（CodeBuddy uid / Qoder user_id / Trae UserID），用于去重 */
   accountId: string;
+  /**
+   * 卡片级「重新登录」指定的原账号（`accounts.json` 的 displayName）。
+   * 命中即原地更新——重新登录绝不能新增卡片（原卡片可能是取数失败的失效卡）。
+   */
+  targetAccountId?: string;
   /** 平台昵称，用于生成默认卡片名 */
   accountName?: string;
   /** 登录产物（明文），由会话层在内存中直接传入，不经过 HTTP */
@@ -717,6 +743,49 @@ function loginIdentityOf(item: Record<string, unknown>): string {
   const options = (item.options ?? {}) as Record<string, unknown>;
   const value = options.loginAccountId;
   return typeof value === 'string' ? value.trim() : '';
+}
+
+/** 从原始 accounts.json 条目里取登录昵称（非敏感，登录时写入 options.loginName） */
+function loginNameOf(item: Record<string, unknown>): string {
+  const options = (item.options ?? {}) as Record<string, unknown>;
+  const value = options.loginName;
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/**
+ * 登录落库时定位「这次登录属于哪一条已有账号」。
+ *
+ * 顺序：
+ *   1. `targetAccountId`（卡片级「重新登录」显式指定）——最高优先级，
+ *      保证原卡片原地更新，不会因为凭证指纹变化而新建；
+ *   2. 平台账号身份 `loginAccountId`——弹窗里重复登录同一账号的常规路径；
+ *   3. 登录昵称 `loginName`——兼容历史条目（它们的 loginAccountId 是 Cookie 指纹，
+ *      每次登录都会变）。只在**唯一命中**时认，避免把两个同名账号误合并。
+ *
+ * 返回 undefined = 新账号。
+ */
+function findLoginTarget(
+  members: Array<Record<string, unknown>>,
+  identity: string,
+  accountName: string,
+  targetAccountId: string,
+): Record<string, unknown> | undefined {
+  if (targetAccountId) {
+    const byTarget = members.filter(
+      (item) => String(item.displayName ?? '') === targetAccountId,
+    );
+    if (byTarget.length === 1) return byTarget[0];
+    // 目标已被改名 / 删除：退回下面按身份匹配，至少不会把新凭证挂到别的账号上
+  }
+  const byIdentity = identity
+    ? members.find((item) => loginIdentityOf(item) === identity)
+    : undefined;
+  if (byIdentity) return byIdentity;
+  if (accountName) {
+    const byName = members.filter((item) => loginNameOf(item) === accountName);
+    if (byName.length === 1) return byName[0];
+  }
+  return undefined;
 }
 
 /**
@@ -795,8 +864,8 @@ export function adoptResolvedAccountName(
  *
  * 与 `addManagedAccount` 的差别只有两点：
  *   1. 凭证不是用户填的，而是登录协议产出的（可能是多把令牌）；
- *   2. 按 `options.loginAccountId` 去重——同一账号重新登录只刷新令牌，
- *      不新增卡片（displayName 是卡片身份，不能变）。
+ *   2. 按「目标账号 → `options.loginAccountId` → 唯一登录昵称」定位原条目：
+ *      同一账号重新登录只刷新令牌，不新增卡片（displayName 是卡片身份，不能变）。
  *
  * 其余规则完全一致：先 probe 验证 → 备份 → 写 `.env`（0600）→ 写 accounts.json。
  */
@@ -809,7 +878,10 @@ export async function landLoginAccount(input: LandLoginInput): Promise<LandLogin
     return { ok: false, status: 403, stage: 'input', error: `平台「${adapter.id}」未声明登录能力。` };
   }
   const accountId = (input.accountId ?? '').trim();
-  if (!accountId) {
+  const targetAccountId = (input.targetAccountId ?? '').trim();
+  // 卡片级重新登录可能拿不到上游账号 ID（个别平台只在页面侧有身份），
+  // 只要有明确目标账号就仍可原地更新，不能因此拒绝落库。
+  if (!accountId && !targetAccountId) {
     return { ok: false, status: 400, stage: 'input', error: '登录结果缺少平台账号 ID，无法落库。' };
   }
 
@@ -823,7 +895,9 @@ export async function landLoginAccount(input: LandLoginInput): Promise<LandLogin
 
   loadDotEnv();
   const timeoutMs = input.timeoutMs ?? (Number(process.env.REQUEST_TIMEOUT_MS) || 15_000);
-  const optionValues: Record<string, string> = { ...(input.options ?? {}), loginAccountId: accountId };
+  const optionValues: Record<string, string> = { ...(input.options ?? {}) };
+  // 身份为空时不要覆盖旧值：原地更新应保留原 loginAccountId
+  if (accountId) optionValues.loginAccountId = accountId;
   const accountName = (input.accountName ?? '').trim();
   if (accountName) optionValues.loginName = accountName;
 
@@ -855,7 +929,16 @@ export async function landLoginAccount(input: LandLoginInput): Promise<LandLogin
     return { ok: false, status: 500, stage: 'write', error: (error as Error).message };
   }
   const members = accountsFile.accounts.filter((item) => sameProvider(item, adapter));
-  const existing = members.find((item) => loginIdentityOf(item) === accountId);
+  const existing = findLoginTarget(members, accountId, accountName, targetAccountId);
+  // 既没有上游身份、也没命中目标账号：这条记录以后无法去重，宁可拒绝也不写
+  if (!existing && !accountId) {
+    return {
+      ok: false,
+      status: 400,
+      stage: 'input',
+      error: '登录结果缺少平台账号 ID，且要更新的账号已不存在，无法落库。',
+    };
+  }
   const existingNames = new Set(members.map((item) => String(item.displayName ?? '')));
 
   const envFile = readEnvFile();

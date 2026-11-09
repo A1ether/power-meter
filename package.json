@@ -1,6 +1,6 @@
 {
   "name": "power-meter",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "多平台 AI 账户余额 / 积分看板，聚焦「最快到期」优先消耗",
   "type": "module",

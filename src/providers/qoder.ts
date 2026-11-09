@@ -1297,14 +1297,15 @@ function makeQoderWebLogin(site: QoderSiteMeta): ProviderLogin {
       if (!cookie) return { status: 'waiting', message: '抓到的 Cookie 头为空，继续等待页面发起新请求…' };
 
       // 账号身份：
-      //   - 去重键仍用「Cookie 指纹」：同一账号的登录态 Cookie 相对稳定，重新登录 → 指纹一致
-      //     → 更新原条目；不同账号 → 指纹不同 → 新建卡片。改成上游 id 会让已有账号的
-      //     loginAccountId 对不上（重新登录会新建卡片），故本次不动。
-      //   - 昵称走**网页**身份接口 `GET /api/v1/me`（与 Cookie 同一条信任面）。早先
-      //     「网页侧拿不到昵称」的结论只对 openapi `/api/v1/userinfo`（要 Bearer）成立，
-      //     网页接口本来就返回 `{ id, username, name, email }`——实测 `name` 即昵称。
-      const accountId = createHash('sha256').update(cookie).digest('hex').slice(0, 16);
+      //   - 去重键优先用**网页身份接口** `GET /api/v1/me` 返回的稳定 `id`（user_id）：
+      //     Cookie 会随重新登录轮换，指纹去重会「重新登录 → 新建卡片」。
+      //     身份接口失败时退回 Cookie 指纹，至少还能按凭证去重。
+      //   - 昵称走同一条信任面。早先「网页侧拿不到昵称」的结论只对
+      //     openapi `/api/v1/userinfo`（要 Bearer）成立，网页接口本来就返回
+      //     `{ id, username, name, email }`——实测 `name` 即昵称。
       const identity = await qoderCookieIdentity(site, cookie, ctx, QODER_TIMEOUT_FALLBACK);
+      const accountId =
+        identity?.id || createHash('sha256').update(cookie).digest('hex').slice(0, 16);
       const name = identity?.name ?? '';
       ctx.log(
         `Qoder 网页端登录已抓到 Cookie（指纹 ${accountId}）` +

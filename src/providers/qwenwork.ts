@@ -434,7 +434,12 @@ function buildLots(input: {
  * 网页端登录（CDP 旁听真实 Cookie 头）
  * ------------------------------------------------------------------ */
 
-/** 账号去重键：Cookie 没有自解释的用户标识，用指纹（稳定、不可逆） */
+/**
+ * 账号去重键兜底：Cookie 没有自解释的用户标识时用指纹（稳定、不可逆）。
+ *
+ * 注意指纹会随重新登录轮换，只能当兜底——登录成功时应优先用
+ * `/user/info` 返回的稳定用户 id（见 makeQwenWorkWebLogin 的 ready 分支）。
+ */
 function accountIdOf(cookie: string): string {
   return createHash('sha256').update(cookie).digest('hex').slice(0, 16);
 }
@@ -507,12 +512,26 @@ function makeQwenWorkWebLogin(usageUrl: string): ProviderLogin {
       }
 
       const cookie = normalizeCookieHeader(raw ?? '');
-      ctx.log(`千问办公网页端登录已抓到 Cookie（账号键 ${accountIdOf(cookie)}），开始验证落库`);
+      // 身份优先用 /user/info 的稳定用户 id：Cookie 会随重新登录轮换，
+      // 指纹去重会「重新登录 → 新建卡片」。身份接口失败才退回指纹。
+      let identity = { id: '', name: '' };
+      try {
+        const { body } = await fetchJson(`${QWENWORK_ORIGIN}/user/info`, {
+          method: 'GET',
+          headers: qwenWorkHeaders(cookie),
+          timeoutMs: ctx.timeoutMs || QWENWORK_TIMEOUT_FALLBACK,
+        });
+        identity = parseQwIdentity(unwrap(body, '账号信息请求失败'));
+      } catch (error) {
+        ctx.log(`千问办公账号身份获取失败（改用 Cookie 指纹去重）：${(error as Error).message}`);
+      }
+      const accountId = identity.id || accountIdOf(cookie);
+      ctx.log(`千问办公网页端登录已抓到 Cookie（账号键 ${accountId}），开始验证落库`);
 
       return {
         status: 'ready',
         // 昵称为空时用占位名「千问办公 · 登录账号」，探测时由 adoptResolvedAccountName 补
-        account: { id: accountIdOf(cookie), name: '' },
+        account: { id: accountId, name: identity.name },
         credentials: { cookie },
         options: {},
         message: '已抓到登录态 Cookie，正在验证取数并写入本机配置…',

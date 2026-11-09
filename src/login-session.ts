@@ -61,6 +61,8 @@ interface LoginSession {
   message: string | null;
   createdAt: number;
   expiresAt: number;
+  /** 卡片级「重新登录」指定的原账号（`accounts.json` displayName）；空串 = 新增账号 */
+  targetAccountId: string;
   /** 适配器私有状态（state / verifier / 设备私钥），只留在内存 */
   secret: unknown;
   login: ProviderLogin;
@@ -142,6 +144,12 @@ export function pruneLoginSessions(now = Date.now()): void {
 
 export interface StartLoginInput {
   provider: string;
+  /**
+   * 卡片级「重新登录」的目标账号（`accounts.json` displayName）。
+   * 非空时会话层在 `ready` 落库时原地更新该条目，绝不新增卡片；
+   * 弹窗里的「登录 / 添加账号」不传，走身份去重。
+   */
+  targetAccountId?: string;
   /** 用哪个登录方法（`ProviderLogin.id`）；缺省 = 平台默认方法（`login`） */
   method?: string;
   options?: Record<string, string>;
@@ -211,6 +219,7 @@ export async function startLogin(input: StartLoginInput): Promise<StartLoginResu
     message: '等待扫码 / 授权…',
     createdAt: now,
     expiresAt: now + (started.ttlMs > 0 ? started.ttlMs : 5 * 60 * 1000),
+    targetAccountId: (input.targetAccountId ?? '').trim(),
     secret: started.secret,
     login: method,
     timer: null,
@@ -274,6 +283,7 @@ async function tick(
     const landed: LandLoginResult = await landLoginAccount({
       provider: session.provider,
       accountId: result.account.id,
+      targetAccountId: session.targetAccountId,
       accountName: result.account.name,
       credentials: result.credentials,
       options: result.options,

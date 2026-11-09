@@ -1293,11 +1293,15 @@ function renderLogin(box, target, loginMeta) {
           state.login = null;
         }
         // 登录目标站点由 provider 决定（国内版 qoder / 国际版 qoder-intl），
-        // 请求体不再带站点选项
+        // 请求体不再带站点选项。
+        // 卡片级「重新登录」带上目标账号：后端据此原地更新原条目，
+        // 避免凭证指纹轮换时又新建一张重复卡片（弹窗目标是 null，不传）。
+        const targetAccountId = (target.currentAccountId ?? '').trim();
         const payload = await loginRequest('/api/login/start', {
           body: {
             provider: providerId,
             ...(methodId === 'default' ? {} : { method: methodId }),
+            ...(targetAccountId ? { targetAccountId } : {}),
           },
         });
         const view = payload.session;
@@ -2401,6 +2405,25 @@ function renderNavPlatforms(data) {
     // 阈值缺省时给个兜底，避免 urgencyOf 读 undefined.criticalDays 直接抛错
     const thresholds = data.expiryThresholds ?? { criticalDays: 3, warningDays: 7 };
     const fragment = document.createDocumentFragment();
+
+    // 「全部平台」常驻首行：按平台筛选后一键回到全部卡片。
+    // 右侧放平台数而不是金额——跨平台混币种，硬加会给出一个假数字。
+    const allRow = element('button', 'nav__sub-item');
+    allRow.type = 'button';
+    allRow.dataset.filter = '';
+    const allDot = element('span', 'nav__sub-dot');
+    allDot.dataset.level = groupUrgency(
+      groups.flatMap((group) => group.members),
+      thresholds,
+    );
+    allRow.append(
+      allDot,
+      element('span', 'nav__sub-label', '全部平台'),
+      element('span', 'nav__sub-amount', `${groups.length} 个`),
+    );
+    allRow.addEventListener('click', () => filterByProvider(''));
+    fragment.append(allRow);
+
     for (const group of groups) {
       const amount = groupBalance(group.members);
       const row = element('button', 'nav__sub-item');
@@ -2429,6 +2452,21 @@ function renderNavPlatforms(data) {
 
   // 展开态存在 state 里：子菜单每次重建后按它恢复，刷新数据时不会被收起
   syncNavGroupState();
+  syncPlatformNavActive();
+}
+
+/**
+ * 按当前筛选词点亮「按平台」子菜单的对应行。
+ *
+ * 筛选的唯一状态仍是 `state.query`：完全等于某个平台标签才点亮该行；
+ * query 为空时点亮「全部平台」；手输的自由搜索词不属于任何平台，全部熄灭。
+ */
+function syncPlatformNavActive() {
+  if (!els.navPlatforms) return;
+  const query = state.query.trim();
+  for (const row of els.navPlatforms.querySelectorAll('.nav__sub-item')) {
+    row.classList.toggle('is-active', (row.dataset.filter ?? '') === query);
+  }
 }
 
 /** 把 state.navPlatformsOpen 落到 DOM（hidden / aria-expanded / is-open 三处） */
@@ -2452,6 +2490,7 @@ function toggleNavPlatforms() {
 function filterByProvider(name) {
   state.query = name;
   if (els.search && els.search.value !== name) els.search.value = name;
+  syncPlatformNavActive();
   if (state.data) renderGrid(state.data);
   const grid = document.querySelector('#grid');
   if (grid) grid.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -2647,6 +2686,8 @@ function buildCommands() {
     { label: '打开平台与账号', hint: '操作', run: () => openPlatformsDialog() },
     { label: '切换自动刷新', hint: '操作', run: () => toggleAutoRefresh() },
   ];
+  // 与子菜单首行同源：清空筛选，回到全部卡片
+  items.push({ label: '显示全部平台', hint: '平台', run: () => filterByProvider('') });
   // 平台命令与「按平台」子菜单同源（platformGroups）：一个平台一条「查看 X」
   for (const group of platformGroups(state.data)) {
     items.push({
@@ -2895,6 +2936,7 @@ els.sort.addEventListener('change', (event) => {
 });
 els.search.addEventListener('input', (event) => {
   state.query = event.target.value;
+  syncPlatformNavActive();
   if (state.data) renderGrid(state.data);
 });
 
