@@ -3,6 +3,7 @@ import { endOfBeijingDay } from '../lib/beijing-time.js';
 import { ensureDebugChrome, openCookieCollector, type CookieCollector } from '../lib/cdp.js';
 import { fetchJson, HttpError } from '../lib/http.js';
 import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
+import { fetchAllPages, incompleteNote } from '../lib/pagination.js';
 import { startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
 import type { AccountConfig } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
@@ -51,11 +52,12 @@ import {
  * 其次 `raccoon_token`；续期用 `raccoon_refresh_token`。Electron 客户端那套
  * 带 `electron_` 前缀的 Cookie 名不属于网页端，这里不认。
  *
- * 口径（见方案文档 §5）：
+ * 口径（见 docs/fixes/商汤小浣熊-每日积分到期时间批次缺失-修复方案.md）：
  *   - 余额 = `available_points`（账户级权威数字）；
- *   - 四类积分（每日 / 每月 / 加油包 / 奖励）各拆成一条 `CreditLot`，
- *     金额取账户级各桶剩余、到期时间取「积分明细」里同类发放记录的 `expire_at`
- *     （每月缺失时退回订阅到期；每日缺失时退回北京时间当日 24:00）；
+ *   - **逐批建模**：每日 / 每月 / 奖励三类，把「账户级桶剩余」按平台公布的消耗顺序
+ *     （同类内先到期先消耗）分摊到**每一笔发放记录**上，一笔发放一条 `CreditLot`，
+ *     到期时间用该笔自己的 `expire_at`（上游原值，不做推算）；
+ *     分摊差额（明细未覆盖）出「未明细部分」调节项并注明；
  *   - 加油包永久有效 → `expiresAt = null`，不参与「最快到期」；
  *   - 明细流水里 `points < 0` 记 `use`、`> 0` 记 `grant`，`biz_type` 含 expire
  *     的过期记录两边都不计（过期既不是花掉的、也不是到账的）。
@@ -65,9 +67,33 @@ const XHX_TIMEOUT_FALLBACK = 12_000;
 const XHX_ORIGIN = 'https://xiaohuanxiong.com';
 /** 「资源用量」页：卡片「每日用量」跳转与网页端登录打开的都是它 */
 const XHX_USAGE_URL = 'https://xiaohuanxiong.com/work/settings/resource';
-/** 明细分页：50 条 × 10 页，够覆盖「昨日 00:00 至今」；超出即退回本地采样 */
-const BILLS_PAGE_SIZE = 50;
+/**
+ * 明细每页要几条：往大了要——服务端支持就少翻几页（这也是修复前一直在用的值）。
+ * 桌面端 bundle 里客户端固定传 20，服务端**可能封顶 20**。
+ */
+const BILLS_REQUEST_LIMIT = 50;
+/**
+ * 短页判据阈值：按客户端实测的 20 判定。
+ *
+ * `fetchAllPages()` 用「本页条数 < pageSize」判末页；若拿 50 当阈值而服务端封顶 20，
+ * 每一页都会被当成「短页 + 上游声称还有 = 未取全」而在第 1 页停下。
+ * 因此「请求 50 / 阈值 20」：服务端封顶 20 时页页满页、正常翻到底；
+ * 服务端支持 50 时页更大，同样不会被误判。
+ * 10 页覆盖「昨日 00:00 至今」；超出即退回本地采样。
+ */
+const BILLS_PAGE_SIZE = 20;
 const BILLS_MAX_PAGES = 10;
+/**
+ * 发放流水（`type=income`）翻页上限：15 页（每页 20–50 条）。
+ *
+ * 逐批建模要一直翻到「各桶剩余被这些发放记录覆盖」为止。**不能**再用 `type=all`
+ * 只翻 3 页：消耗流水（桌面端一次对话就一条 -4）会把窗口挤到只剩近一小时，
+ * 于是只能看到当天那一笔发放，到期时间退化成「最晚到期」——这正是本次修复的问题。
+ * 日常账号 1–2 页即可（每天 1 笔每日发放）；上限只是防御（奖励积分 1 年有效期）。
+ */
+const GRANT_BILLS_MAX_PAGES = 15;
+/** 发放流水不可用（参数被上游改版拒绝）时退回全量流水的页数 */
+const BILLS_FALLBACK_MAX_PAGES = 4;
 /** 网页端登录（CDP 抓取）节奏：与 CodeBuddy 同一套常量 */
 const XHX_WEB_POLL_INTERVAL_MS = 2_000;
 const XHX_WEB_RELOAD_IDLE_MS = 20_000;
@@ -86,11 +112,14 @@ const AUTH_CODES = new Set([200001, 200003, 200009]);
 
 /**
  * 「积分明细」里各类积分的判定关键字。
- * 上游 `biz_type` 枚举未穷举（实测到 `daily_grant` / `daily_expire`），
- * 因此用关键字匹配，认不出的一律归 `other`——只影响批次到期时间的精细度，
- * 不影响余额。
+ *
+ * 对 app.asar 的静态取证（见修复方案 §2.2）只能确认 `daily_grant` /
+ * `daily_expire` 两个 `biz_type`，`monthly_*` / `reward_*` / `topup_*` 在客户端
+ * bundle 里根本不存在；而 **`event_name` 是服务端下发的中文字符串**（客户端直接渲染，
+ * 没有 biz_type→中文的字典）。所以匹配必须「英文 biz_type + 中文 event_name」一起覆盖，
+ * 认不出的一律归 `other`——只影响批次精细度，不影响余额。
  */
-const BUCKET_KEYWORDS: Array<{ bucket: XhxBucket; pattern: RegExp }> = [
+const BUCKET_BIZ_KEYWORDS: Array<{ bucket: XhxBucket; pattern: RegExp }> = [
   { bucket: 'daily', pattern: /daily|day_/i },
   // 加油包排在「每月」之前：购买类记录的 biz_type 里常带 subscription，
   // 若先匹配 monthly 会被误归到「每月赠送」上，到期时间就错了。
@@ -98,6 +127,22 @@ const BUCKET_KEYWORDS: Array<{ bucket: XhxBucket; pattern: RegExp }> = [
   { bucket: 'topup', pattern: /topup|top_up|booster|recharge|purchase/i },
   { bucket: 'reward', pattern: /reward|activity|campaign|redeem|gift|promo|invite/i },
   { bucket: 'monthly', pattern: /monthly|month_|subscription/i },
+];
+
+/**
+ * `event_name` 里的中文关键字（**服务端下发**，客户端没有 `biz_type` → 中文的字典）。
+ *
+ * 顺序有意为之：`签到` 归**奖励**（「活动签到奖励」「每日签到领积分」在产品里都是奖励类），
+ * 每月 / 奖励排在每日之前 —— 否则「每月签到礼包」会先命中 daily，被当成最晚到期的
+ * 每日批次、反把真实每日批次挤掉，正是本次要修的那个形状。
+ */
+const BUCKET_EVENT_KEYWORDS: Array<{ bucket: XhxBucket; pattern: RegExp }> = [
+  // `每日` / `每天` 必须排最前：「每日签到奖励」是每日额度（7 天），
+  // 若被 reward 的 `签到` 抢先，daily 桶会整桶丢发放、reward 反被短效批次填满。
+  { bucket: 'daily', pattern: /每日|每天/ },
+  { bucket: 'topup', pattern: /加油包|增购|充值|购买/ },
+  { bucket: 'reward', pattern: /奖励|活动|兑换|新人|回馈|礼包|签到/ },
+  { bucket: 'monthly', pattern: /每月|月度|订阅|会员/ },
 ];
 
 export type XhxBucket = 'daily' | 'monthly' | 'topup' | 'reward' | 'other';
@@ -378,81 +423,131 @@ export interface XhxBillsResult {
   items: XhxBill[];
   /** 是否已取全（翻到窗口边界或没有下一页） */
   complete: boolean;
+  /** 未取全时可直接放进卡片 note 的说明（取全为 null） */
+  incompleteNote: string | null;
 }
 
 /**
  * 拉取积分明细（新→旧，游标分页）。
  *
- * `stopBefore` 给定时，遇到早于该时刻的记录即停止并判定「已取全」——
- * 用量统计只需要「昨日 00:00 之后」这一段。
+ * 翻页交给 `fetchAllPages()`（AGENTS §9 的硬约束：列表型接口不得手写翻页循环），
+ * 这里只做两件事：
+ *   ① 上一页 `next_cursor` → 本页查询参数；
+ *   ② 把上游 `has_more` 翻译成 `fetchAllPages` 认得的 `total`
+ *      （「还有」⇒ 已取条数 + 1，避免短页被当成末页而静默判取全；与 qwenwork.ts 同一范式）。
+ *
+ * `stopBefore` / `stopWhen` 表达的是「需要的窗口已被覆盖」：命中即停并判取全，
+ * 由 `fetchAllPages` 的 `stopWhen` 钩子实现（用量统计只需要「昨日 00:00 之后」，
+ * 逐批建模只需要「各桶剩余被发放覆盖」——更早的记录按先到期先消耗已无剩余）。
  */
 export async function fetchXhxBills(
   account: AccountConfig,
   ctx: ProbeContext,
-  options: { type?: 'all' | 'income' | 'expense'; maxPages?: number; stopBefore?: number } = {},
+  options: {
+    type?: 'all' | 'income' | 'expense';
+    maxPages?: number;
+    stopBefore?: number;
+    /** 「需要的窗口已覆盖」判定，命中即停并判取全（见 lib/pagination.ts 的 stopWhen） */
+    stopWhen?: (bills: XhxBill[]) => boolean;
+  } = {},
 ): Promise<XhxBillsResult> {
-  const items: XhxBill[] = [];
-  const maxPages = options.maxPages ?? BILLS_MAX_PAGES;
-  let cursor = '';
-  let complete = false;
+  const type = options.type ?? 'all';
+  /** 第 N 页（从 1 起）要用的游标；由上一页响应写入 */
+  const cursors: string[] = [];
+  /**
+   * 已解析出的**去重**条数：必须与 `fetchAllPages` 的 keyOf 计数口径一致
+   * （无效条目两边都不计、跨页重复的 bill_id 两边都只算一次），
+   * 否则翻译出的 total 永远达不到，会把取全误判成未取全。
+   */
+  const seenIds = new Set<string>();
+  /** 已取到的最早一条流水时间（`stopBefore` 覆盖判定用，避免每页重算） */
+  let oldestSeen = Number.POSITIVE_INFINITY;
+  /** 上一次 `stopWhen` 调用时的累计条数：用来判断「本次新增的这页是不是满页」 */
+  let lastCount = 0;
+  /** 观测到的首页新增条数：作为「满页」的动态基线（服务端可能支持 50，也可能封顶 20） */
+  let observedPageLength = 0;
+  const stopBefore = options.stopBefore;
 
-  for (let page = 0; page < maxPages; page += 1) {
-    const params = new URLSearchParams({
-      'paging.limit': String(BILLS_PAGE_SIZE),
-      type: options.type ?? 'all',
-    });
-    if (cursor) params.set('cursor', cursor);
-    const data = await xhxRequest(
-      account,
-      ctx,
-      `/api/web/points/v2/bills?${params.toString()}`,
-      '积分明细请求失败',
-    );
-    const payload = isRecord(data) ? data : {};
-    const list = pick(payload, 'items');
-    if (!Array.isArray(list)) throw new Error('积分明细响应缺少 items 字段（令牌可能已失效）');
-
-    for (const raw of list) {
-      const bill = parseBill(raw);
-      if (bill) items.push(bill);
-    }
-
-    const nextCursor = firstString(
-      pick(payload, 'next_cursor', 'nextCursor'),
-      isRecord(pick(payload, 'paging'))
-        ? firstString(pick(pick(payload, 'paging'), 'next_cursor', 'cursor'))
-        : '',
-      pick(payload, 'cursor'),
-    );
-    const hasMoreFlag = pick(payload, 'has_more');
-    const hasMore =
-      hasMoreFlag === true || (hasMoreFlag === undefined && Boolean(nextCursor));
-
-    if (options.stopBefore !== undefined) {
-      const oldest = items.reduce((min, bill) => Math.min(min, bill.at), Number.POSITIVE_INFINITY);
-      if (oldest < options.stopBefore) {
-        complete = true;
-        break;
+  const result = await fetchAllPages<XhxBill>({
+    pageSize: BILLS_PAGE_SIZE,
+    maxPages: options.maxPages ?? BILLS_MAX_PAGES,
+    keyOf: (bill) => bill.id,
+    label: '小浣熊积分明细',
+    stopWhen: (items) => {
+      const pageLength = items.length - lastCount;
+      lastCount = items.length;
+      if (observedPageLength === 0) observedPageLength = pageLength;
+      for (const bill of items) {
+        if (bill.at < oldestSeen) oldestSeen = bill.at;
       }
-    }
-    // 没有下一页 / 空页 = 取到尽头
-    if (!hasMore || list.length === 0) {
-      complete = true;
-      break;
-    }
-    // 上游说还有、却没给游标：无法继续翻页，如实标记「未取全」
-    // （否则会静默把「只拿到前 N 条」当成完整记录集，让日级用量偏小）
-    if (!nextCursor) break;
-    cursor = nextCursor;
-  }
+      // 时间窗覆盖只认「满页且已跨过边界」：上游若按 `expire_at` 排序（或插了一条补发），
+      // 短页里出现一条很老的 `created_at` 并不代表窗口记录都在手里；此时判取全，
+      // 用量台账会少算还把来源标成 upstream。
+      // 「满页」以观测到的首页页长为基线：请求 50 但服务端支持 50 时，一个被过滤到
+      // 20 条的中间页也不算满页（否则这里等于没门槛）。
+      const fullPage = Math.max(BILLS_PAGE_SIZE, observedPageLength);
+      if (stopBefore !== undefined && oldestSeen < stopBefore && pageLength >= fullPage) {
+        return true;
+      }
+      return options.stopWhen ? options.stopWhen(items) : false;
+    },
+    fetchPage: async (page) => {
+      const params = new URLSearchParams({
+        'paging.limit': String(BILLS_REQUEST_LIMIT),
+        type,
+      });
+      const cursor = cursors[page - 1];
+      if (cursor) params.set('cursor', cursor);
+      const data = await xhxRequest(
+        account,
+        ctx,
+        `/api/web/points/v2/bills?${params.toString()}`,
+        '积分明细请求失败',
+      );
+      const payload = isRecord(data) ? data : {};
+      const list = pick(payload, 'items');
+      if (!Array.isArray(list)) throw new Error('积分明细响应缺少 items 字段（令牌可能已失效）');
 
-  return { items, complete };
+      const parsed = list.map(parseBill).filter((bill): bill is XhxBill => bill !== null);
+      for (const bill of parsed) seenIds.add(bill.id);
+
+      const nextCursor = firstString(
+        pick(payload, 'next_cursor', 'nextCursor'),
+        isRecord(pick(payload, 'paging'))
+          ? firstString(pick(pick(payload, 'paging'), 'next_cursor', 'cursor'))
+          : '',
+        pick(payload, 'cursor'),
+      );
+      const hasMoreFlag = pick(payload, 'has_more');
+      const hasMore =
+        hasMoreFlag === true || (hasMoreFlag === undefined && Boolean(nextCursor));
+      // 上游说还有、却没给游标：下一页会重复请求第 1 页，由 fetchAllPages 的
+      // 「本页零新增」判据收口，并如实标记「未取全」。
+      if (hasMore) cursors[page] = nextCursor;
+
+      return { items: parsed, total: hasMore ? seenIds.size + 1 : seenIds.size };
+    },
+  });
+
+  return {
+    items: result.items,
+    complete: result.complete,
+    incompleteNote: incompleteNote(result),
+  };
 }
 
+/**
+ * 桶归属：**先按 `biz_type`**（英文、精确），判不出再看中文 `event_name`。
+ *
+ * 这个顺序是复核时定下的：中文是模糊匹配，先命中会把「活动签到奖励」误判成每日批次；
+ * 而 `biz_type` 是上游枚举，`daily_grant` 这类字面量一旦出现就是确定的。
+ */
 function bucketOf(bill: XhxBill): XhxBucket {
-  const haystack = `${bill.bizType} ${bill.eventName}`;
-  for (const { bucket, pattern } of BUCKET_KEYWORDS) {
-    if (pattern.test(haystack)) return bucket;
+  for (const { bucket, pattern } of BUCKET_BIZ_KEYWORDS) {
+    if (pattern.test(bill.bizType)) return bucket;
+  }
+  for (const { bucket, pattern } of BUCKET_EVENT_KEYWORDS) {
+    if (pattern.test(bill.eventName)) return bucket;
   }
   return 'other';
 }
@@ -521,104 +616,313 @@ export function parseXhxIdentity(data: unknown): XhxIdentity {
  */
 export { endOfBeijingDay };
 
+/** 逐批建模的三类桶（加油包永久有效，不拆批） */
+const BATCH_BUCKETS = ['daily', 'monthly', 'reward'] as const;
+type BatchBucket = (typeof BATCH_BUCKETS)[number];
+
+/** 各桶展示名：批次标题与「未明细部分」调节项共用 */
+const BUCKET_LABEL: Record<XhxBucket, string> = {
+  daily: '每日赠送积分',
+  monthly: '每月赠送积分',
+  reward: '奖励积分',
+  topup: '加油包积分',
+  other: '其他积分',
+};
+
+/** 一笔「发放」按消耗顺序反推出来的当前剩余 */
+export interface XhxGrantBatch {
+  /** 上游 `bill_id`（批次稳定标识） */
+  billId: string;
+  bucket: BatchBucket;
+  /** 发放时间（epoch ms） */
+  grantedAt: number;
+  /** 该笔的到期时间（epoch ms，上游 `expire_at` 原值） */
+  expiresAt: number;
+  /** 该笔授予量（上游 `points`） */
+  granted: number;
+  /** 按「同类内先到期先消耗」反推出来的剩余 */
+  remaining: number;
+}
+
+export interface XhxAllocation {
+  batches: XhxGrantBatch[];
+  /** 某一个桶里「账户级剩余」没能归到任何发放笔上的差额（明细未覆盖） */
+  gaps: Array<{ bucket: BatchBucket; amount: number }>;
+}
+
 /**
- * 各桶最早的有效到期时间：只看「发放类」记录（`points > 0`），且只要未来的。
- * 过期的发放记录说明那笔额度已经作废，不能拿来当当前批次的到期时间。
+ * 把「账户级桶剩余」分摊到逐笔发放，得到每条批次的到期时间与剩余。
+ *
+ * 依据是平台自己公布的消耗顺序：**同类内按到期日 / 入账时间先后消耗**
+ * （「资源用量」页原文：「消耗顺序：每日额度 → 每月额度 → 奖励积分 → 加油包
+ * （同类内按到期日/入账时间排序）」）。因此同一桶内，先到期的先被吃掉，
+ * **剩余额度必然集中在最晚到期的若干笔上**——从最晚一笔往前填满桶剩余，
+ * 就能还原逐批剩余，不需要逐笔对账、也不会被退款 / 并发写入的顺序干扰。
+ *
+ * 三条硬约束：
+ *   1. 只用 `points > 0` 的发放记录（过期流水既不是发放也不是消耗）；
+ *   2. 只认 `expiresAt >= now` 的发放（已作废的批次不参与分配）；
+ *   3. 发放合计 < 桶剩余时**不硬凑**：差额进 `gaps`，由调用方出「未明细部分」
+ *      调节项并注明，绝不把没取到的批次合并进某一笔真实批次里。
  */
-function earliestExpiryByBucket(bills: XhxBill[], now: number): Map<XhxBucket, number> {
-  const out = new Map<XhxBucket, number>();
-  for (const bill of bills) {
-    if (bill.points <= 0 || isExpiryBill(bill) || bill.expiresAt === null) continue;
-    if (bill.expiresAt < now) continue;
-    const bucket = bucketOf(bill);
-    const current = out.get(bucket);
-    if (current === undefined || bill.expiresAt < current) out.set(bucket, bill.expiresAt);
+export function allocateXhxBatches(input: {
+  bills: XhxBill[];
+  balances: Record<BatchBucket, number>;
+  now: number;
+}): XhxAllocation {
+  const batches: XhxGrantBatch[] = [];
+  const gaps: Array<{ bucket: BatchBucket; amount: number }> = [];
+
+  for (const bucket of BATCH_BUCKETS) {
+    const total = round2(Math.max(0, input.balances[bucket]));
+    if (total <= 0) continue;
+
+    // 候选：同类、发放、未过期、有明确 expire_at；同 bill_id 去重（翻页错位会重复）
+    const grants = new Map<string, XhxGrantBatch>();
+    for (const bill of input.bills) {
+      if (bill.points <= 0 || isExpiryBill(bill)) continue;
+      if (bill.expiresAt === null || bill.expiresAt < input.now) continue;
+      if (bucketOf(bill) !== bucket) continue;
+      const existing = grants.get(bill.id);
+      if (existing && existing.granted >= bill.points) continue;
+      grants.set(bill.id, {
+        billId: bill.id,
+        bucket,
+        grantedAt: bill.at,
+        expiresAt: bill.expiresAt,
+        granted: round2(bill.points),
+        remaining: 0,
+      });
+    }
+
+    const ordered = [...grants.values()].sort(
+      (a, b) => a.expiresAt - b.expiresAt || a.grantedAt - b.grantedAt,
+    );
+    let left = total;
+    for (let i = ordered.length - 1; i >= 0 && left > 0; i -= 1) {
+      const take = round2(Math.min(ordered[i].granted, left));
+      if (take <= 0) continue;
+      batches.push({ ...ordered[i], remaining: take });
+      left = round2(left - take);
+    }
+    if (left > 0) gaps.push({ bucket, amount: left });
   }
-  return out;
+
+  batches.sort((a, b) => a.expiresAt - b.expiresAt || a.grantedAt - b.grantedAt);
+  return { batches, gaps };
 }
 
-interface BucketSpec {
-  bucket: XhxBucket;
-  label: string;
-  amount: number;
-  /** 永久有效：显式声明，不参与「最快到期」 */
-  permanent?: boolean;
-  /** 备注（如加油包冻结） */
-  note?: string;
+/** 北京时间的「MM-DD」标签（批次标题用；不依赖本机时区） */
+function beijingDayLabel(ms: number): string {
+  const shifted = new Date(ms + 8 * 3_600_000);
+  const month = String(shifted.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(shifted.getUTCDate()).padStart(2, '0');
+  return `${month}-${day}`;
 }
 
-function buildLots(input: {
+/** 批次备注（卡片上作悬停说明）：授予量、已用量与有效期规则 */
+function batchNote(batch: XhxGrantBatch): string {
+  const parts = [`发放 ${round2(batch.granted)}`];
+  const used = round2(batch.granted - batch.remaining);
+  if (used > 0.005) parts.push(`已用 ${used}`);
+  if (batch.bucket === 'daily') parts.push('当天登录后到期延长至 7 天');
+  if (batch.bucket === 'reward') parts.push('到账后 1 年内有效');
+  if (batch.bucket === 'monthly') parts.push('仅限当前订阅周期');
+  return parts.join(' · ');
+}
+
+/**
+ * 桶内「没能归属到具体批次」的部分（或整桶）的到期兜底。
+ *
+ * - 每月：与订阅周期一致，退回 `entitlement_info` 的到期时间；
+ * - 每日：缺失的批次一定早于「今天 24:00 + 7 天」的那几笔，取「已知最早批次」
+ *   与「今天 24:00」中更早的一个 —— 宁可低估可用时间，也不谎报能用到 7 天后；
+ * - 奖励：**返回 null（不编时间）**。差额只会在「桶剩余 > 已知发放合计」时出现，
+ *   而按先到期先消耗，已知且拿到剩余的一定是**最晚到期**的那些；缺失的是更早发放、
+ *   更早到期的批次，所以「已知最早」对缺失部分而言是**上界**、不是保守值——
+ *   拿它填日期等于让「最快到期」再一次偏晚（复核指出的坑）。
+ */
+function gapExpiry(
+  bucket: BatchBucket,
+  knownExpiries: number[],
+  entitlement: XhxEntitlement,
+  now: number,
+): string | null {
+  if (bucket === 'monthly') return entitlement.subscriptionExpiresAt;
+  if (bucket === 'daily') {
+    const earliestKnown = knownExpiries.length > 0 ? Math.min(...knownExpiries) : null;
+    const todayEnd = endOfBeijingDay(now);
+    const chosen = earliestKnown === null ? todayEnd : Math.min(earliestKnown, todayEnd);
+    return new Date(chosen).toISOString();
+  }
+  return null;
+}
+
+function gapNote(bucket: BatchBucket, amount: number, partial: boolean): string {
+  const value = `${round2(amount)} 积分`;
+  if (partial) {
+    if (bucket === 'daily') {
+      return `每日赠送积分有 ${value}未取到逐笔明细（发放流水合计小于账户级剩余），已单列并按「今天 24:00 北京时间」保守估算`;
+    }
+    if (bucket === 'monthly') {
+      return `每月赠送积分有 ${value}未取到逐笔明细，已单列并按订阅到期时间估算`;
+    }
+    return `奖励积分有 ${value}未取到逐笔明细（发放流水合计小于账户级剩余），到期时间未知，未参与「最快到期」`;
+  }
+  if (bucket === 'daily') {
+    return `每日赠送积分的发放流水未取到，${value}按规则兜底（当日 24:00 北京时间）`;
+  }
+  if (bucket === 'monthly') {
+    return `每月赠送积分的发放流水未取到，${value}按订阅到期时间兜底`;
+  }
+  return `奖励积分的逐笔发放未取到，${value}未参与「最快到期」`;
+}
+
+/**
+ * 「各桶剩余是否已被这些发放记录覆盖」——发放流水翻页的提前停判据。
+ *
+ * 与 `allocateXhxBatches()` 的候选过滤保持一致：先到期先消耗 ⇒ 某桶的有效发放
+ * 合计 ≥ 桶剩余时，更早的发放必然已经被吃光，再翻也不会有剩余，可以停。
+ *
+ * 注意：这里只用于**取数提前停**，不参与建模；若上游某天停了「先到期先消耗」，
+ * 先坏的也是批次剩余（已在卡片 note 标注为反推值），不是余额。
+ */
+export function grantsCoverBalances(
+  bills: XhxBill[],
+  balances: Record<BatchBucket, number>,
+  now: number,
+): boolean {
+  const totals: Record<BatchBucket, number> = { daily: 0, monthly: 0, reward: 0 };
+  /** 同 bill_id 只算一次（与 `allocateXhxBatches()` 一致）：重复流水会虚增覆盖、导致提前停 */
+  const seen = new Map<string, XhxBill>();
+  for (const bill of bills) {
+    if (bill.points <= 0 || isExpiryBill(bill)) continue;
+    if (bill.expiresAt === null || bill.expiresAt < now) continue;
+    const existing = seen.get(bill.id);
+    if (!existing || existing.points < bill.points) seen.set(bill.id, bill);
+  }
+  for (const bill of seen.values()) {
+    const bucket = bucketOf(bill);
+    if (bucket === 'daily' || bucket === 'monthly' || bucket === 'reward') {
+      totals[bucket] += bill.points;
+    }
+  }
+  return BATCH_BUCKETS.every(
+    (bucket) => balances[bucket] <= 0 || totals[bucket] >= balances[bucket],
+  );
+}
+
+export function buildXhxLots(input: {
   balance: XhxBalance;
   bills: XhxBill[];
+  /** 发放明细是否可用：请求失败时退回「桶级聚合 + 规则 / 订阅兜底」 */
+  billsAvailable: boolean;
   entitlement: XhxEntitlement;
   now: number;
 }): { lots: CreditLot[]; notes: string[] } {
-  const expiries = earliestExpiryByBucket(input.bills, input.now);
+  const lots: CreditLot[] = [];
   const notes: string[] = [];
+  const balances: Record<BatchBucket, number> = {
+    daily: input.balance.daily,
+    monthly: input.balance.monthly,
+    reward: input.balance.reward,
+  };
 
-  const specs: BucketSpec[] = [
-    {
-      bucket: 'daily',
-      label: '每日赠送积分',
-      amount: input.balance.daily,
-      note: '当日 24:00 失效（当天登录延长至 7 天）',
-    },
-    {
-      bucket: 'monthly',
-      label: '每月赠送积分',
-      amount: input.balance.monthly,
-      note: '仅限当前订阅周期',
-    },
-    {
-      bucket: 'topup',
-      label: '加油包积分',
-      amount: input.balance.topup,
-      permanent: true,
-      note: input.balance.topupFrozen ? '已冻结（升级版到期或降级）' : undefined,
-    },
-    {
-      bucket: 'reward',
-      label: '奖励积分',
-      amount: input.balance.reward,
-      note: '到账后 1 年内有效',
-    },
-  ];
-  if (input.balance.enterpriseTopup > 0) {
-    specs.push({
-      bucket: 'other',
-      label: '企业加油包（共享）',
-      amount: input.balance.enterpriseTopup,
-      permanent: true,
+  if (input.billsAvailable) {
+    const { batches, gaps } = allocateXhxBatches({
+      bills: input.bills,
+      balances,
+      now: input.now,
     });
+
+    for (const batch of batches) {
+      lots.push(
+        makeLot({
+          id: `xhx-${batch.bucket}-${batch.billId}`,
+          label: `${BUCKET_LABEL[batch.bucket]} · ${beijingDayLabel(batch.grantedAt)}`,
+          amount: batch.remaining,
+          granted: batch.granted,
+          currency: 'CREDITS',
+          expiresAt: toIso(batch.expiresAt),
+          note: batchNote(batch),
+        }),
+      );
+    }
+    if (batches.length > 0) {
+      notes.push('逐批剩余按「同类内先到期先消耗」从账户级剩余反推（平台不提供逐批剩余）');
+    }
+
+    for (const gap of gaps) {
+      const known = batches
+        .filter((batch) => batch.bucket === gap.bucket)
+        .map((batch) => batch.expiresAt);
+      const partial = known.length > 0;
+      const expiresAt = gapExpiry(gap.bucket, known, input.entitlement, input.now);
+      lots.push(
+        makeLot({
+          id: `xhx-${gap.bucket}-unitemized`,
+          label: (partial
+            ? `${BUCKET_LABEL[gap.bucket]}（未明细部分`
+            : `${BUCKET_LABEL[gap.bucket]}（合计，未取到逐笔`) +
+            // 到期为 null 时前端会显示「不过期」，正文必须说清「到期未知」
+            (expiresAt === null ? ' · 到期未知）' : '）'),
+          amount: gap.amount,
+          currency: 'CREDITS',
+          expiresAt,
+          note:
+            expiresAt === null
+              ? '上游只给账户级剩余与逐笔发放，明细未覆盖；到期时间未取到，不代表永久有效'
+              : '上游只给账户级剩余与逐笔发放，明细未覆盖的部分单列于此',
+        }),
+      );
+      notes.push(gapNote(gap.bucket, gap.amount, partial));
+    }
+  } else {
+    // 明细不可用：退回修复前的桶级聚合口径（到期靠规则 / 订阅兜底）
+    for (const bucket of BATCH_BUCKETS) {
+      const amount = balances[bucket];
+      if (amount <= 0) continue;
+      lots.push(
+        makeLot({
+          id: `xhx-${bucket}`,
+          label: BUCKET_LABEL[bucket],
+          amount,
+          currency: 'CREDITS',
+          expiresAt: gapExpiry(bucket, [], input.entitlement, input.now),
+          note:
+            bucket === 'daily'
+              ? '当日 24:00 失效（当天登录延长至 7 天）'
+              : bucket === 'monthly'
+                ? '仅限当前订阅周期'
+                : '到账后 1 年内有效',
+        }),
+      );
+    }
+    notes.push('发放明细请求失败，批次到期时间由规则 / 订阅信息兜底');
   }
 
-  const lots: CreditLot[] = [];
-  for (const spec of specs) {
-    if (spec.amount <= 0) continue;
-    let expiresAt: string | null = null;
-    if (!spec.permanent) {
-      const fromBills = expiries.get(spec.bucket);
-      if (fromBills !== undefined) {
-        expiresAt = new Date(fromBills).toISOString();
-      } else if (spec.bucket === 'monthly' && input.entitlement.subscriptionExpiresAt) {
-        // 每月积分的到期时间与订阅周期一致；明细取不到时退回订阅到期
-        expiresAt = input.entitlement.subscriptionExpiresAt;
-      } else if (spec.bucket === 'daily') {
-        // 每日积分：明细取不到时按「当日 24:00（北京时间）」兜底
-        expiresAt = new Date(endOfBeijingDay(input.now)).toISOString();
-        notes.push('每日积分的到期时间由规则推算（当日 24:00 北京时间），明细未返回 expire_at');
-      } else {
-        notes.push(`${spec.label}的到期时间未取到，未参与「最快到期」`);
-      }
-    }
+  // 加油包 / 企业加油包：永久有效 → 一条聚合批次，不参与「最快到期」
+  if (input.balance.topup > 0) {
     lots.push(
       makeLot({
-        id: `xhx-${spec.bucket}`,
-        label: spec.label,
-        amount: spec.amount,
+        id: 'xhx-topup',
+        label: BUCKET_LABEL.topup,
+        amount: input.balance.topup,
         currency: 'CREDITS',
-        expiresAt,
-        note: spec.note ?? '',
+        expiresAt: null,
+        note: input.balance.topupFrozen ? '已冻结（升级版到期或降级）' : '永久有效',
+      }),
+    );
+  }
+  if (input.balance.enterpriseTopup > 0) {
+    lots.push(
+      makeLot({
+        id: 'xhx-enterprise-topup',
+        label: '企业加油包（共享）',
+        amount: input.balance.enterpriseTopup,
+        currency: 'CREDITS',
+        expiresAt: null,
+        note: '永久有效',
       }),
     );
   }
@@ -863,17 +1167,54 @@ export const xiaohuanxiongAdapter: ProviderAdapter = {
       const balance = parseXhxBalance(balanceData);
 
       // 明细与订阅都是「让到期时间更准」的增强项：失败不影响余额展示。
-      // 探针只要最近几页（拿到各桶最近发放的 expire_at 即可），不必翻到底，
-      // 因此这里**不**因为「没翻完」而提示「未取全」——那只会在每张卡片上制造噪音；
-      // 真正要提示的是「明细请求失败」，此时到期时间只能靠规则/订阅兜底。
+      //
+      // 取的是**发放流水**（`type=income`）而不是全量流水：全量流水里消耗记录会
+      // 把窗口挤满（桌面端一次对话就一条 -4），只翻几页时往往只剩「今天这一笔」
+      // 发放，逐批到期就退化成「最晚到期」。发放流水稀少，翻到「各桶剩余被覆盖」
+      // 即可停；取不全时由 `incompleteNote` 如实说明，并让没覆盖到的部分落成
+      // 「未明细部分」调节项，不冒充真实批次。
       let bills: XhxBill[] = [];
-      let billsFailed = false;
+      let billsAvailable = false;
+      let billsNote: string | null = null;
       try {
-        const result = await fetchXhxBills(account, ctx, { type: 'all', maxPages: 3 });
+        const result = await fetchXhxBills(account, ctx, {
+          type: 'income',
+          maxPages: GRANT_BILLS_MAX_PAGES,
+          // 各桶剩余已被这批发放覆盖就没必要继续翻（更早的发放按先到期先消耗已无剩余），
+          // 否则每个缓存周期都会把 7–15 页顺序打一遍，还可能误挂「未取全」提示。
+          stopWhen: (items) =>
+            grantsCoverBalances(
+              items,
+              { daily: balance.daily, monthly: balance.monthly, reward: balance.reward },
+              ctx.now,
+            ),
+        });
         bills = result.items;
+        billsAvailable = true;
+        billsNote = result.incompleteNote;
       } catch (error) {
-        billsFailed = true;
-        ctx.log(`小浣熊积分明细获取失败（不影响余额）：${(error as Error).message}`);
+        if (isAuthFailure(error)) {
+          // 鉴权失败时退化成一堆二次请求没有意义，直接按「明细不可用」处理
+          ctx.log(`小浣熊发放流水获取失败（不影响余额）：${(error as Error).message}`);
+        } else {
+          ctx.log(`小浣熊发放流水（type=income）获取失败，退回全量流水口径：${(error as Error).message}`);
+          try {
+            const fallback = await fetchXhxBills(account, ctx, {
+              type: 'all',
+              maxPages: BILLS_FALLBACK_MAX_PAGES,
+            });
+            bills = fallback.items.filter((bill) => bill.points > 0);
+            billsAvailable = true;
+            billsNote = [
+              fallback.incompleteNote,
+              '发放流水（type=income）不可用，已退回全量流水口径（消耗记录会挤占窗口，批次可能不全）',
+            ]
+              .filter((note): note is string => Boolean(note))
+              .join('；');
+          } catch (fallbackError) {
+            ctx.log(`小浣熊积分明细获取失败（不影响余额）：${(fallbackError as Error).message}`);
+          }
+        }
       }
 
       let entitlement: XhxEntitlement = { plan: null, subscriptionExpiresAt: null };
@@ -885,7 +1226,13 @@ export const xiaohuanxiongAdapter: ProviderAdapter = {
         ctx.log(`小浣熊订阅信息获取失败（不影响余额）：${(error as Error).message}`);
       }
 
-      const { lots, notes } = buildLots({ balance, bills, entitlement, now: ctx.now });
+      const { lots, notes } = buildXhxLots({
+        balance,
+        bills,
+        billsAvailable,
+        entitlement,
+        now: ctx.now,
+      });
       const { active, expired } = splitByExpiry(lots, ctx.now);
 
       // 构成合计与可用总额对不上时如实说明，便于上游改口径时第一时间发现
@@ -932,10 +1279,10 @@ export const xiaohuanxiongAdapter: ProviderAdapter = {
           balance.topupFrozen ? '加油包已冻结（升级版到期或降级，重新升级可恢复）' : null,
           ...notes,
           mismatch,
+          billsNote,
           expired.length > 0
             ? `另有 ${expired.length} 个批次已过期（共 ${round2(expired.reduce((sum, lot) => sum + lot.amount, 0))} 积分作废），未在列表中展示`
             : null,
-          billsFailed ? '积分明细请求失败，批次到期时间由规则 / 订阅信息兜底' : null,
         ),
         fallbackExpiryFromWindow: false,
       });

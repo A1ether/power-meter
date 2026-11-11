@@ -194,6 +194,28 @@ test('游标分页：has_more → total 的翻译在满页末页下仍判取全'
   assert.equal(calls, 2, '不应在取全后再多打一页');
 });
 
+/** ⑪ stopWhen：调用方声明「窗口已覆盖」即停，并判取全（省掉多余页请求） */
+test('窗口已覆盖：stopWhen 命中即停且 complete=true', async () => {
+  const all = Array.from({ length: 100 }, (_, i) => ({ id: `b${i}` }));
+  const calls: number[] = [];
+  const result = await fetchAllPages<Item>({
+    pageSize: 20,
+    maxPages: 10,
+    keyOf: (item) => item.id,
+    stopWhen: (items) => items.length >= 40,
+    fetchPage: async (page) => {
+      calls.push(page);
+      const start = (page - 1) * 20;
+      return { items: all.slice(start, start + 20), total: all.length };
+    },
+  });
+  assert.equal(result.items.length, 40);
+  assert.equal(result.complete, true, '窗口覆盖应判取全（不再需要更早的数据）');
+  assert.equal(result.pages, 2);
+  assert.equal(result.stoppedBy, 'window-covered');
+  assert.deepEqual(calls, [1, 2], '命中后不得再多打一页');
+});
+
 /** ⑩ 游标分页超上限：仍要如实判未取全（不允许静默截断） */
 test('游标分页超上限：complete=false 且条数等于实际上限', async () => {
   const all = Array.from({ length: 60 }, (_, i) => ({ id: `b${i}` }));

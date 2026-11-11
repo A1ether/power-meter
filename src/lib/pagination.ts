@@ -20,7 +20,13 @@
  *     **禁止**把截断后的合计当作完整值使用。
  */
 
-export type PageStopReason = 'total' | 'short-page' | 'no-progress' | 'max-pages' | 'error';
+export type PageStopReason =
+  | 'total'
+  | 'short-page'
+  | 'no-progress'
+  | 'max-pages'
+  | 'window-covered'
+  | 'error';
 
 export interface PagedResult<T> {
   items: T[];
@@ -46,6 +52,16 @@ export interface PagedOptions<T> {
   keyOf?: (item: T) => string;
   /** 活动/资源标识，仅用于错误信息 */
   label?: string;
+  /**
+   * 「所需窗口已覆盖」判定：返回 true 即停止翻页并判 `complete=true`。
+   *
+   * 给「只要最近一段数据」的调用方用（时间窗已翻过 / 各桶剩余已被发放覆盖），
+   * 免得把上限页数全部打完 —— 那既慢，也容易触发上游限流。
+   * 它表达的是「不再需要更多」，不是「上游已无更多数据」；因此只应在
+   * 「更早的数据按业务规则一定不影响结论」时使用（例如先到期先消耗，
+   * 更早的批次已经没有剩余）。拿不准就交给 `total` / 短页判据。
+   */
+  stopWhen?: (items: T[]) => boolean;
 }
 
 const DEFAULT_MAX_PAGES = 10;
@@ -91,6 +107,17 @@ export async function fetchAllPages<T>(options: PagedOptions<T>): Promise<PagedR
     if (payload.total !== null && Number.isFinite(payload.total)) expected = payload.total;
 
     const added = push(payload.items);
+    // 调用方声明「需要的窗口已被这批记录覆盖」→ 判取全并停（见 PagedOptions.stopWhen）
+    if (options.stopWhen && options.stopWhen(items)) {
+      return {
+        items,
+        expected,
+        complete: true,
+        pages,
+        stoppedBy: 'window-covered',
+        error: null,
+      };
+    }
     if (reachedTotal()) {
       return { items, expected, complete: true, pages, stoppedBy: 'total', error: null };
     }
