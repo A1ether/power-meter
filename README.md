@@ -28,6 +28,35 @@ npm start
 # 打开 http://127.0.0.1:48213
 ```
 
+### Flutter 客户端（新前端，含桌面 / 移动端）
+
+`public/` 里的原生前端保留为 **legacy**（`http://127.0.0.1:48213/legacy`）；
+默认入口会优先使用 Flutter 构建产物（`web/` 或 `app/build/web/`），没有产物时自动回退旧前端。
+
+```bash
+# 开发（需要 Flutter 3.50+）
+npm run app:dev:web        # 浏览器里热重载
+npm run app:dev:macos      # 桌面窗口
+
+# Web 构建：输出到 app/build/web，Node 服务会自动探测
+npm run app:build:web
+
+# macOS 桌面 App（内置 bun sidecar，随机端口 + 随机令牌）
+npm run app:build:macos          # 产物：desktop/dist-flutter/PowerMeter.app
+npm run app:analyze              # 静态检查
+npm run app:test                 # 单元测试
+```
+
+**移动端（iOS / Android）**：首次启动填写服务地址（如 `http://192.168.1.10:48213`）与访问令牌。
+为安全起见移动端只读（不提供账号增删 / 密钥读取 / 扫码登录）。跨设备访问时，在服务端这样启动：
+
+```bash
+HOST=0.0.0.0 POWER_METER_TOKEN=<自定义令牌> npm start
+# 不要设置 ALLOW_SECRET_REVEAL=1，移动端不会调用特权接口
+```
+
+> Flutter 与 Dart 依赖只在前端构建时需要；Node 服务端仍是运行时零第三方依赖。
+
 ### 接入自己的账号
 
 **入口：顶栏「平台与账号」（还没有任何账号时也能用）**

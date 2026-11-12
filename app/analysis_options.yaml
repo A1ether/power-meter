@@ -1,0 +1,21 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  errors:
+    invalid_annotation_target: ignore
+    # Flutter 3.50 起 `package:flutter/material.dart` 被标记为弃用（建议 material_ui）。
+    # 本项目继续使用 Flutter 官方 material，避免与第三方组件库的类型生态冲突，
+    # 待 material_ui 生态稳定后再统一迁移。
+    deprecated_member_use: ignore
+  exclude:
+    - build/**
+    - android/**
+    - ios/**
+    - web/**
+    - macos/**
+
+linter:
+  rules:
+    prefer_single_quotes: true
+    always_declare_return_types: true
+    unawaited_futures: false
