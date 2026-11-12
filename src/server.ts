@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { extname, join, resolve, sep } from 'node:path';
@@ -19,18 +20,50 @@ import { DashboardService } from './service.js';
 // 而 loadConfig 一进来就 loadDotEnv。独立看板（不带参数）时它们全部保持默认，行为不变。
 const sidecar = parseSidecarOptions();
 
-// 静态资源根目录：--static-dir 优先（桌面版把 public/ 放进 App Resources，bun 编译后的
-// import.meta.url 在虚拟文件系统里读不到真实目录）；缺省仍是 <dist>/../public/。
-const PUBLIC_DIR = sidecar.staticDir ?? fileURLToPath(new URL('../public/', import.meta.url));
+// 静态资源根目录：--static-dir 优先（桌面版把静态资源放进 App Resources，
+// bun 编译后的 import.meta.url 在虚拟文件系统里读不到真实目录）。
+//
+// 缺省按优先级探测：
+//   1. 仓库根 `web/`（Flutter Web 的发布产物，可手动拷贝）
+//   2. `app/build/web/`（`npm run app:build:web` 的默认输出）
+//   3. `public/`（旧原生前端，未构建 Flutter Web 时的兜底）
+// 旧前端始终挂在 `/legacy` 下，便于对照与回退。
+const LEGACY_PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
+
+function defaultStaticDir(): string {
+  const candidates = [
+    new URL('../web/', import.meta.url),
+    new URL('../app/build/web/', import.meta.url),
+    new URL('../public/', import.meta.url),
+  ];
+  for (const candidate of candidates) {
+    const dir = fileURLToPath(candidate);
+    if (existsSync(join(dir, 'index.html'))) return dir;
+  }
+  return LEGACY_PUBLIC_DIR;
+}
+
+const PUBLIC_DIR = sidecar.staticDir ?? defaultStaticDir();
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.wasm': 'application/wasm',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
   '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.otf': 'font/otf',
+  '.ttf': 'font/ttf',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.webmanifest': 'application/manifest+json',
 };
 
 const service = new DashboardService();
@@ -217,14 +250,29 @@ function revealSecret(
 }
 
 async function serveStatic(pathname: string, res: ServerResponse): Promise<boolean> {
-  const relative = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
-  const target = resolve(join(PUBLIC_DIR, relative));
-  if (!target.startsWith(resolve(PUBLIC_DIR) + sep)) {
+  // `/legacy/**` 固定映射到旧原生前端（public/），与默认入口解耦。
+  const isLegacy = pathname === '/legacy' || pathname.startsWith('/legacy/');
+  const root = isLegacy ? LEGACY_PUBLIC_DIR : PUBLIC_DIR;
+  const stripped = isLegacy ? pathname.slice('/legacy'.length) : pathname;
+  const relative = stripped === '' || stripped === '/' ? 'index.html' : stripped.replace(/^\/+/, '');
+  const target = resolve(join(root, relative));
+  if (!target.startsWith(resolve(root) + sep)) {
     res.writeHead(403).end('Forbidden');
     return true;
   }
   try {
-    const content = await readFile(target);
+    let content = await readFile(target);
+    // 旧前端用绝对路径引用资源；从 /legacy 访问时改写成同前缀，
+    // 这样两套前端可以同时在线（/legacy/app.js、/legacy/styles.css、/legacy/vendor/*）。
+    if (isLegacy && relative === 'index.html') {
+      content = Buffer.from(
+        content
+          .toString('utf8')
+          .replace('href="/styles.css"', 'href="/legacy/styles.css"')
+          .replace('src="/app.js"', 'src="/legacy/app.js"'),
+        'utf8',
+      );
+    }
     res.writeHead(200, {
       'Content-Type': MIME[extname(target).toLowerCase()] ?? 'application/octet-stream',
       'Cache-Control': 'no-cache',

@@ -1,0 +1,28 @@
+name: power_meter
+description: Power Meter · 多平台 AI 余额看板（Flutter 客户端）
+publish_to: "none"
+version: 0.2.0+2
+
+environment:
+  sdk: ">=3.6.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  flutter_riverpod: ^2.6.1
+  http: ^1.2.2
+  shared_preferences: ^2.3.2
+  url_launcher: ^6.3.0
+  qr_flutter: ^4.1.0
+  intl: ">=0.20.2 <0.22.0"
+  path: ^1.9.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true

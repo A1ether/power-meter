@@ -1,6 +1,6 @@
 {
   "name": "power-meter",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "private": true,
   "description": "多平台 AI 账户余额 / 积分看板，聚焦「最快到期」优先消耗",
   "type": "module",
@@ -26,6 +26,14 @@
     "build": "tsc -p tsconfig.json",
     "desktop:build": "bash tools/build-macos-app.sh",
     "desktop:install": "bash tools/build-macos-app.sh --install",
+    "app:dev:web": "cd app && flutter run -d chrome",
+    "app:dev:macos": "cd app && flutter run -d macos",
+    "app:build:web": "cd app && flutter build web --release",
+    "app:build:macos": "bash tools/build-flutter-macos-app.sh",
+    "app:build:ios": "cd app && flutter build ios --release --no-codesign",
+    "app:build:android": "cd app && flutter build apk --release",
+    "app:analyze": "cd app && flutter analyze",
+    "app:test": "cd app && flutter test",
     "serve": "node dist/server.js",
     "serve:sidecar": "node dist/server.js --port 0 --no-static",
     "build:sidecar": "npm run build && bun build --compile --minify dist/server.js --outfile dist/power-meter-sidecar"
