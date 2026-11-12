@@ -4,6 +4,27 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Power Meter · 多平台余额看板</title>
+    <script>
+      /*
+       * 主题首帧：必须在样式表之前落 data-theme，否则浅色用户会先看到一帧深色。
+       * 存储键与 public/app.js 的 THEME_STORAGE_KEY 必须一致；
+       * 缺失 / 非法值一律视为「自动」，由 prefers-color-scheme 决定。
+       */
+      (function () {
+        try {
+          var saved = localStorage.getItem('power-meter.theme');
+          var choice = saved === 'light' || saved === 'dark' ? saved : 'auto';
+          var dark =
+            choice === 'dark' ||
+            (choice === 'auto' && !window.matchMedia('(prefers-color-scheme: light)').matches);
+          document.documentElement.dataset.themeChoice = choice;
+          document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+        } catch (error) {
+          /* localStorage 不可用（隐私模式 / 被禁用）时按深色基准渲染，运行时仍可切换 */
+          document.documentElement.dataset.theme = 'dark';
+        }
+      })();
+    </script>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%E2%9A%A1%3C/text%3E%3C/svg%3E" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -79,6 +100,12 @@
               <span class="status__dot" aria-hidden="true"></span>
               <span id="status-text">等待数据</span>
             </span>
+            <!-- 主题按钮：自动 → 浅色 → 深色 → 自动，文案与 title 由 app.js 的 applyTheme() 刷新 -->
+            <button class="btn btn--ghost theme-btn" id="theme-btn" type="button"
+                    aria-label="主题：自动">
+              <span class="theme-btn__icon" id="theme-icon" aria-hidden="true">◐</span>
+              <span id="theme-label">自动</span>
+            </button>
             <button class="btn btn--ghost" id="cmd-btn" type="button">
               <span>搜索</span><kbd>⌘K</kbd>
             </button>

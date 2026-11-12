@@ -10,6 +10,8 @@
  *   0 0 0 1px <ring> 影子代替 border（含 --ring-color / --elev 两态切换）。
  * 配色走「石墨黑 + 薄荷绿」，用极细描边与分层阴影做高级感，
  * 告警不再整块铺色，只保留左侧细色条 + 小徽标。
+ * 主题开关：<html data-theme="dark|light">，浅色 token 见文件下方
+ * `:root[data-theme='light']`；运行时切换逻辑在 public/app.js（applyTheme）。
  *
  * 注意：本文件被 public/app.js 动态生成的节点依赖，删改 class 前先 grep app.js：
  *   grep -oE "class(Name)? = [\`'\"][^\`'\"]+" public/app.js
@@ -72,36 +74,36 @@
   text-rendering: optimizeLegibility;
 }
 
-/* 浅色主题：纸感 off-white，薄荷绿压暗保证对比度 */
-@media (prefers-color-scheme: light) {
-  :root {
-    color-scheme: light;
-    --bg: #f5f4ef;
-    --bg-soft: #fbfaf6;
-    --surface: #ffffff;
-    --surface-2: #f7f6f1;
-    --surface-3: #eeece4;
-    --text: #14171d;
-    --text-2: #4d5566;
-    --text-3: #767d8c;
-    --mint: #0f9d6f;
-    --mint-ink: #ffffff;
-    --danger: #d6453a;
-    --warn: #a9711a;
-    --info: #6b4fd0;
-    --hi: inset 0 1px 0 rgba(255, 255, 255, 0.9);
-    --elev-1: 0 1px 2px rgba(20, 23, 29, 0.06), 0 6px 14px -10px rgba(20, 23, 29, 0.12);
-    --elev-2: 0 2px 4px rgba(20, 23, 29, 0.08), 0 24px 48px -26px rgba(20, 23, 29, 0.24);
-  }
-
+/*
+ * 浅色主题：纸感 off-white，薄荷绿压暗保证对比度。
+ * 开关是 <html data-theme="light">（解析后的实际主题），由 index.html 头部的内联脚本
+ * 在样式表之前写入、public/app.js 的 applyTheme() 在运行时维护。
+ * 深色是 :root 基准，所以这里不需要 [data-theme='dark'] 规则。
+ */
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #f5f4ef;
+  --bg-soft: #fbfaf6;
+  --surface: #ffffff;
+  --surface-2: #f7f6f1;
+  --surface-3: #eeece4;
+  --text: #14171d;
+  --text-2: #4d5566;
+  --text-3: #767d8c;
+  --mint: #0f9d6f;
+  --mint-ink: #ffffff;
+  --danger: #d6453a;
+  --warn: #a9711a;
+  --info: #6b4fd0;
+  --hi: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --elev-1: 0 1px 2px rgba(20, 23, 29, 0.06), 0 6px 14px -10px rgba(20, 23, 29, 0.12);
+  --elev-2: 0 2px 4px rgba(20, 23, 29, 0.08), 0 24px 48px -26px rgba(20, 23, 29, 0.24);
   /* 浅色下描边 / 填充要更实一些，否则卡片边界几乎看不见 */
-  :root {
-    --line: rgba(20, 23, 29, 0.1);
-    --line-strong: rgba(20, 23, 29, 0.18);
-    --fill-1: rgba(20, 23, 29, 0.032);
-    --fill-2: rgba(20, 23, 29, 0.06);
-    --fill-3: rgba(20, 23, 29, 0.1);
-  }
+  --line: rgba(20, 23, 29, 0.1);
+  --line-strong: rgba(20, 23, 29, 0.18);
+  --fill-1: rgba(20, 23, 29, 0.032);
+  --fill-2: rgba(20, 23, 29, 0.06);
+  --fill-3: rgba(20, 23, 29, 0.1);
 }
 
 * {
@@ -664,6 +666,13 @@ body {
 .btn--primary:hover {
   background: color-mix(in srgb, var(--mint) 88%, var(--text));
   border-color: transparent;
+}
+
+/* 主题按钮：图标用语义色点一下即可，文案由 app.js 按当前选择刷新 */
+.theme-btn__icon {
+  font-size: 12px;
+  line-height: 1;
+  color: var(--mint);
 }
 
 kbd {

@@ -9,6 +9,17 @@ const VISIBLE_LOTS = 3;
 /** 合并卡片里默认展示的账号数，其余折叠 */
 const VISIBLE_ENTRIES = 2;
 
+/** 主题偏好存 localStorage 的键：必须与 public/index.html 头部内联脚本保持一致 */
+const THEME_STORAGE_KEY = 'power-meter.theme';
+/** 三态选择：auto 跟随系统 / light 强制浅色 / dark 强制深色 */
+const THEME_CHOICES = ['auto', 'light', 'dark'];
+/** 按钮文案与图标：label 显示「选择」，title 里再补充当前实际生效的主题 */
+const THEME_META = {
+  auto: { label: '自动', icon: '◐', title: '跟随系统主题' },
+  light: { label: '浅色', icon: '☀', title: '浅色主题' },
+  dark: { label: '深色', icon: '☾', title: '深色主题' },
+};
+
 /**
  * 来源文案：upstream = 平台明细接口，local = 本地采样兜底，
  * mixed = 两种来源都参与了判定（合并卡片里各账号来源不一致，或「今日」上游尚未出数、
@@ -67,6 +78,8 @@ const state = {
   sort: 'expiry',
   query: '',
   autoRefresh: true,
+  /** 主题选择：auto / light / dark（真值同步写在 <html data-theme-choice>，不另存一份） */
+  themeChoice: 'auto',
   timer: null,
   loading: false,
   /**
@@ -158,6 +171,9 @@ const els = {
   pageTitle: document.getElementById('page-title'),
   statusChip: document.getElementById('status-chip'),
   statusText: document.getElementById('status-text'),
+  themeBtn: document.getElementById('theme-btn'),
+  themeIcon: document.getElementById('theme-icon'),
+  themeLabel: document.getElementById('theme-label'),
   nav: document.getElementById('nav'),
   navPill: document.querySelector('#nav .nav__pill'),
   navGroupPlatforms: document.getElementById('nav-group-platforms'),
@@ -2685,6 +2701,9 @@ function buildCommands() {
     { label: '立即刷新数据', hint: '操作', run: () => void load(true) },
     { label: '打开平台与账号', hint: '操作', run: () => openPlatformsDialog() },
     { label: '切换自动刷新', hint: '操作', run: () => toggleAutoRefresh() },
+    { label: '主题：跟随系统', hint: '主题', run: () => setTheme('auto') },
+    { label: '主题：浅色', hint: '主题', run: () => setTheme('light') },
+    { label: '主题：深色', hint: '主题', run: () => setTheme('dark') },
   ];
   // 与子菜单首行同源：清空筛选，回到全部卡片
   items.push({ label: '显示全部平台', hint: '平台', run: () => filterByProvider('') });
@@ -2705,6 +2724,74 @@ function toggleAutoRefresh() {
   state.autoRefresh = next;
   if (els.autoRefresh) els.autoRefresh.checked = next;
   scheduleAutoRefresh();
+}
+
+/* ------------------------------ 主题切换 ------------------------------ */
+
+/** 系统深色偏好：既用于「自动」解析，也用于监听系统变化 */
+const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+
+/** 读取持久化的主题选择；localStorage 不可用或值非法时退回「自动」 */
+function storedThemeChoice() {
+  try {
+    const saved = localStorage.getItem(THEME_STORAGE_KEY);
+    if (THEME_CHOICES.includes(saved)) return saved;
+  } catch (error) {
+    /* 隐私模式下读取会抛：按自动处理，不影响本次会话内的切换 */
+  }
+  return 'auto';
+}
+
+/** 把「选择」解析成实际生效的主题（auto 交给系统偏好） */
+function effectiveTheme(choice) {
+  if (choice === 'auto') return darkQuery.matches ? 'dark' : 'light';
+  return choice;
+}
+
+/**
+ * 应用主题：<html data-theme> 是 CSS 的唯一开关（见 styles.css 的
+ * :root[data-theme='light']），data-theme-choice 只记录用户选择。
+ * persist 仅在用户主动切换时为 true；首屏同步与系统偏好变化不写存储。
+ */
+function applyTheme(choice, { persist = false } = {}) {
+  state.themeChoice = THEME_CHOICES.includes(choice) ? choice : 'auto';
+  const effective = effectiveTheme(state.themeChoice);
+  const root = document.documentElement;
+  root.dataset.theme = effective;
+  root.dataset.themeChoice = state.themeChoice;
+  if (persist) {
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, state.themeChoice);
+    } catch (error) {
+      /* 存不下就只在本次会话生效，界面表现没有差别 */
+    }
+  }
+
+  const meta = THEME_META[state.themeChoice];
+  const showing = effective === 'dark' ? '深色' : '浅色';
+  if (els.themeLabel) els.themeLabel.textContent = meta.label;
+  if (els.themeIcon) els.themeIcon.textContent = meta.icon;
+  if (els.themeBtn) {
+    els.themeBtn.title = `${meta.title}（当前显示${showing}，点击切换）`;
+    els.themeBtn.setAttribute('aria-label', `主题：${meta.label}，当前显示${showing}，点击切换`);
+  }
+}
+
+/**
+ * 顶栏按钮循环：自动 → 浅色 → 深色 → 自动。
+ * 从「自动」出发时先切到当前没生效的一侧，保证第一次点击一定有可见变化。
+ */
+function cycleTheme() {
+  const current = state.themeChoice;
+  let next;
+  if (current === 'auto') next = effectiveTheme('auto') === 'dark' ? 'light' : 'dark';
+  else next = current === 'light' ? 'dark' : 'auto';
+  applyTheme(next, { persist: true });
+}
+
+/** 命令面板用：直接指定选择，同样持久化 */
+function setTheme(choice) {
+  applyTheme(choice, { persist: true });
 }
 
 /** 按输入框关键词重建列表（label + hint 小写 includes；中文直接 includes） */
@@ -2907,6 +2994,14 @@ function bindShell() {
 
   // 子菜单若用 CSS 过渡展开，期间量到的是动画中间态：展开结束后再校一次
   els.navPlatforms?.addEventListener('transitionend', scheduleNavPill);
+
+  // 主题：按钮循环切换；系统偏好只在「自动」时跟随。
+  // 首屏颜色已由 index.html 头部内联脚本落好，这里只把存储值同步给按钮文案。
+  els.themeBtn?.addEventListener('click', cycleTheme);
+  darkQuery.addEventListener('change', () => {
+    if (state.themeChoice === 'auto') applyTheme('auto');
+  });
+  applyTheme(storedThemeChoice());
 }
 
 function scheduleAutoRefresh() {
