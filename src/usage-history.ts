@@ -14,6 +14,7 @@
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { resolveRuntimeDir } from './config.js';
 import { asNumber, isRecord } from './lib/json.js';
 import { startOfDay } from './usage-ledger.js';
 
@@ -48,9 +49,9 @@ function round(value: number): number {
   return Math.round(value * 100) / 100;
 }
 
-/** 采样文件路径：与 accounts.json 同样相对服务进程 cwd 定位（.run/ 已 gitignore） */
+/** 采样文件路径：锚定到配置目录（与 .env / accounts.json 同源），不依赖进程 cwd */
 export function resolveUsageHistoryPath(): string {
-  return resolve(process.cwd(), '.run', 'usage-history.json');
+  return resolve(resolveRuntimeDir(), 'usage-history.json');
 }
 
 export class UsageHistory {

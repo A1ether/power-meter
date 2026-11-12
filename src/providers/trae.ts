@@ -5,6 +5,7 @@ import { fetchJson, HttpError } from '../lib/http.js';
 import { firstNumber, firstString, isRecord, pick, toIso } from '../lib/json.js';
 import { startOfDay, type UsageLedger, type UsageRecord } from '../usage-ledger.js';
 import type { AccountConfig } from '../config.js';
+import { resolveRuntimeDir } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
 import {
   buildSnapshot,
@@ -120,7 +121,7 @@ export interface TraeLoginDeviceIdentity {
  * 私钥只在服务端用于 DeviceInfo / DeviceProof，不写日志、不下发前端。
  */
 export function traeLoginDeviceIdentity(providerId: string): TraeLoginDeviceIdentity {
-  const file = resolve(process.cwd(), '.run', 'login-device', `${providerId}.json`);
+  const file = resolve(resolveRuntimeDir(), 'login-device', `${providerId}.json`);
   try {
     const raw: unknown = JSON.parse(readFileSync(file, 'utf8'));
     if (isRecord(raw)) {

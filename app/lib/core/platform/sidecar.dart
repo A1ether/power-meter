@@ -56,12 +56,21 @@ class SidecarLauncher implements SidecarHandle {
 
     final configDir = await _prepareConfigDir();
     token = _randomToken();
-    final process = await Process.start(binary, [
-      '--port', '0',
-      '--no-static',
-      '--token', token,
-      '--config-dir', configDir.path,
-    ]);
+    final process = await Process.start(
+      binary,
+      [
+        '--port', '0',
+        '--no-static',
+        '--token', token,
+        '--config-dir', configDir.path,
+      ],
+      // 必须显式指定工作目录：不指定时 macOS 下子进程继承不到 .app 的 cwd，
+      // sidecar 会以「/」为工作目录运行 —— 服务端那些基于 process.cwd() 的运行时写入
+      // （.run/ 备份目录、用量采样、Trae 设备身份）会解析到根卷只读路径，
+      // 表现为登录报「EROFS: read-only file system, mkdir '/.run'」。
+      // 服务端已把 .run/ 锚定到 --config-dir，这里再设一次 cwd 是双保险。
+      workingDirectory: configDir.path,
+    );
     _process = process;
     final ready = Completer<Uri>();
 

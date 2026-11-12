@@ -18,7 +18,7 @@
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { loadDotEnv } from '../config.js';
+import { loadDotEnv, resolveRuntimeDir } from '../config.js';
 import {
   huaweiSignedFetch,
   type HuaweiSignInput,
@@ -26,7 +26,7 @@ import {
 } from '../lib/huaweicloud.js';
 
 const SNAP_ACCESS = 'https://snap-access.cn-north-4.myhuaweicloud.com';
-const DUMP_PATH = resolve(process.cwd(), '.run/codearts-statistics-plugin.json');
+const DUMP_PATH = resolve(resolveRuntimeDir(), 'codearts-statistics-plugin.json');
 
 interface ProbeItem {
   label: string;
@@ -106,7 +106,7 @@ function topKeys(json: unknown): string {
 }
 
 function dump(json: unknown): void {
-  mkdirSync(resolve(process.cwd(), '.run'), { recursive: true });
+  mkdirSync(resolveRuntimeDir(), { recursive: true });
   writeFileSync(DUMP_PATH, `${JSON.stringify(json, null, 2)}\n`);
   console.log(`  完整响应已写入：${DUMP_PATH}`);
 }

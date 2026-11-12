@@ -238,6 +238,89 @@ test('游标分页超上限：complete=false 且条数等于实际上限', async
   assert.equal(result.stoppedBy, 'max-pages');
 });
 
+/**
+ * ⑫ 原始条数口径（AGENTS.md §9 第 3 条）：
+ * 上游 `total` 是**原始条目数**，而解析层会丢弃无效条目（金额 ≤ 0、缺时间）。
+ * 若拿解析后的条数去比 `total`，永远差几条 → 永远判「未取全」→ 用量维度整体退回本地采样
+ * （桌面端 CodeBuddy 卡片「今日/昨日增量恒为 0」即此因）。
+ */
+test('原始条数口径：total 是原始条数、解析层过滤若干条时仍判取全', async () => {
+  // 上游共 235 条，每页各丢 1 条（模拟金额 ≤ 0 被解析层过滤）
+  const total = 235;
+  const pages = [100, 100, 35];
+  let served = 0;
+  const result = await fetchAllPages<Item>({
+    pageSize: 100,
+    maxPages: 10,
+    fetchPage: async (page) => {
+      const size = pages[page - 1] ?? 0;
+      const raw = Array.from({ length: size }, (_, i) => ({ id: `r${served + i}` }));
+      served += size;
+      const items = raw.slice(0, Math.max(0, size - 1));
+      return { items, total, rawCount: size };
+    },
+  });
+  assert.equal(result.expected, 235);
+  assert.equal(result.complete, true, '原始条数够了就该判取全（解析层过滤不算缺额）');
+  assert.equal(result.items.length, 232, '有效条数 = 原始 235 - 每页各丢 1 条（共 3 条）');
+});
+
+/** ⑬ 反向：原始条数确实少于上游声称的 total 时，必须判未取全（不能放宽成取全） */
+test('原始条数口径：原始条数不足 total 时仍判未取全', async () => {
+  // 上游声称 235 条，实际只给了 150 条原始数据（翻到第 3 页就是空的）
+  const pageSizes = [100, 50, 0];
+  let served = 0;
+  const result = await fetchAllPages<Item>({
+    pageSize: 100,
+    maxPages: 10,
+    fetchPage: async (page) => {
+      const size = pageSizes[page - 1] ?? 0;
+      const raw = Array.from({ length: size }, (_, i) => ({ id: `r${served + i}` }));
+      served += size;
+      return { items: raw.slice(0, Math.max(0, size - 1)), total: 235, rawCount: size };
+    },
+  });
+  assert.equal(result.complete, false, '原始条数不足时不得判取全');
+  assert.notEqual(result.stoppedBy, 'total');
+});
+
+/**
+ * ⑭ 保守规则：原始条数**超过** total（上游没识别分页参数、同一页被重复取回）时，
+ * 不得凭虚增的原始条数判取全。
+ */
+test('原始条数口径：原始条数虚增（分页参数未识别）时不得误判取全', async () => {
+  const result = await fetchAllPages<Item>({
+    pageSize: 100,
+    maxPages: 10,
+    keyOf: (item) => item.id,
+    fetchPage: async () => {
+      // 每页都返回同一批 100 条（rawCount 累加到 500 > total 235）
+      const raw = Array.from({ length: 100 }, (_, i) => ({ id: `r${i}` }));
+      return { items: raw.slice(0, 99), total: 235, rawCount: 100 };
+    },
+  });
+  assert.equal(result.complete, false, '原始条数虚增时不得判取全');
+  assert.notEqual(result.stoppedBy, 'total');
+});
+
+/** ⑮ 不传 rawCount 时行为与修复前完全一致（解析后条数口径，缺额要暴露） */
+test('未传 rawCount：仍按解析后条数判定，缺额如实判未取全', async () => {
+  const pageSizes = [100, 50, 0];
+  let served = 0;
+  const result = await fetchAllPages<Item>({
+    pageSize: 100,
+    maxPages: 10,
+    fetchPage: async (page) => {
+      const size = pageSizes[page - 1] ?? 0;
+      const raw = Array.from({ length: size }, (_, i) => ({ id: `r${served + i}` }));
+      served += size;
+      return { items: raw.slice(0, Math.max(0, size - 1)), total: 235 };
+    },
+  });
+  assert.equal(result.complete, false, '未提供 rawCount 时不得放宽取全判据');
+  assert.notEqual(result.stoppedBy, 'total');
+});
+
 let failed = 0;
 for (const item of cases) {
   try {

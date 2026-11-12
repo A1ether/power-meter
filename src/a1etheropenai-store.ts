@@ -13,7 +13,7 @@
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { loadConfig, loadDotEnv, resolveDotEnvPath } from './config.js';
+import { loadConfig, loadDotEnv, resolveDotEnvPath, resolveRuntimeDir } from './config.js';
 import { maskSecret } from './providers/base.js';
 import { a1etheropenaiAdapter, normalizeApiKey } from './providers/a1etheropenai.js';
 import type { ProviderSnapshot } from './types.js';
@@ -144,8 +144,7 @@ export function writeAccountsFile(file: AccountsFile): void {
  */
 export function backupBeforeWrite(op: string, label = 'a1etheropenai'): string {
   const dir = resolve(
-    process.cwd(),
-    '.run',
+    resolveRuntimeDir(),
     `${label}-${op}-${new Date().toISOString().replace(/[:.]/g, '-')}`,
   );
   mkdirSync(dir, { recursive: true });

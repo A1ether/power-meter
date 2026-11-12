@@ -43,8 +43,15 @@ export interface PagedResult<T> {
 }
 
 export interface PagedOptions<T> {
-  /** 单页拉取：返回本页条目与上游 total（拿不到给 null） */
-  fetchPage: (page: number) => Promise<{ items: T[]; total: number | null }>;
+  /**
+   * 单页拉取：返回本页条目与上游 total（拿不到给 null）。
+   *
+   * `rawCount` 是**上游原始条目数**（即接口实际返回的数组长度，尚未经过解析层过滤）。
+   * 提供它时，「是否取全」的进度判定改用原始条数与 `total` 比较 —— 这解决了
+   * 「解析层丢弃无效条目（金额 ≤ 0、缺时间）导致永远差几条、永远判未取全」的问题
+   * （AGENTS.md §9 第 3 条）。不提供时退回用 `items.length`（既有行为不变）。
+   */
+  fetchPage: (page: number) => Promise<{ items: T[]; total: number | null; rawCount?: number }>;
   pageSize: number;
   /** 翻页上限，防御上游忽略分页参数导致的死循环 */
   maxPages?: number;
@@ -73,6 +80,14 @@ export async function fetchAllPages<T>(options: PagedOptions<T>): Promise<PagedR
   const items: T[] = [];
   let expected: number | null = null;
   let pages = 0;
+  /**
+   * 已取到的**原始**条目数（未经解析层过滤）。
+   *
+   * 调用方传了 `rawCount` 时用它，否则用解析后的条数 —— 这样「上游 total 是原始条数、
+   * 而解析层会丢弃无效条目」的场景也能正确判取全（AGENTS.md §9 第 3 条）。
+   * `null` 表示没有任何一页提供过 rawCount（此时退回 items.length）。
+   */
+  let rawTotal: number | null = null;
 
   const push = (page: T[]): number => {
     if (!keyOf) {
@@ -90,11 +105,28 @@ export async function fetchAllPages<T>(options: PagedOptions<T>): Promise<PagedR
     return added;
   };
 
-  /** 有 total 就以 total 为准；没有 total 时，短页即末页 */
-  const reachedTotal = (): boolean => expected !== null && items.length >= expected;
+  /**
+   * 有 total 就以 total 为准；没有 total 时，短页即末页。
+   *
+   * 进度计数优先用原始条数：解析层丢弃的条目（金额 ≤ 0、缺时间等）**不能**用来判断
+   * 是否已到末页 —— 否则「上游声称 235 条、解析后剩 234 条」会被永远判成未取全。
+   *
+   * 保守规则：原始条数**超过**上游声称的 total 时，说明有两种可能：
+   * 分页参数没被上游识别（同一页被重复取回，原始条数虚增）、或翻页期间上游 total 变了。
+   * 这时不能只凭原始条数判取全，退回用去重后的有效条数比较。
+   */
+  const reachedTotal = (): boolean => {
+    if (expected === null) return false;
+    const raw = rawTotal;
+    if (raw !== null) {
+      if (raw > expected) return items.length >= expected;
+      if (raw >= expected) return true;
+    }
+    return items.length >= expected;
+  };
 
   for (let page = 1; page <= maxPages; page += 1) {
-    let payload: { items: T[]; total: number | null };
+    let payload: { items: T[]; total: number | null; rawCount?: number };
     try {
       payload = await fetchPage(page);
     } catch (error) {
@@ -105,6 +137,10 @@ export async function fetchAllPages<T>(options: PagedOptions<T>): Promise<PagedR
     }
     pages = page;
     if (payload.total !== null && Number.isFinite(payload.total)) expected = payload.total;
+    // 原始条数累加：只在调用方给了 rawCount 时才有意义（未给则保持 null → 用 items.length）
+    if (typeof payload.rawCount === 'number' && Number.isFinite(payload.rawCount)) {
+      rawTotal = (rawTotal ?? 0) + payload.rawCount;
+    }
 
     const added = push(payload.items);
     // 调用方声明「需要的窗口已被这批记录覆盖」→ 判取全并停（见 PagedOptions.stopWhen）
@@ -121,8 +157,9 @@ export async function fetchAllPages<T>(options: PagedOptions<T>): Promise<PagedR
     if (reachedTotal()) {
       return { items, expected, complete: true, pages, stoppedBy: 'total', error: null };
     }
-    if (payload.items.length === 0) {
+    if (payload.items.length === 0 && (payload.rawCount ?? 0) === 0) {
       // 空页：上游已无更多数据。若 total 声称还有，说明被过滤/参数未被识别
+      // （rawCount > 0 而 items 为空 = 本页条目全被解析层过滤掉，不算空页）
       return {
         items,
         expected,
@@ -136,7 +173,9 @@ export async function fetchAllPages<T>(options: PagedOptions<T>): Promise<PagedR
     if (keyOf && added === 0) {
       return { items, expected, complete: reachedTotal(), pages, stoppedBy: 'no-progress', error: null };
     }
-    if (payload.items.length < pageSize) {
+    // 短页判定也看原始条数：解析层过滤掉的条目不应让「本页不满」被误判成满页
+    const pageRawLength = payload.rawCount ?? payload.items.length;
+    if (pageRawLength < pageSize) {
       // 短页：正常语义是「最后一页」。但有 total 且没达到时**不判取全** ——
       // 上游可能按 status 过滤掉了部分记录，此时「没有更多页」不等于「没有更多数据」。
       // 没有 total 时短页即可确认取全（后面不会再有数据）。

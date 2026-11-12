@@ -644,7 +644,10 @@ async function cbTokenRequestUsage(
             items.push({ at: Date.parse(at), kind: 'use', amount });
           }
         }
-        return { items, total };
+        // rawCount = 上游原始条数：`total` 是原始口径，而解析层会丢掉金额 ≤ 0 / 缺时间的条目。
+        // 若用解析后的条数去比 `total`，永远差几条 → 永远判未取全 → use 维度整体退回本地采样
+        // （AGENTS.md §9 第 3 条：翻页进度按原始条目数判定）。
+        return { items, total, rawCount: Array.isArray(list) ? list.length : 0 };
       },
     });
     if (!result.complete) {
@@ -1160,7 +1163,9 @@ function createCodeBuddyAdapter(siteId: CodeBuddySiteId): ProviderAdapter {
               items.push({ at: Date.parse(at), kind: 'use', amount });
             }
           }
-          return { items, total };
+          // rawCount = 上游原始条数（`total` 是原始口径，解析层会过滤无效条目）。
+          // 见令牌模式同处注释与 AGENTS.md §9 第 3 条。
+          return { items, total, rawCount: Array.isArray(list) ? list.length : 0 };
         },
       });
       records.push(...usePages.items);

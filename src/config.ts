@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { isRecord } from './lib/json.js';
 
 export interface AccountConfig {
@@ -66,6 +66,34 @@ export function resolveDotEnvPath(file = '.env'): string {
   return resolve(dotEnvDir, file);
 }
 
+/** --config-dir 显式指定的配置目录（未指定时为 null，走 ACCOUNTS_PATH / cwd 回退） */
+let configDir: string | null = null;
+
+/**
+ * 运行时目录（`.run/`）的绝对路径。
+ *
+ * 与 `.env` / `accounts.json` 同源锚定到配置目录，**不再依赖进程 cwd**。
+ *
+ * 为什么：桌面版（Flutter 外壳）拉起 sidecar 时若没指定 workingDirectory，
+ * 子进程在 macOS 下会以 `/` 为 cwd；此时 `resolve(process.cwd(), '.run', …)`
+ * 解析成 `/.run`，而根卷只读 → 备份目录、用量采样、Trae 设备身份全部写失败
+ * （表现为登录报 `EROFS: read-only file system, mkdir '/.run'`）。
+ * 锚到配置目录后，cwd 是什么都不影响落盘位置。
+ *
+ * 基准目录的优先级（与 `--config-dir` 的语义一致）：
+ *   1. `--config-dir` 显式指定；
+ *   2. `ACCOUNTS_PATH` 所在目录（显式指定账号文件时，运行时产物跟着它走）；
+ *   3. 进程 cwd（缺省，CLI / 本机跑服务的既有行为不变）。
+ */
+export function resolveRuntimeDir(name = '.run'): string {
+  if (configDir) return resolve(configDir, name);
+  const accountsPath = process.env.ACCOUNTS_PATH;
+  if (accountsPath) {
+    return resolve(dirname(resolve(process.cwd(), accountsPath)), name);
+  }
+  return resolve(dotEnvDir, name);
+}
+
 /**
  * 解析 sidecar 相关 CLI 参数与环境变量，并就地生效配置目录重定位。
  * 必须在 loadConfig() 之前调用（loadConfig 会先跑 loadDotEnv，依赖重定位后的目录）。
@@ -116,6 +144,7 @@ export function parseSidecarOptions(argv: string[] = process.argv.slice(2)): Sid
       const dir = resolve(takeValue(i, '--config-dir='));
       if (arg === '--config-dir') i += 1;
       dotEnvDir = dir;
+      configDir = dir;
       // 仅当用户没有显式指定 ACCOUNTS_PATH 时，才把账号文件锚定到 config-dir；
       // 显式的 ACCOUNTS_PATH 永远优先（无论是相对还是绝对，保持原有 cwd 语义）。
       if (!process.env.ACCOUNTS_PATH) {
