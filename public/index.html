@@ -7,21 +7,22 @@
     <script>
       /*
        * 主题首帧：必须在样式表之前落 data-theme，否则浅色用户会先看到一帧深色。
-       * 存储键与 public/app.js 的 THEME_STORAGE_KEY 必须一致；
-       * 缺失 / 非法值一律视为「自动」，由 prefers-color-scheme 决定。
+       * 存储键与 public/app.js 的 THEME_STORAGE_KEY 必须一致。
+       *
+       * 默认是「浅色」而不是「自动」：看板的视觉基准是 BoardUI 的浅色系统，
+       * 系统深色的用户首次打开也应先看到设计基准，需要深色再点顶栏切一次。
+       * 已显式选择过（light / dark）的用户始终按自己的选择走。
        */
       (function () {
         try {
           var saved = localStorage.getItem('power-meter.theme');
-          var choice = saved === 'light' || saved === 'dark' ? saved : 'auto';
-          var dark =
-            choice === 'dark' ||
-            (choice === 'auto' && !window.matchMedia('(prefers-color-scheme: light)').matches);
+          var choice = saved === 'light' || saved === 'dark' ? saved : 'light';
           document.documentElement.dataset.themeChoice = choice;
-          document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+          document.documentElement.dataset.theme = choice;
         } catch (error) {
-          /* localStorage 不可用（隐私模式 / 被禁用）时按深色基准渲染，运行时仍可切换 */
-          document.documentElement.dataset.theme = 'dark';
+          /* localStorage 不可用（隐私模式 / 被禁用）时按浅色基准渲染，运行时仍可切换 */
+          document.documentElement.dataset.themeChoice = 'light';
+          document.documentElement.dataset.theme = 'light';
         }
       })();
     </script>
@@ -51,9 +52,20 @@
           <!-- 初始 is-hidden：尺寸为 0 时若还带描边，会在导航左上角留下一个像素点 -->
           <span class="nav__pill is-hidden" aria-hidden="true"></span>
 
+          <!-- 第一项就是「最先到期」：与页面首屏区块同序 -->
+          <a class="nav__item" href="#timeline-panel" data-nav-item data-target="timeline-panel">
+            <span class="nav__label">最先到期</span>
+            <span class="nav__badge nav__badge--warn" id="nav-badge-timeline">–</span>
+          </a>
+
           <a class="nav__item" href="#overview" data-nav-item data-target="summary">
             <span class="nav__label">总览</span>
             <span class="nav__badge" id="nav-badge-platforms">–</span>
+          </a>
+
+          <a class="nav__item" href="#providers" data-nav-item data-target="providers">
+            <span class="nav__label">额度卡片</span>
+            <span class="nav__badge" id="nav-badge-providers">–</span>
           </a>
 
           <button class="nav__item nav__item--group" type="button" id="nav-group-platforms"
@@ -63,16 +75,6 @@
           </button>
           <!-- 就地展开的子菜单：一行一个平台，右侧是它的到期状态点 -->
           <div class="nav__sub" id="nav-platforms" hidden></div>
-
-          <a class="nav__item" href="#providers" data-nav-item data-target="providers">
-            <span class="nav__label">额度卡片</span>
-            <span class="nav__badge" id="nav-badge-providers">–</span>
-          </a>
-
-          <a class="nav__item" href="#timeline-panel" data-nav-item data-target="timeline-panel">
-            <span class="nav__label">到期时间线</span>
-            <span class="nav__badge nav__badge--warn" id="nav-badge-timeline">–</span>
-          </a>
 
           <a class="nav__item" href="#diagnostics-panel" data-nav-item data-target="diagnostics-panel">
             <span class="nav__label">诊断</span>
@@ -110,18 +112,46 @@
               <span>搜索</span><kbd>⌘K</kbd>
             </button>
             <button class="btn" id="platforms-btn" type="button">平台与账号</button>
+            <!--
+              真开关：input 只做语义与焦点载体（视觉隐藏），轨道与滑块由样式画，
+              位置靠 input:checked + .switch__track 驱动，不改任何既有 id / 事件绑定。
+            -->
             <label class="switch" title="每 5 分钟自动刷新">
               <input type="checkbox" id="auto-refresh" checked />
-              <span>自动刷新</span>
+              <span class="switch__track" aria-hidden="true"><span class="switch__thumb"></span></span>
+              <span class="switch__label">自动刷新</span>
             </label>
             <button class="btn btn--primary" id="refresh-btn" type="button">立即刷新</button>
           </div>
         </header>
 
         <main class="wrap">
-          <section class="summary" id="summary" data-section="summary" aria-label="总体汇总"></section>
+          <!--
+            页面第一屏 = 最先到期。打开看板要回答的两个问题都在这块里：
+              1. 最先到期的是哪几个供应商（每行左侧的平台名 + 按日期分组）；
+              2. 那几笔具体什么时候过期（每行的「今天 21:43」+ 倒计时）。
+            数据来自 /api/summary 的 expiryTimeline（后端已按 expiresAt 升序），
+            这里只做分组与折叠，不重排语义。id 保持 timeline-panel，导航/命令面板不受影响。
+          -->
+          <section class="panel panel--expiry" id="timeline-panel" data-section="timeline-panel"
+                   aria-label="最先到期">
+            <div class="panel__head panel__head--split">
+              <div>
+                <h2>最先到期</h2>
+                <p class="muted" id="expiry-summary">按过期时间升序，优先消耗排在最前面的积分</p>
+              </div>
+              <!--
+                展开按钮常驻在标题行右侧（不在列表末尾）：
+                展开 30 行后按钮不会被推到列表底部，用户不必滚回去才能收起。
+                显隐与文案由 renderTimeline 维护。
+              -->
+              <button class="expiry__toggle" type="button" id="expiry-toggle"
+                      aria-expanded="false" hidden>展开</button>
+            </div>
+            <div class="expiry" id="timeline"></div>
+          </section>
 
-          <section class="alert" id="alert" data-section="alert" hidden></section>
+          <section class="summary" id="summary" data-section="summary" aria-label="总体汇总"></section>
 
           <section class="toolbar" data-section="toolbar" aria-label="排序与筛选">
             <div class="toolbar__group">
@@ -146,14 +176,6 @@
 
           <section class="grid" id="grid" data-section="providers" aria-live="polite"></section>
 
-          <section class="panel" id="timeline-panel" data-section="timeline-panel" aria-label="到期时间线">
-            <div class="panel__head">
-              <h2>到期时间线</h2>
-              <p class="muted">按过期时间升序，优先消耗排在最前面的积分</p>
-            </div>
-            <ol class="timeline" id="timeline"></ol>
-          </section>
-
           <section class="panel" id="diagnostics-panel" data-section="diagnostics-panel" aria-label="诊断信息">
             <div class="panel__head">
               <h2>诊断</h2>
@@ -173,9 +195,9 @@
     <!-- 移动端底部停靠栏（教程「底部停靠栏」）：≤1024px 时替代左侧导航 -->
     <nav class="dock" id="dock" aria-label="快捷导航">
       <span class="dock__pill is-hidden" aria-hidden="true"></span>
+      <button class="dock__item" type="button" data-nav-item data-target="timeline-panel">到期</button>
       <button class="dock__item" type="button" data-nav-item data-target="summary">总览</button>
       <button class="dock__item" type="button" data-nav-item data-target="providers">额度</button>
-      <button class="dock__item" type="button" data-nav-item data-target="timeline-panel">时间线</button>
       <button class="dock__item" type="button" id="dock-cmd">搜索</button>
     </nav>
 

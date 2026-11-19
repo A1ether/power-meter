@@ -78,8 +78,11 @@ const state = {
   sort: 'expiry',
   query: '',
   autoRefresh: true,
-  /** 主题选择：auto / light / dark（真值同步写在 <html data-theme-choice>，不另存一份） */
-  themeChoice: 'auto',
+  /**
+   * 主题选择：light / dark / auto（真值同步写在 <html data-theme-choice>，不另存一份）。
+   * 初始值取浅色，与 index.html 首帧脚本的兜底一致；bindShell 里会按 localStorage 覆写。
+   */
+  themeChoice: 'light',
   timer: null,
   loading: false,
   /**
@@ -131,6 +134,11 @@ const state = {
    * 反复重建这个子菜单，展开态写进 DOM 会被下一次渲染重置。
    */
   navPlatformsOpen: false,
+  /**
+   * 「最先到期」清单是否已展开到全部（默认只放前 MAX_VISIBLE_EXPIRY 笔）。
+   * 存 state 而不是 DOM：自动刷新会整块重建，展开态写在 DOM 上会被重置。
+   */
+  expiryExpanded: false,
   /** 当前 scrollspy 命中的导航目标（data-target 值）；null 表示还没算过 */
   activeTarget: null,
   /** 命令面板当前这一屏的命令（见 buildCommands），index 是选中项 */
@@ -148,7 +156,8 @@ const LOGIN_POLL_MS = 1_500;
 
 const els = {
   summary: document.getElementById('summary'),
-  alert: document.getElementById('alert'),
+  expirySummary: document.getElementById('expiry-summary'),
+  expiryToggle: document.getElementById('expiry-toggle'),
   grid: document.getElementById('grid'),
   timeline: document.getElementById('timeline'),
   diagnostics: document.getElementById('diagnostics'),
@@ -235,11 +244,19 @@ function pluralize(days) {
   return `${Math.round(abs)} 天`;
 }
 
+/**
+ * 倒计时文案。
+ *
+ * 48 小时以内一律按**小时**报，不按天取整：否则「明天 23:59」会被说成
+ * 「2 天后到期」，与左边的「明天」分组直接打架（这是分组上线后暴露的口径冲突）。
+ * 超过 48 小时才回到天，此时「N 天后」与分组不会矛盾。
+ */
 function expiryText(inDays) {
   if (inDays === null || inDays === undefined || Number.isNaN(inDays)) return '无过期时间';
   if (inDays < 0) return `已过期 ${pluralize(inDays)}`;
   if (inDays < 1 / 24) return '不足 1 小时';
-  return `${pluralize(inDays)}后到期`;
+  if (inDays < 2) return `${Math.max(1, Math.round(inDays * 24))} 小时后到期`;
+  return `${Math.round(inDays)} 天后到期`;
 }
 
 function levelFor(inDays, thresholds) {
@@ -335,11 +352,11 @@ async function load(force = false) {
 function render() {
   const data = state.data;
   if (!data) return;
+  // 顺序即优先级：先「最先到期」，再汇总，再卡片
+  renderTimeline(data);
   renderSummary(data);
-  renderAlert(data);
   renderSortOptions(data);
   renderGrid(data);
-  renderTimeline(data);
   renderDiagnostics(data);
   // 外壳（导航徽标 / 平台子菜单 / 状态条）跟着同一份数据走，放在业务渲染之后
   renderShell(data);
@@ -349,13 +366,63 @@ function render() {
   els.footerUpdated.textContent = `数据生成于 ${fmtDate(data.generatedAt)}`;
 }
 
+/**
+ * 数值弹簧（与 Bencho 的弹簧积分器同构）：把 node.textContent 从「上一次显示的值」
+ * 平滑推到目标值，而不是刷新时瞬间跳变。
+ *
+ * 口径：
+ *   - 键不存在（首屏）→ 直接落值，不做「从 0 滚上来」；
+ *   - 目标与上次相同 → 直接落值，省掉一次 rAF 循环；
+ *   - prefers-reduced-motion → 直接落值。
+ * 刚度 0.18 / 阻尼 0.72：约 600ms 收敛，看得见节奏但不拖沓。
+ * 只改 textContent，不碰任何布局或内联样式。
+ */
+const springValues = new Map();
+const reducedMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+const SPRING_STIFFNESS = 0.18;
+const SPRING_DAMPING = 0.72;
+
+function springTo(node, key, target, format) {
+  if (!node) return;
+  const previous = springValues.get(key);
+  springValues.set(key, target);
+  if (
+    previous === undefined ||
+    !Number.isFinite(previous) ||
+    previous === target ||
+    reducedMotionQuery.matches
+  ) {
+    node.textContent = format(target);
+    return;
+  }
+  let value = previous;
+  let velocity = 0;
+  let last = performance.now();
+  const step = (now) => {
+    // 卡片整块重建后旧节点已脱离文档：停掉循环，别在游离节点上空转
+    if (!node.isConnected) return;
+    // dt 按 16.67ms 归一，并夹到 2.5：标签页切回来时不会一帧跳过整段
+    const frames = Math.min(Math.max((now - last) / 16.67, 0), 2.5);
+    last = now;
+    velocity = (velocity + (target - value) * SPRING_STIFFNESS * frames) * SPRING_DAMPING ** frames;
+    value += velocity * frames;
+    if (Math.abs(target - value) < 0.01 && Math.abs(velocity) < 0.01) {
+      node.textContent = format(target);
+      return;
+    }
+    node.textContent = format(value);
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
 function renderSummary(data) {
   const { totals, expiryThresholds, expiryTimeline } = data;
   els.summary.replaceChildren();
 
   const availableRows = Object.entries(totals.availableByCurrency ?? {})
     .filter(([, amount]) => amount > 0)
-    .map(([currency, amount]) => ({ unit: currency, amount: fmtNumber(amount) }));
+    .map(([currency, amount]) => ({ unit: currency, amount }));
 
   const critical = expiryTimeline.filter(
     (hit) => hit.inDays <= expiryThresholds.criticalDays,
@@ -366,21 +433,29 @@ function renderSummary(data) {
   ).length;
 
   const stats = [
-    { label: '平台总数', value: String(totals.providers), hint: `${totals.ok} 正常 / ${totals.failed} 异常` },
     {
+      key: 'providers',
+      label: '平台总数',
+      value: totals.providers,
+      hint: `${totals.ok} 正常 / ${totals.failed} 异常`,
+    },
+    {
+      key: 'available',
       label: '可用额度合计',
-      rows: availableRows.length > 0 ? availableRows : [{ unit: '', amount: '–' }],
+      rows: availableRows,
       hint: '各币种余额独立汇总，数值之间互不换算',
     },
     {
+      key: 'critical',
       label: `≤${expiryThresholds.criticalDays} 天到期`,
-      value: String(critical),
+      value: critical,
       hint: `${expiryThresholds.criticalDays}~${expiryThresholds.warningDays} 天内还有 ${warning} 笔`,
       accent: critical > 0,
     },
     {
+      key: 'lots',
       label: '到期批次总数',
-      value: String(expiryTimeline.length),
+      value: expiryTimeline.length,
       hint: '只统计仍可用的积分批次',
     },
   ];
@@ -390,45 +465,34 @@ function renderSummary(data) {
     card.append(element('span', 'stat__label', stat.label));
     if (stat.rows) {
       const rows = element('div', 'stat__rows');
+      if (stat.rows.length === 0) {
+        const rowEl = element('div', 'stat__row');
+        rowEl.append(element('span'), element('span', 'stat__row-amount', '–'));
+        rows.append(rowEl);
+      }
       for (const row of stat.rows) {
         const rowEl = element('div', 'stat__row');
+        const amount = element('span', 'stat__row-amount');
         rowEl.append(
           row.unit ? element('span', 'stat__row-unit', row.unit) : element('span'),
-          element('span', 'stat__row-amount', row.amount),
+          amount,
         );
         rows.append(rowEl);
+        springTo(amount, `summary:${stat.key}:${row.unit}`, row.amount, fmtNumber);
       }
       card.append(rows);
     } else {
-      card.append(element('span', 'stat__value', stat.value));
+      const value = element('span', 'stat__value');
+      card.append(value);
+      springTo(value, `summary:${stat.key}`, stat.value, fmtNumber);
     }
-    card.append(element('span', 'stat__hint', stat.hint));
+    // 口径说明收进页脚条带（BoardUI 统计卡的 footer 变体）
+    const foot = element('div', 'stat__foot');
+    foot.append(element('span', 'stat__hint', stat.hint));
+    card.append(foot);
     els.summary.append(card);
   }
   applyStagger(els.summary, 'summary');
-}
-
-function renderAlert(data) {
-  const next = data.nextExpiry;
-  if (!next) {
-    els.alert.hidden = true;
-    return;
-  }
-  const level = levelFor(next.inDays, data.expiryThresholds);
-  els.alert.hidden = false;
-  els.alert.className = `alert${level === 'critical' ? ' alert--danger' : level === 'warning' ? ' alert--warning' : ''}`;
-  els.alert.replaceChildren();
-
-  const body = element('div', 'alert__body');
-  body.append(
-    element('strong', null, `最快到期：${next.displayName} · ${next.lotLabel}`),
-    element(
-      'p',
-      null,
-      `${fmtNumber(next.amount)} ${next.currency} 将于 ${fmtDate(next.expiresAt)} 到期（${expiryText(next.inDays)}），建议优先使用。`,
-    ),
-  );
-  els.alert.append(element('span', 'alert__icon', level === 'critical' ? '🔥' : '⏳'), body);
 }
 
 function renderSortOptions(data) {
@@ -2239,38 +2303,171 @@ async function copyText(value) {
   }
 }
 
+/**
+ * 最先到期清单（页面第一屏）。
+ *
+ * 从「打开看板要做什么」倒推，只需要回答两件事：
+ *   1. **哪几个供应商**最先到期 → 每行左侧是平台名，右侧按天分组给出「今天 / 明天 / 11/21」；
+ *   2. **那几笔具体什么时候**过期 → 每行给出「21:43」这样的具体时刻 + 倒计时。
+ *
+ * 两档都是「天数窗口」，不是「前 N 笔」：
+ *   - 收起（默认）= 今天 + 明天，只回答「最先到期的是哪几笔」；
+ *   - 展开 = 最近 5 天，够用来安排这一周用掉什么。
+ * 展开**不会**列出全部：一次铺 168 笔既读不完，也会把「展开」变成
+ * 一个比滚动还累的操作。5 天之外的数据留给卡片区与筛选。
+ * 用天数而不是笔数，是因为笔数是任意截断，用户看不出「为什么停在这里」。
+ */
+const EXPIRY_DEFAULT_DAYS = 2;
+const EXPIRY_MAX_DAYS = 5;
+
+/** 把 ISO 时刻拆成「今天 21:43」「明天 08:43」「11/21 17:26」三种口语化形式 */
+function expiryMoment(iso) {
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) return { day: '未知', clock: '', dayKey: 'unknown' };
+  const at = new Date(ts);
+  const now = new Date();
+  const startOf = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const diffDays = Math.round((startOf(at) - startOf(now)) / 86_400_000);
+  const clock = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`;
+  const dayKey = `${at.getFullYear()}-${at.getMonth() + 1}-${at.getDate()}`;
+
+  if (diffDays < 0) return { day: '已过期', clock, dayKey };
+  if (diffDays === 0) return { day: '今天', clock, dayKey };
+  if (diffDays === 1) return { day: '明天', clock, dayKey };
+  if (diffDays === 2) return { day: '后天', clock, dayKey };
+  return {
+    day: `${String(at.getMonth() + 1).padStart(2, '0')}/${String(at.getDate()).padStart(2, '0')}`,
+    clock,
+    dayKey,
+  };
+}
+
 function renderTimeline(data) {
-  const hits = data.expiryTimeline;
+  /*
+   * 前端再排一次序，不只依赖后端顺序：
+   * 后端按 expiresAt 的绝对值升序，但这里展示的是**本地时区**的时刻；
+   * 跨时区/夏令时的数据经过本地化后，组内顺序可能与上游不一致。
+   * 排序是纯函数、代价可忽略，换来「组内一定按时间从上到下」这个可读性保证。
+   */
+  const hits = [...(data.expiryTimeline ?? [])].sort(
+    (a, b) => Date.parse(a.expiresAt) - Date.parse(b.expiresAt),
+  );
   els.timeline.replaceChildren();
+
   if (hits.length === 0) {
-    els.timeline.append(element('li', 'muted', '暂无可用的到期信息'));
+    els.timeline.append(element('p', 'expiry__empty muted', '暂无可用的到期信息'));
     els.timeline.dataset.enter = 'instant';
+    if (els.expirySummary) els.expirySummary.textContent = '没有任何带过期时间的积分批次';
     return;
   }
 
-  const fragment = document.createDocumentFragment();
-  for (const hit of hits) {
-    const level = levelFor(hit.inDays, data.expiryThresholds);
-    const item = element('li');
-    item.dataset.level = level;
+  const thresholds = data.expiryThresholds;
+  const criticalCount = hits.filter((hit) => levelFor(hit.inDays, thresholds) === 'critical').length;
 
-    // 额度 + 人民币估值：估值与口径来自后端（src/credit-value.ts），前端只负责显示
-    const amount = element('span', 'timeline__amount', `${fmtNumber(hit.amount)} ${hit.currency}`);
-    if (typeof hit.cny === 'number') {
-      const cny = element('em', 'timeline__cny', `≈ ${fmtCny(hit.cny)}`);
-      if (hit.cnyNote) cny.title = hit.cnyNote;
-      amount.append(' ', cny);
-    }
+  // 两档窗口的笔数：收起看 2 天，展开看 5 天
+  const visibleDays = state.expiryExpanded ? EXPIRY_MAX_DAYS : EXPIRY_DEFAULT_DAYS;
+  const inVisible = hits.filter((hit) => hit.inDays <= visibleDays);
+  const inMax = hits.filter((hit) => hit.inDays <= EXPIRY_MAX_DAYS);
+  // 「展开后还能多看到几笔」：只统计 2 天之外、5 天之内那段
+  const hiddenCount = inMax.length - inVisible.length;
 
-    item.append(
-      element('span', 'timeline__when', fmtDate(hit.expiresAt)),
-      element('span', 'timeline__name', `${hit.displayName} · ${hit.lotLabel}`),
-      amount,
-      element('span', 'timeline__badge', expiryText(hit.inDays)),
-    );
-    fragment.append(item);
+  // 摘要：先给结论（几笔、最早几时），再给当前窗口内的笔数
+  if (els.expirySummary) {
+    const first = expiryMoment(hits[0].expiresAt);
+    els.expirySummary.textContent =
+      `${hits.length} 笔待消耗 · 最近一笔 ${first.day} ${first.clock} 过期 · ` +
+      `未来 ${visibleDays} 天内有 ${inVisible.length} 笔`;
   }
+
+  // 展开按钮挂在面板标题行右侧：展开 30 行后按钮不会被推到列表底部，
+  // 用户不必滚回去才能收起（这是旧版把按钮放在列表末尾的直接后果）。
+  if (els.expiryToggle) {
+    // 2 天内已经覆盖全部可显示范围时，展开按钮没有意义，直接隐藏
+    const canExpand = hiddenCount > 0;
+    els.expiryToggle.hidden = !(canExpand || state.expiryExpanded);
+    els.expiryToggle.textContent = state.expiryExpanded
+      ? `只看 ${EXPIRY_DEFAULT_DAYS} 天 ⌃`
+      : `展开到 ${EXPIRY_MAX_DAYS} 天（+${hiddenCount} 笔）⌄`;
+    els.expiryToggle.setAttribute('aria-expanded', String(state.expiryExpanded));
+    els.expiryToggle.title = state.expiryExpanded
+      ? `收起，只保留未来 ${EXPIRY_DEFAULT_DAYS} 天内的批次`
+      : `展开未来 ${EXPIRY_MAX_DAYS} 天内的其余 ${hiddenCount} 笔（不含更远的）`;
+  }
+
+  // 按天分组：hits 已升序，直接顺序切段，不重新排序
+  const groups = [];
+  for (const hit of hits) {
+    const moment = expiryMoment(hit.expiresAt);
+    const last = groups[groups.length - 1];
+    if (last && last.dayKey === moment.dayKey) last.hits.push({ hit, moment });
+    else groups.push({ dayKey: moment.dayKey, day: moment.day, hits: [{ hit, moment }] });
+  }
+
+  /*
+   * 展开态存 state：自动刷新整块重建时不会被收起。
+   * 只渲染窗口内的组；窗口外（> EXPIRY_MAX_DAYS）的组一律不渲染——
+   * 展开的上限是 5 天，不是「全部」。
+   */
+  const visibleGroups = groups.filter((group) =>
+    group.hits.some((item) => item.hit.inDays <= visibleDays),
+  );
+
+  let shown = 0;
+  const fragment = document.createDocumentFragment();
+
+  for (const group of visibleGroups) {
+    const groupNode = element('div', 'expiry__group');
+
+    // 组头：日期 + 这一天的笔数（日期只出现一次，行内只剩时刻）
+    const head = element('div', 'expiry__day');
+    head.append(
+      element('span', 'expiry__day-label', group.day),
+      element('span', 'expiry__day-count', `${group.hits.length} 笔`),
+    );
+    groupNode.append(head);
+
+    const rows = element('div', 'expiry__rows');
+    for (const { hit, moment } of group.hits) {
+      shown += 1;
+      const level = levelFor(hit.inDays, thresholds);
+      const row = element('button', 'expiry__row');
+      row.type = 'button';
+      row.dataset.level = level;
+      // 点一行 = 在卡片区筛到这个平台，等于「这笔是谁的、还剩多少」一眼到底
+      row.title = `只看 ${hit.displayName} 的卡片`;
+      row.addEventListener('click', () => filterByProvider(baseNameOf(hit.provider, [hit])));
+
+      // ① 具体时刻（左，等宽数字）
+      row.append(element('span', 'expiry__clock', moment.clock));
+
+      // ② 供应商（中，最重要的辨识信息）
+      const who = element('span', 'expiry__who');
+      who.append(
+        element('span', 'expiry__provider', baseNameOf(hit.provider, [hit])),
+        element('span', 'expiry__lot', hit.lotLabel),
+      );
+      row.append(who);
+
+      // ③ 金额 + 人民币估值（右）
+      const amount = element('span', 'expiry__amount', `${fmtNumber(hit.amount)} ${hit.currency}`);
+      if (typeof hit.cny === 'number') {
+        const cny = element('em', 'expiry__cny', `≈ ${fmtCny(hit.cny)}`);
+        if (hit.cnyNote) cny.title = hit.cnyNote;
+        amount.append(' ', cny);
+      }
+      row.append(amount);
+
+      // ④ 倒计时（最右，语义色只在这里出现）
+      row.append(element('span', 'expiry__left', expiryText(hit.inDays)));
+
+      rows.append(row);
+    }
+    groupNode.append(rows);
+    fragment.append(groupNode);
+  }
+
   els.timeline.append(fragment);
+
   applyStagger(els.timeline, 'timeline');
 }
 
@@ -2314,13 +2511,20 @@ function renderDiagnostics(data) {
 // 避免外壳和区块各算一套、对不上。
 // ===========================================================================
 
-/** 导航目标 → 顶栏标题。alert / toolbar 故意不在表里：它们没有导航项，向上沿用 */
+/** 导航目标 → 顶栏标题。toolbar 故意不在表里：它没有导航项，向上沿用上一个区块 */
 const NAV_SECTION_TITLES = {
+  'timeline-panel': '最先到期',
   summary: '总览',
   providers: '额度卡片',
-  'timeline-panel': '到期时间线',
   'diagnostics-panel': '诊断',
 };
+
+/**
+ * 页面第一个有导航项的区块：首屏 = 「最先到期」。
+ * scrollspy 的兜底一律用它，而不是写死某个区块名——否则改首屏顺序时
+ * 导航高亮会停在页面里根本不存在的那个位置上。
+ */
+const FIRST_NAV_TARGET = Object.keys(NAV_SECTION_TITLES)[0];
 
 /** 「有导航项」的 data-section 值（与左侧导航的 data-target 一一对应） */
 const NAV_TARGETS = new Set(Object.keys(NAV_SECTION_TITLES));
@@ -2350,14 +2554,22 @@ function renderShell(data) {
   const thresholds = data.expiryThresholds ?? { criticalDays: 3, warningDays: 7 };
 
   setBadge(els.navBadgePlatforms, totals.providers ?? providers.length);
-  setBadge(els.navBadgeTimeline, timeline.length);
 
-  // 到期时间线：有 critical 批次就把徽标点热（CSS 的 .nav__badge--hot）
+  /*
+   * 「最先到期」徽标 = **紧急窗口内的笔数**（≤ criticalDays），不是库存总量。
+   * 旧口径写 timeline.length（这里会显示 167），等于把「一共存了多少笔积分」
+   * 塞进导航：每天都是三位数、永远点不热，反而看不出「现在有几笔要马上用掉」。
+   * 用 criticalDays 而不是 warningDays，是因为后者（默认 14 天）同样会把
+   * 数字推到几十上百，失去「一眼看出紧不紧张」的意义。
+   */
+  const urgentCount = timeline.filter(
+    (hit) => hit.inDays >= 0 && hit.inDays <= thresholds.criticalDays,
+  ).length;
+  setBadge(els.navBadgeTimeline, urgentCount);
   if (els.navBadgeTimeline) {
-    els.navBadgeTimeline.classList.toggle(
-      'nav__badge--hot',
-      timeline.some((hit) => hit.inDays <= thresholds.criticalDays),
-    );
+    els.navBadgeTimeline.classList.toggle('is-zero', urgentCount === 0);
+    els.navBadgeTimeline.classList.toggle('nav__badge--hot', urgentCount > 0);
+    els.navBadgeTimeline.title = `${urgentCount} 笔在 ${thresholds.criticalDays} 天内过期（共 ${timeline.length} 笔待消耗）`;
   }
 
   // 诊断徽标口径：与 renderDiagnostics 同源，但排除 notConfigured——
@@ -2546,19 +2758,20 @@ function applyActiveTarget(target) {
 
 /**
  * scrollspy 的核心判断：取所有 [data-section]，选「顶部已越过探针、且离探针最近」的那个；
- * alert / toolbar 没有导航项，向前沿用最近一个有导航项的区块。
+ * toolbar 没有导航项，向前沿用最近一个有导航项的区块。
  */
 function currentSectionTarget() {
   const sections = [...document.querySelectorAll('[data-section]')];
   if (sections.length === 0) return null;
 
-  // 页面还在顶部（或整页没有滚动余地）：总览就是激活项
-  if (window.scrollY <= 2) return 'summary';
+  // 页面还在顶部（或整页没有滚动余地）：首屏区块「最先到期」就是激活项。
+  // 不能写死 summary——首屏已经换成了到期清单，写死会让导航一进来就点错项。
+  if (window.scrollY <= 2) return FIRST_NAV_TARGET;
 
-  // 隐藏区块（#alert 有内容才显示）没有盒子，rect 恒为 0，会把探针判断带偏；
+  // 没有盒子的区块（如尚未渲染的空容器）rect 恒为 0，会把探针判断带偏；
   // getClientRects() 为空正是「当前没有渲染」的可靠信号
   const rendered = sections.filter((section) => section.getClientRects().length > 0);
-  if (rendered.length === 0) return 'summary';
+  if (rendered.length === 0) return FIRST_NAV_TARGET;
 
   const probe = window.innerHeight * NAV_PROBE_RATIO;
   let passed = null;
@@ -2576,14 +2789,14 @@ function currentSectionTarget() {
   const hit = passed ?? (atBottom ? rendered[rendered.length - 1] : rendered[0]);
   if (!hit) return null;
 
-  // 从命中点向前找第一个有导航项的区块，把 alert / toolbar 这类「无导航项」的沿用掉。
-  // 这里用全量 sections 的顺序定位，保证 alert 消失与否都不影响沿用结果
+  // 从命中点向前找第一个有导航项的区块，把 toolbar 这类「无导航项」的沿用掉。
+  // 这里用全量 sections 的顺序定位，保证中间区块增减都不影响沿用结果
   const index = sections.indexOf(hit);
   for (let i = index; i >= 0; i -= 1) {
     const target = sections[i].dataset.section;
     if (NAV_TARGETS.has(target)) return target;
   }
-  return 'summary';
+  return FIRST_NAV_TARGET;
 }
 
 /** 滚动位置变化后重算激活项；rAF 节流，绝不用 setInterval */
@@ -2694,9 +2907,9 @@ function scheduleNavPill() {
 /** 命令一律现算：数据变了（平台增减、刷新后状态变化），命令清单跟着变 */
 function buildCommands() {
   const items = [
+    { label: '跳转到最先到期', hint: '跳转', run: () => scrollToSection('timeline-panel') },
     { label: '跳转到总览', hint: '跳转', run: () => scrollToSection('summary') },
     { label: '跳转到额度卡片', hint: '跳转', run: () => scrollToSection('providers') },
-    { label: '跳转到到期时间线', hint: '跳转', run: () => scrollToSection('timeline-panel') },
     { label: '跳转到诊断', hint: '跳转', run: () => scrollToSection('diagnostics-panel') },
     { label: '立即刷新数据', hint: '操作', run: () => void load(true) },
     { label: '打开平台与账号', hint: '操作', run: () => openPlatformsDialog() },
@@ -2731,15 +2944,21 @@ function toggleAutoRefresh() {
 /** 系统深色偏好：既用于「自动」解析，也用于监听系统变化 */
 const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
 
-/** 读取持久化的主题选择；localStorage 不可用或值非法时退回「自动」 */
+/**
+ * 读取持久化的主题选择；localStorage 不可用或值非法时退回「浅色」。
+ *
+ * 兜底不是「自动」：看板的视觉基准是 BoardUI 的浅色系统（见 styles.css 顶部），
+ * 系统深色的用户首次打开也应先看到设计基准。必须与 index.html 头部内联脚本
+ * 的默认值保持一致，否则首帧与运行时会闪一下。
+ */
 function storedThemeChoice() {
   try {
     const saved = localStorage.getItem(THEME_STORAGE_KEY);
     if (THEME_CHOICES.includes(saved)) return saved;
   } catch (error) {
-    /* 隐私模式下读取会抛：按自动处理，不影响本次会话内的切换 */
+    /* 隐私模式下读取会抛：按浅色处理，不影响本次会话内的切换 */
   }
-  return 'auto';
+  return 'light';
 }
 
 /** 把「选择」解析成实际生效的主题（auto 交给系统偏好） */
@@ -2754,7 +2973,8 @@ function effectiveTheme(choice) {
  * persist 仅在用户主动切换时为 true；首屏同步与系统偏好变化不写存储。
  */
 function applyTheme(choice, { persist = false } = {}) {
-  state.themeChoice = THEME_CHOICES.includes(choice) ? choice : 'auto';
+  // 非法值退回浅色（视觉基准），而不是「自动」——与 storedThemeChoice 的兜底一致
+  state.themeChoice = THEME_CHOICES.includes(choice) ? choice : 'light';
   const effective = effectiveTheme(state.themeChoice);
   const root = document.documentElement;
   root.dataset.theme = effective;
@@ -2781,11 +3001,16 @@ function applyTheme(choice, { persist = false } = {}) {
  * 顶栏按钮循环：自动 → 浅色 → 深色 → 自动。
  * 从「自动」出发时先切到当前没生效的一侧，保证第一次点击一定有可见变化。
  */
+/**
+ * 顶栏按钮循环：浅色 → 深色 → 自动 → 浅色。
+ * 从「浅色」（视觉基准）出发时先切到深色，保证第一次点击一定有可见变化。
+ */
 function cycleTheme() {
   const current = state.themeChoice;
   let next;
-  if (current === 'auto') next = effectiveTheme('auto') === 'dark' ? 'light' : 'dark';
-  else next = current === 'light' ? 'dark' : 'auto';
+  if (current === 'light') next = 'dark';
+  else if (current === 'dark') next = 'auto';
+  else next = 'light';
   applyTheme(next, { persist: true });
 }
 
@@ -2927,6 +3152,12 @@ function bindShell() {
   }
 
   els.navGroupPlatforms?.addEventListener('click', toggleNavPlatforms);
+
+  // 「展开 / 收起」到期窗口：按钮在标题行，重绘只换列表内容，按钮本身不重建
+  els.expiryToggle?.addEventListener('click', () => {
+    state.expiryExpanded = !state.expiryExpanded;
+    if (state.data) renderTimeline(state.data);
+  });
   els.dockCmd?.addEventListener('click', openCommandPalette);
   els.cmdOpen?.addEventListener('click', openCommandPalette);
   els.cmdBtn?.addEventListener('click', openCommandPalette);
