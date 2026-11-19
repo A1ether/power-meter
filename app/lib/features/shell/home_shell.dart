@@ -8,6 +8,7 @@ import '../../core/models/models.dart';
 import '../../core/theme/app_theme.dart';
 import '../../state/providers.dart';
 import '../accounts/platforms_dialog.dart';
+import '../checkin/checkin_dialog.dart';
 import '../dashboard/dashboard_sections.dart';
 import '../dashboard/provider_grid.dart';
 import 'command_palette.dart';
@@ -194,6 +195,21 @@ class _HomeShellState extends ConsumerState<HomeShell> {
           onPressed: () => showCommandPalette(context, ref, onGoToSection: _goTo),
           icon: const Icon(Icons.search),
         ),
+        if (roomy)
+          Padding(
+            padding: const EdgeInsets.only(right: 4),
+            child: OutlinedButton.icon(
+              onPressed: () => showCheckinDialog(context, ref),
+              icon: const Icon(Icons.event_available, size: 18),
+              label: const Text('每日签到'),
+            ),
+          )
+        else
+          IconButton(
+            tooltip: '每日签到',
+            onPressed: () => showCheckinDialog(context, ref),
+            icon: const Icon(Icons.event_available),
+          ),
         if (wide)
           Padding(
             padding: const EdgeInsets.only(right: 4),

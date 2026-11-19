@@ -54,6 +54,8 @@ class _PlatformsDialogState extends ConsumerState<PlatformsDialog> {
 
   Future<void> _afterChange() async {
     await _load();
+    // 账号集合变化会影响可选签到账号
+    ref.invalidate(checkinProvider);
     await ref.read(dashboardProvider.notifier).refresh(force: true, silent: true);
   }
 

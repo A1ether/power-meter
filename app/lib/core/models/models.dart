@@ -499,6 +499,171 @@ class DashboardPayload {
 }
 
 /* ------------------------------------------------------------------ *
+ * 每日签到（src/checkin.ts）
+ * ------------------------------------------------------------------ */
+
+/// 自动签到设置。`at` 为北京时间 `HH:mm`。
+class CheckinSettings {
+  const CheckinSettings({this.auto = false, this.at = '09:00'});
+
+  final bool auto;
+  final String at;
+
+  factory CheckinSettings.fromJson(Map<String, dynamic> json) => CheckinSettings(
+        auto: _bool(json['auto']),
+        at: _str(json['at'], '09:00'),
+      );
+
+  Map<String, dynamic> toJson() => {'auto': auto, 'at': at};
+}
+
+/// 某个账号最近一次签到结果（由服务端 `.run/checkin.json` 持久化）。
+class CheckinRecord {
+  const CheckinRecord({
+    required this.day,
+    this.at,
+    required this.outcome,
+    this.credit,
+    this.streak,
+    this.message = '',
+    this.tries = 1,
+  });
+
+  /// 北京时间日期 `YYYY-MM-DD`。
+  final String day;
+  final DateTime? at;
+  final String outcome;
+  final double? credit;
+  final int? streak;
+  final String message;
+  final int tries;
+
+  bool get settled => outcome == 'claimed' || outcome == 'done';
+
+  bool isForToday([DateTime? now]) => day == beijingDayKey(now);
+
+  factory CheckinRecord.fromJson(Map<String, dynamic> json) => CheckinRecord(
+        day: _str(json['day']),
+        at: _date(json['at']),
+        outcome: _str(json['outcome'], 'failed'),
+        credit: _num(json['credit']),
+        streak: _int(json['streak']),
+        message: _str(json['message']),
+        tries: _int(json['tries']) ?? 1,
+      );
+}
+
+/// 服务端按账号描述签到能力与最近结果。
+class CheckinAccountState {
+  const CheckinAccountState({
+    required this.provider,
+    required this.accountId,
+    required this.displayName,
+    this.enabled = true,
+    this.supported = false,
+    this.reason,
+    this.record,
+  });
+
+  final String provider;
+
+  /// 账号 `displayName`（服务端口径）；默认账号为空串。
+  final String accountId;
+
+  /// 平台展示名（如「MiniMax Code」），不是账号昵称。
+  final String displayName;
+  final bool enabled;
+  final bool supported;
+  final String? reason;
+  final CheckinRecord? record;
+
+  factory CheckinAccountState.fromJson(Map<String, dynamic> json) => CheckinAccountState(
+        provider: _str(json['provider']),
+        accountId: _str(json['accountId']),
+        displayName: _str(json['displayName']),
+        enabled: _bool(json['enabled'], true),
+        supported: _bool(json['supported']),
+        reason: _strOrNull(json['reason']),
+        record: json['record'] == null ? null : CheckinRecord.fromJson(_obj(json['record'])),
+      );
+}
+
+class CheckinStatus {
+  const CheckinStatus({
+    this.settings = const CheckinSettings(),
+    this.accounts = const [],
+    this.running = const [],
+  });
+
+  final CheckinSettings settings;
+  final List<CheckinAccountState> accounts;
+
+  /// 正在签到的账号键：`provider|accountId`。
+  final List<String> running;
+
+  factory CheckinStatus.fromJson(Map<String, dynamic> json) => CheckinStatus(
+        settings: CheckinSettings.fromJson(_obj(json['settings'])),
+        accounts:
+            _list(json['accounts']).map((item) => CheckinAccountState.fromJson(_obj(item))).toList(),
+        running: _list(json['running']).map((item) => '$item').toList(),
+      );
+
+  CheckinStatus copyWith({CheckinSettings? settings}) => CheckinStatus(
+        settings: settings ?? this.settings,
+        accounts: accounts,
+        running: running,
+      );
+}
+
+String checkinKeyOf(String provider, String accountId) => '$provider|$accountId';
+
+/// 北京时间日期（UTC+8），与平台「每日」口径一致。
+String beijingDayKey([DateTime? now]) {
+  final value = (now ?? DateTime.now()).toUtc().add(const Duration(hours: 8));
+  return value.toIso8601String().substring(0, 10);
+}
+
+/// 结果文案：与 Web 看板 `app.js:851` 保持一致。
+String checkinOutcomeText(CheckinRecord record) => switch (record.outcome) {
+      'claimed' =>
+        record.credit == null || record.credit == 0
+            ? '已领取'
+            : '已领取 +${fmtCheckinCredit(record.credit!)}',
+      'done' => '今日已签到',
+      'inactive' => '当前无活动',
+      'ineligible' => '不可领取',
+      'unsupported' => '不支持',
+      'failed' => '签到失败',
+      _ => record.outcome.isEmpty ? '—' : record.outcome,
+    };
+
+/// 今天没有记录时的占位文案。
+String checkinTodayText(CheckinRecord? record) =>
+    record != null && record.isForToday() ? checkinOutcomeText(record) : '今天未签到';
+
+String fmtCheckinCredit(double value) =>
+    value == value.roundToDouble() ? value.toStringAsFixed(0) : value.toStringAsFixed(2);
+
+enum CheckinTone { ok, bad, muted }
+
+CheckinTone checkinToneFor(CheckinRecord? record) {
+  if (record == null) return CheckinTone.muted;
+  if (record.settled) return CheckinTone.ok;
+  if (record.outcome == 'failed') return CheckinTone.bad;
+  return CheckinTone.muted;
+}
+
+/// 卡片与弹窗共用的账号匹配：先精确匹配，再在「该平台只有一个账号」时回退。
+CheckinAccountState? checkinAccountFor(CheckinStatus? status, String provider, String accountId) {
+  final accounts = status?.accounts ?? const <CheckinAccountState>[];
+  for (final account in accounts) {
+    if (account.provider == provider && account.accountId == accountId) return account;
+  }
+  final sameProvider = accounts.where((account) => account.provider == provider).toList();
+  return sameProvider.length == 1 ? sameProvider.first : null;
+}
+
+/* ------------------------------------------------------------------ *
  * 平台注册表（/api/providers）
  * ------------------------------------------------------------------ */
 

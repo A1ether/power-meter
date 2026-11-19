@@ -13,6 +13,14 @@ import '../accounts/secret_tile.dart';
 const int _visibleLots = 3;
 const int _visibleEntries = 2;
 
+String _checkinChipText(List<CheckinRecord> claimed) {
+  if (claimed.length == 1) {
+    final credit = claimed.first.credit;
+    return credit == null || credit == 0 ? '已签到' : '签到 +${fmtCheckinCredit(credit)}';
+  }
+  return '已签到 ${claimed.length} 个账号';
+}
+
 class ProviderCard extends ConsumerStatefulWidget {
   const ProviderCard({super.key, required this.provider, required this.thresholds});
 
@@ -33,7 +41,33 @@ class _ProviderCardState extends ConsumerState<ProviderCard> {
 
   Future<void> _refreshDashboard() async {
     // 增删账号 / 登录落库后必须强制重新读配置与取数，避免返回旧缓存。
+    // 账号集合变化也会影响签到可选账号，顺带让签到状态重新计算。
+    ref.invalidate(checkinProvider);
     await ref.read(dashboardProvider.notifier).refresh(force: true, silent: true);
+  }
+
+  Future<void> _runCheckin(ProviderEntry entry) async {
+    try {
+      final record = await ref.read(checkinProvider.notifier).runOne(
+            provider: provider.provider,
+            accountId: entry.id,
+          );
+      if (!mounted) return;
+      final label = entry.label.isEmpty ? '未命名账号' : entry.label;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '$label：${checkinOutcomeText(record)}'
+            '${record.message.isEmpty ? '' : ' · ${record.message}'}',
+          ),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('签到失败：$error')),
+      );
+    }
   }
 
   Future<void> _removeAccount(String accountId, String label) async {
@@ -84,6 +118,17 @@ class _ProviderCardState extends ConsumerState<ProviderCard> {
     final healthy = provider.healthy;
     final grouped = provider.groupAccounts || provider.entries.isNotEmpty;
     final showManage = canManage && meta != null && meta.manageAccounts;
+
+    // 签到状态是整页共享的一份；这里只取与当前卡片账号相关、且发生在今天的记录。
+    final checkinStatus = ref.watch(checkinProvider).valueOrNull;
+    final todayCheckins = <CheckinRecord>[];
+    if (healthy) {
+      for (final entry in provider.entries) {
+        final state = checkinAccountFor(checkinStatus, provider.provider, entry.id);
+        final record = state?.record;
+        if (record != null && record.isForToday()) todayCheckins.add(record);
+      }
+    }
 
     final expiryLevel = provider.nextExpiryInDays == null
         ? ExpiryLevel.none
@@ -156,6 +201,27 @@ class _ProviderCardState extends ConsumerState<ProviderCard> {
                           if (!healthy)
                             _Pill(
                               text: provider.status,
+                              foreground: tones.critical,
+                              background: tones.criticalContainer,
+                            ),
+                          if (todayCheckins.any((record) => record.outcome == 'claimed'))
+                            _Pill(
+                              text: _checkinChipText(
+                                todayCheckins.where((record) => record.outcome == 'claimed').toList(),
+                              ),
+                              foreground: tones.success,
+                              background: tones.successContainer,
+                            )
+                          else if (todayCheckins.any((record) => record.outcome == 'done'))
+                            _Pill(
+                              text: '今日已签到',
+                              foreground: tones.success,
+                              background: tones.successContainer,
+                            ),
+                          if (todayCheckins.any((record) => record.outcome == 'failed'))
+                            _Pill(
+                              text:
+                                  '签到失败 ${todayCheckins.where((record) => record.outcome == 'failed').length}',
                               foreground: tones.critical,
                               background: tones.criticalContainer,
                             ),
@@ -366,20 +432,33 @@ class _ProviderCardState extends ConsumerState<ProviderCard> {
           ],
         ),
         const SizedBox(height: 6),
-        for (final entry in entries)
-          _EntryRow(
-            provider: provider,
-            entry: entry,
-            canManage: ref.watch(runtimeProvider).canManageAccounts && provider.manageAccounts,
-            canReveal: ref.watch(runtimeProvider).canManageAccounts,
-            onRemove: () => _removeAccount(entry.id, entry.label.isEmpty ? '未命名账号' : entry.label),
-          ),
+        for (final entry in entries) _buildEntryRow(entry),
         if (hidden > 0)
           TextButton(
             onPressed: () => setState(() => _entriesExpanded = !_entriesExpanded),
             child: Text(_entriesExpanded ? '收起 ⌃' : '展开其余 $hidden 个 ⌄'),
           ),
       ],
+    );
+  }
+
+  Widget _buildEntryRow(ProviderEntry entry) {
+    final checkinStatus = ref.watch(checkinProvider).valueOrNull;
+    final busySet = ref.watch(checkinBusyProvider);
+    final key = checkinKeyOf(provider.provider, entry.id);
+    final checkin = checkinAccountFor(checkinStatus, provider.provider, entry.id);
+    final record = checkin?.record;
+    return _EntryRow(
+      provider: provider,
+      entry: entry,
+      canManage: ref.watch(runtimeProvider).canManageAccounts && provider.manageAccounts,
+      canReveal: ref.watch(runtimeProvider).canManageAccounts,
+      canCheckin: ref.watch(runtimeProvider).canManageAccounts,
+      checkin: checkin,
+      checkinBusy: busySet.contains(key) || (checkinStatus?.running.contains(key) ?? false),
+      checkinSettled: (record?.isForToday() ?? false) && (record?.settled ?? false),
+      onCheckin: () => _runCheckin(entry),
+      onRemove: () => _removeAccount(entry.id, entry.label.isEmpty ? '未命名账号' : entry.label),
     );
   }
 }
@@ -472,6 +551,11 @@ class _EntryRow extends StatelessWidget {
     required this.entry,
     required this.canManage,
     required this.canReveal,
+    required this.canCheckin,
+    required this.checkin,
+    required this.checkinBusy,
+    required this.checkinSettled,
+    required this.onCheckin,
     required this.onRemove,
   });
 
@@ -479,14 +563,27 @@ class _EntryRow extends StatelessWidget {
   final ProviderEntry entry;
   final bool canManage;
   final bool canReveal;
+  final bool canCheckin;
+  final CheckinAccountState? checkin;
+  final bool checkinBusy;
+  final bool checkinSettled;
+  final VoidCallback onCheckin;
   final VoidCallback onRemove;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
+    final tones = context.tones;
     final healthy = entry.healthy;
     final empty = healthy && entry.amount <= 0;
+    final record = checkin?.record;
+    final recordToday = record?.isForToday() ?? false;
+    final showCheckin = canCheckin &&
+        checkin != null &&
+        checkin!.supported &&
+        checkin!.enabled &&
+        healthy;
     return Container(
       margin: const EdgeInsets.only(bottom: 6),
       padding: const EdgeInsets.all(10),
@@ -505,6 +602,16 @@ class _EntryRow extends StatelessWidget {
                   style: theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600),
                 ),
               ),
+              if (showCheckin)
+                TextButton(
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    minimumSize: const Size(0, 30),
+                  ),
+                  onPressed: checkinBusy || checkinSettled ? null : onCheckin,
+                  child: Text(checkinBusy ? '签到中…' : checkinSettled ? '已签到' : '签到'),
+                ),
               Text(
                 healthy ? '${fmtNumber(entry.amount)} ${entry.currency}' : entry.status,
                 style: theme.textTheme.labelMedium?.copyWith(
@@ -523,6 +630,23 @@ class _EntryRow extends StatelessWidget {
           if (empty)
             Text('quota 已用尽，该账号调不动',
                 style: theme.textTheme.labelSmall?.copyWith(color: scheme.error)),
+          if (showCheckin && record != null && recordToday)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                '签到：${checkinOutcomeText(record)}'
+                '${record.message.isEmpty ? '' : ' · ${record.message}'}',
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: switch (checkinToneFor(record)) {
+                    CheckinTone.ok => tones.success,
+                    CheckinTone.bad => tones.critical,
+                    CheckinTone.muted => scheme.onSurfaceVariant,
+                  },
+                ),
+              ),
+            ),
           if (!healthy && entry.message != null)
             Text(entry.message!, style: theme.textTheme.labelSmall?.copyWith(color: scheme.error)),
           if (entry.secrets.isEmpty)

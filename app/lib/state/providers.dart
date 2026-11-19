@@ -63,6 +63,89 @@ class DashboardNotifier extends AsyncNotifier<DashboardPayload> {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * 每日签到
+ * ------------------------------------------------------------------ */
+
+/// 正在签到的账号键 `provider|accountId`（卡片与弹窗共享，保证两边按钮同步禁用）。
+final checkinBusyProvider = StateProvider<Set<String>>((ref) => <String>{});
+
+/// 「一键签到全部」进行中。
+final checkinAllBusyProvider = StateProvider<bool>((ref) => false);
+
+final checkinProvider = AsyncNotifierProvider<CheckinNotifier, CheckinStatus>(
+  CheckinNotifier.new,
+);
+
+class CheckinNotifier extends AsyncNotifier<CheckinStatus> {
+  @override
+  Future<CheckinStatus> build() async {
+    ref.watch(apiProvider);
+    return ref.read(apiProvider).checkinStatus();
+  }
+
+  /// 静默重读；失败时保留上一次成功数据，避免弹窗因一次网络抖动清空。
+  Future<void> reload() async {
+    final previous = state;
+    try {
+      state = AsyncValue.data(await ref.read(apiProvider).checkinStatus());
+    } catch (error, stackTrace) {
+      state = AsyncValue<CheckinStatus>.error(error, stackTrace).copyWithPrevious(previous);
+    }
+  }
+
+  void _setBusy(String key, bool busy) {
+    ref.read(checkinBusyProvider.notifier).update(
+          (set) => busy ? <String>{...set, key} : (<String>{...set}..remove(key)),
+        );
+  }
+
+  void _refreshDashboard() {
+    unawaited(ref.read(dashboardProvider.notifier).refresh(force: true, silent: true));
+  }
+
+  /// 单账号签到：成功后重读状态；只有 claimed 才需要刷新看板余额。
+  Future<CheckinRecord> runOne({required String provider, required String accountId}) async {
+    final key = checkinKeyOf(provider, accountId);
+    if (ref.read(checkinBusyProvider).contains(key)) throw ApiException('该账号正在签到');
+    _setBusy(key, true);
+    try {
+      final record = await ref.read(apiProvider).runCheckin(
+            provider: provider,
+            accountId: accountId,
+          );
+      await reload();
+      if (record.outcome == 'claimed') _refreshDashboard();
+      return record;
+    } finally {
+      _setBusy(key, false);
+    }
+  }
+
+  /// 一键签到全部；服务端并发 2，单账号失败不影响其它账号。
+  Future<List<CheckinRecord>> runAll() async {
+    final busy = ref.read(checkinAllBusyProvider.notifier);
+    if (busy.state) return const [];
+    busy.state = true;
+    try {
+      final results = await ref.read(apiProvider).runAllCheckins();
+      await reload();
+      if (results.any((record) => record.outcome == 'claimed')) _refreshDashboard();
+      return results;
+    } finally {
+      busy.state = false;
+    }
+  }
+
+  Future<CheckinSettings> updateSettings({bool? auto, String? at}) async {
+    final settings = await ref.read(apiProvider).updateCheckinSettings(auto: auto, at: at);
+    state = AsyncValue.data(
+      (state.valueOrNull ?? const CheckinStatus()).copyWith(settings: settings),
+    );
+    return settings;
+  }
+}
+
 final searchQueryProvider = StateProvider<String>((ref) => '');
 final sortModeProvider = StateProvider<SortMode>((ref) => SortMode.expiry);
 

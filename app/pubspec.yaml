@@ -1,7 +1,7 @@
 name: power_meter
 description: Power Meter · 多平台 AI 余额看板（Flutter 客户端）
 publish_to: "none"
-version: 0.3.0+4
+version: 0.3.1+5
 
 environment:
   sdk: ">=3.6.0 <4.0.0"

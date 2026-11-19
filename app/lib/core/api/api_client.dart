@@ -209,5 +209,48 @@ class ApiClient {
     );
   }
 
+  /* --------------------------- 每日签到 --------------------------- */
+
+  Future<CheckinStatus> checkinStatus() async =>
+      CheckinStatus.fromJson(await _send('GET', 'api/checkin'));
+
+  Future<CheckinRecord> runCheckin({
+    required String provider,
+    required String accountId,
+  }) async {
+    final payload = await _send(
+      'POST',
+      'api/checkin',
+      body: {'provider': provider, 'accountId': accountId},
+      timeout: const Duration(seconds: 60),
+    );
+    final result = payload['result'];
+    if (result is! Map) throw ApiException('签到接口未返回结果');
+    return CheckinRecord.fromJson(result.map((key, value) => MapEntry('$key', value)));
+  }
+
+  Future<List<CheckinRecord>> runAllCheckins() async {
+    final payload = await _send(
+      'POST',
+      'api/checkin/all',
+      body: const <String, dynamic>{},
+      timeout: const Duration(seconds: 180),
+    );
+    return (payload['results'] as List? ?? const [])
+        .whereType<Map>()
+        .map((item) => CheckinRecord.fromJson(item.map((key, value) => MapEntry('$key', value))))
+        .toList();
+  }
+
+  Future<CheckinSettings> updateCheckinSettings({bool? auto, String? at}) async {
+    final payload = await _send('POST', 'api/checkin/settings', body: {
+      if (auto != null) 'auto': auto,
+      if (at != null) 'at': at,
+    });
+    final settings = payload['settings'];
+    if (settings is! Map) throw ApiException('签到设置接口未返回结果');
+    return CheckinSettings.fromJson(settings.map((key, value) => MapEntry('$key', value)));
+  }
+
   void close() => _client.close();
 }

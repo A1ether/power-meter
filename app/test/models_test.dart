@@ -187,4 +187,57 @@ void main() {
     expect(provider.dailyUsage, isNull);
     expect(provider.balanceAmount, 1);
   });
+
+  test('CheckinStatus 解析结果、当日判定与账号回退匹配', () {
+    final status = CheckinStatus.fromJson({
+      'settings': {'auto': true, 'at': '09:30'},
+      'accounts': [
+        {
+          'provider': 'minimax',
+          'accountId': 'alice',
+          'displayName': 'MiniMax Code',
+          'enabled': true,
+          'supported': true,
+          'record': {
+            'day': '2026-11-19',
+            'at': '2026-11-19T01:30:00.000Z',
+            'outcome': 'claimed',
+            'credit': 100,
+            'message': '领取成功',
+            'tries': 1,
+          },
+        },
+        {
+          'provider': 'qoder',
+          'accountId': '',
+          'displayName': 'Qoder',
+          'supported': false,
+          'reason': 'Cookie 账号不支持',
+        },
+      ],
+      'running': ['minimax|alice'],
+    });
+
+    expect(status.settings.auto, isTrue);
+    expect(status.settings.at, '09:30');
+    expect(status.running, ['minimax|alice']);
+    final record = status.accounts.first.record!;
+    expect(record.settled, isTrue);
+    expect(record.isForToday(DateTime.utc(2026, 11, 19, 12)), isTrue);
+    expect(record.isForToday(DateTime.utc(2026, 11, 20, 12)), isFalse);
+    expect(checkinOutcomeText(record), '已领取 +100');
+    expect(checkinToneFor(record), CheckinTone.ok);
+    expect(checkinToneFor(status.accounts[1].record), CheckinTone.muted);
+    // 精确匹配
+    expect(checkinAccountFor(status, 'minimax', 'alice')?.accountId, 'alice');
+    // 同平台唯一账号回退
+    expect(checkinAccountFor(status, 'qoder', 'renamed')?.reason, 'Cookie 账号不支持');
+    // 没有签到能力的平台返回 null
+    expect(checkinAccountFor(status, 'trae', 'x'), isNull);
+  });
+
+  test('北京时间日期在 UTC 16:00 跨日', () {
+    expect(beijingDayKey(DateTime.utc(2026, 11, 19, 15, 59)), '2026-11-19');
+    expect(beijingDayKey(DateTime.utc(2026, 11, 19, 16, 0)), '2026-11-20');
+  });
 }
