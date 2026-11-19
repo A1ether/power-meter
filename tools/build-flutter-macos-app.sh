@@ -52,6 +52,12 @@ npm run build:sidecar
 say "2/5 构建 Flutter macOS Release"
 (cd app && flutter build macos --release)
 
+# 构建产物若被 Spotlight 索引，Launchpad / 应用搜索会把它们和安装副本一起列出
+# （同名同图标，出现两份甚至三份）。在构建目录放一个 never-index 标记，
+# Spotlight 会跳过整棵子树；flutter clean 删掉标记后，下次构建会重新写入。
+mkdir -p "$ROOT/app/build" "$OUT"
+touch "$ROOT/app/build/.metadata_never_index" "$OUT/.metadata_never_index"
+
 SRC_APP="$(find app/build/macos/Build/Products/Release -maxdepth 1 -name '*.app' -print -quit)"
 [ -n "$SRC_APP" ] || die "找不到 Flutter macOS 产物（app/build/macos/Build/Products/Release/*.app）"
 
@@ -86,7 +92,7 @@ say "5/5 生成 dmg"
 rm -f "$OUT/PowerMeter-$VERSION.dmg"
 hdiutil create -volname "Power Meter" -srcfolder "$APP" -ov -format UDZO "$OUT/PowerMeter-$VERSION.dmg" >/dev/null
 
-ok "产物：$APP"
+ok "中间产物：$APP（打包结束后清理，只保留 DMG 与安装副本）"
 ok "安装包：$OUT/PowerMeter-$VERSION.dmg"
 ok "sidecar：$RES/power-meter-sidecar（--port 0 --no-static --token 由 App 每次启动随机生成）"
 
@@ -96,3 +102,16 @@ if [ "$INSTALL" = "1" ]; then
   cp -R "$APP" "/Applications/PowerMeter.app"
   ok "已安装 /Applications/PowerMeter.app"
 fi
+
+# 仓库内的 .app 副本会被 Spotlight / LaunchServices 收录，让 Launchpad 搜索与
+# 应用列表同时出现「PowerMeter.app（安装副本）」和「power_meter.app（构建产物）」。
+# DMG 与 /Applications 副本已经够用，这里注销注册并删除两个中间 .app；
+# 下次 flutter build 会重新产出，不影响 flutter run。
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+for bundle in "$SRC_APP" "$APP"; do
+  [ -n "$bundle" ] || continue
+  if [ -x "$LSREGISTER" ]; then
+    "$LSREGISTER" -u "$bundle" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$bundle"
+done
