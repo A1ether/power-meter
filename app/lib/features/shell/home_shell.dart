@@ -28,7 +28,7 @@ class _HomeShellState extends ConsumerState<HomeShell> {
     for (final section in DashboardSection.values) section: GlobalKey(),
   };
 
-  DashboardSection _selected = DashboardSection.overview;
+  DashboardSection _selected = DashboardSection.expiry;
   bool _spyEnabled = true;
   double _lastScrollOffset = 0;
 
@@ -307,6 +307,13 @@ class _HomeShellState extends ConsumerState<HomeShell> {
         controller: _scroll,
         padding: const EdgeInsets.fromLTRB(20, 16, 20, 40),
         children: [
+          ExpiryFirstSection(
+            key: _keys[DashboardSection.expiry],
+            payload: data,
+            meta: ref.watch(registryMapProvider),
+            onFilterProvider: _filterByPlatform,
+          ),
+          const SizedBox(height: 16),
           DashboardSummarySection(key: _keys[DashboardSection.overview], payload: data),
           const SizedBox(height: 16),
           ExpiryAlertBanner(payload: data),
@@ -314,8 +321,6 @@ class _HomeShellState extends ConsumerState<HomeShell> {
           const DashboardToolbar(),
           const SizedBox(height: 16),
           ProviderGrid(key: _keys[DashboardSection.providers]),
-          const SizedBox(height: 24),
-          ExpiryTimelineSection(key: _keys[DashboardSection.timeline], payload: data),
           const SizedBox(height: 24),
           DiagnosticsSection(key: _keys[DashboardSection.diagnostics], payload: data),
           const SizedBox(height: 24),
@@ -351,11 +356,12 @@ class _SideRail extends ConsumerWidget {
     final query = ref.watch(searchQueryProvider);
     final visible = ref.watch(visibleProvidersProvider);
     final diagCount = data == null ? 0 : countDiagnostics(data!);
+    final urgentCount = data == null ? 0 : criticalHits(data!);
 
     int badgeOf(DashboardSection section) => switch (section) {
+          DashboardSection.expiry => urgentCount,
           DashboardSection.overview => data?.totals.providers ?? 0,
           DashboardSection.providers => visible.length,
-          DashboardSection.timeline => data?.expiryTimeline.length ?? 0,
           DashboardSection.diagnostics => diagCount,
         };
 
@@ -402,7 +408,12 @@ class _SideRail extends ConsumerWidget {
                       icon: section.icon,
                       label: section.label,
                       badge: badgeOf(section),
-                      danger: section == DashboardSection.diagnostics && diagCount > 0,
+                      danger: (section == DashboardSection.diagnostics && diagCount > 0) ||
+                          (section == DashboardSection.expiry && urgentCount > 0),
+                      tooltip: data == null
+                          ? null
+                          : '$urgentCount 笔在 ${thresholds.criticalDays} 天内过期'
+                              '（共 ${data?.expiryTimeline.length ?? 0} 笔待消耗）',
                       selected: selected == section,
                       onTap: () => onSelect(section),
                     ),
@@ -490,6 +501,7 @@ class _NavTile extends StatelessWidget {
     required this.onTap,
     this.badge,
     this.danger = false,
+    this.tooltip,
   });
 
   final IconData icon;
@@ -498,12 +510,13 @@ class _NavTile extends StatelessWidget {
   final VoidCallback onTap;
   final int? badge;
   final bool danger;
+  final String? tooltip;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final tones = context.tones;
-    return Padding(
+    final tile = Padding(
       padding: const EdgeInsets.symmetric(vertical: 2),
       child: Material(
         color: selected ? scheme.secondaryContainer : Colors.transparent,
@@ -550,6 +563,8 @@ class _NavTile extends StatelessWidget {
         ),
       ),
     );
+    if (tooltip == null) return tile;
+    return Tooltip(message: tooltip, child: tile);
   }
 }
 

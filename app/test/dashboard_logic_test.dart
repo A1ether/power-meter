@@ -168,4 +168,46 @@ void main() {
     ];
     expect(sortedLots(lots, now: now).map((lot) => lot.id), ['soon', 'late', 'none']);
   });
+
+  test('到期时刻按本地日期给出今天/明天/后天/月日与时分', () {
+    final localNow = DateTime(2026, 11, 12, 12, 0);
+    final today = expiryMomentOf(DateTime(2026, 11, 12, 18, 30), now: localNow);
+    final tomorrow = expiryMomentOf(DateTime(2026, 11, 13, 0, 5), now: localNow);
+    final dayAfter = expiryMomentOf(DateTime(2026, 11, 14, 23, 59), now: localNow);
+    final later = expiryMomentOf(DateTime(2026, 11, 17, 8, 0), now: localNow);
+    final past = expiryMomentOf(DateTime(2026, 11, 11, 8, 0), now: localNow);
+
+    expect((today.label, today.clock), ('今天', '18:30'));
+    expect((tomorrow.label, tomorrow.clock), ('明天', '00:05'));
+    expect(dayAfter.label, '后天');
+    expect((later.label, later.clock), ('11/17', '08:00'));
+    expect(past.label, '已过期');
+  });
+
+  test('到期批次先按时刻升序，再按本地日期切组', () {
+    ExpiryHit hit(String id, DateTime expiresAt) => ExpiryHit(
+          provider: 'a',
+          displayName: 'A · 1',
+          lotId: id,
+          lotLabel: id,
+          amount: 1,
+          currency: 'CREDITS',
+          expiresAt: expiresAt,
+          inDays: 1,
+        );
+
+    final groups = groupExpiryHits(
+      [
+        hit('c', DateTime(2026, 11, 13, 9, 0)),
+        hit('b', DateTime(2026, 11, 12, 20, 0)),
+        hit('a', DateTime(2026, 11, 12, 8, 0)),
+        hit('d', DateTime(2026, 11, 14, 1, 0)),
+      ],
+      now: DateTime(2026, 11, 12, 12, 0),
+    );
+
+    expect(groups.map((group) => group.label), ['今天', '明天', '后天']);
+    expect(groups.map((group) => group.hits.length), [2, 1, 1]);
+    expect(groups.first.hits.map((item) => item.lotId), ['a', 'b']);
+  });
 }

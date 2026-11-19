@@ -308,16 +308,63 @@ class _DashboardToolbarState extends ConsumerState<DashboardToolbar> {
   }
 }
 
-class ExpiryTimelineSection extends StatelessWidget {
-  const ExpiryTimelineSection({super.key, required this.payload});
+/// 「最先到期」首屏：按本地日期分组，默认只看 2 天，可展开到 5 天。
+///
+/// 口径对应 `public/app.js:2823-2984`：先给结论（多少笔、最近一笔何时），
+/// 再按天分组；点一行等于在该平台下筛选额度卡片。
+class ExpiryFirstSection extends StatefulWidget {
+  const ExpiryFirstSection({
+    super.key,
+    required this.payload,
+    required this.meta,
+    required this.onFilterProvider,
+  });
 
   final DashboardPayload payload;
+  final Map<String, ProviderMeta> meta;
+  final ValueChanged<String> onFilterProvider;
+
+  @override
+  State<ExpiryFirstSection> createState() => _ExpiryFirstSectionState();
+}
+
+class _ExpiryFirstSectionState extends State<ExpiryFirstSection> {
+  /// 展开态放在组件内，自动刷新重建列表时不会被收起。
+  bool _expanded = false;
+
+  String _providerName(ExpiryHit hit) {
+    final canonical = baseNameOf(hit.provider, const [], widget.meta);
+    if (canonical != hit.provider) return canonical;
+    final fallback = hit.displayName.split(' · ').first.trim();
+    return fallback.isEmpty ? hit.provider : fallback;
+  }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
-    final hits = payload.expiryTimeline;
+    final payload = widget.payload;
+    final thresholds = payload.expiryThresholds;
+    final hits = sortedExpiryHits(payload.expiryTimeline);
+
+    final visibleDays = _expanded ? expiryMaxDays : expiryWindowDays;
+    final inVisible = hits.where((hit) => hit.inDays <= visibleDays).length;
+    final inMax = hits.where((hit) => hit.inDays <= expiryMaxDays).length;
+    final hiddenCount = inMax - inVisible;
+    final canToggle = hiddenCount > 0 || _expanded;
+
+    final summary = hits.isEmpty
+        ? '没有任何带过期时间的积分批次'
+        : () {
+            final first = expiryMomentOf(hits.first.expiresAt);
+            return '${hits.length} 笔待消耗 · 最近一笔 ${first.label} ${first.clock} 过期 · '
+                '未来 $visibleDays 天内有 $inVisible 笔';
+          }();
+
+    final groups = groupExpiryHits(hits);
+    final visibleGroups =
+        groups.where((group) => group.hits.any((hit) => hit.inDays <= visibleDays)).toList();
+
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -325,27 +372,64 @@ class ExpiryTimelineSection extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('到期时间线', style: theme.textTheme.titleMedium),
-                const SizedBox(width: 10),
-                Text(
-                  '按过期时间升序，优先消耗排在最前面的积分',
-                  style: theme.textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('最先到期', style: theme.textTheme.titleMedium),
+                      const SizedBox(height: 4),
+                      Text(
+                        summary,
+                        style: theme.textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+                      ),
+                    ],
+                  ),
                 ),
+                if (canToggle)
+                  TextButton(
+                    onPressed: () => setState(() => _expanded = !_expanded),
+                    child: Text(
+                      _expanded
+                          ? '只看 $expiryWindowDays 天'
+                          : '展开到 $expiryMaxDays 天（+$hiddenCount 笔）',
+                    ),
+                  ),
               ],
             ),
             const SizedBox(height: 12),
             if (hits.isEmpty)
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 12),
-                child: Text('暂无可用的到期信息',
-                    style: theme.textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant)),
+                child: Text(
+                  '暂无可用的到期信息',
+                  style: theme.textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+                ),
               )
             else
-              for (var index = 0; index < hits.length; index++) ...[
-                if (index > 0) const Divider(height: 1),
-                _TimelineRow(hit: hits[index], thresholds: payload.expiryThresholds),
-              ],
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final compact = constraints.maxWidth < 620;
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      for (var groupIndex = 0; groupIndex < visibleGroups.length; groupIndex++) ...[
+                        if (groupIndex > 0) const Divider(height: 1),
+                        _DayHeader(group: visibleGroups[groupIndex]),
+                        for (final hit in visibleGroups[groupIndex].hits)
+                          _ExpiryRow(
+                            hit: hit,
+                            providerName: _providerName(hit),
+                            thresholds: thresholds,
+                            compact: compact,
+                            onTap: () => widget.onFilterProvider(_providerName(hit)),
+                          ),
+                      ],
+                    ],
+                  );
+                },
+              ),
           ],
         ),
       ),
@@ -353,11 +437,49 @@ class ExpiryTimelineSection extends StatelessWidget {
   }
 }
 
-class _TimelineRow extends StatelessWidget {
-  const _TimelineRow({required this.hit, required this.thresholds});
+class _DayHeader extends StatelessWidget {
+  const _DayHeader({required this.group});
+
+  final ExpiryDayGroup group;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 12, 8, 4),
+      child: Row(
+        children: [
+          Text(
+            group.label,
+            style: theme.textTheme.labelMedium?.copyWith(fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            '${group.hits.length} 笔',
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ExpiryRow extends StatelessWidget {
+  const _ExpiryRow({
+    required this.hit,
+    required this.providerName,
+    required this.thresholds,
+    required this.compact,
+    required this.onTap,
+  });
 
   final ExpiryHit hit;
+  final String providerName;
   final ExpiryThresholds thresholds;
+  final bool compact;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -369,66 +491,123 @@ class _TimelineRow extends StatelessWidget {
       warningDays: thresholds.warningDays,
     );
     final color = context.toneForExpiry(level);
-    final cny = hit.cny;
+    final moment = expiryMomentOf(hit.expiresAt);
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 10),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            width: 3,
-            height: 38,
-            margin: const EdgeInsets.only(top: 2, right: 12),
-            decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(2)),
+    final clock = SizedBox(
+      width: 52,
+      child: Text(
+        moment.clock,
+        style: theme.textTheme.labelMedium?.copyWith(
+          fontFeatures: const [FontFeature.tabularFigures()],
+          color: scheme.onSurfaceVariant,
+        ),
+      ),
+    );
+
+    final who = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          providerName,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: theme.textTheme.bodyMedium,
+        ),
+        const SizedBox(height: 2),
+        Text(
+          hit.lotLabel,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: theme.textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+        ),
+      ],
+    );
+
+    final amount = Column(
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        Text(
+          '${fmtNumber(hit.amount)} ${hit.currency}',
+          style: theme.textTheme.labelMedium?.copyWith(
+            fontFeatures: const [FontFeature.tabularFigures()],
           ),
-          SizedBox(
-            width: 128,
+        ),
+        if (hit.cny != null)
+          Tooltip(
+            message: hit.cnyNote ?? '',
             child: Text(
-              fmtDate(hit.expiresAt),
+              '≈ ${fmtCny(hit.cny)}',
               style: theme.textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
             ),
           ),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('${hit.displayName} · ${hit.lotLabel}', style: theme.textTheme.bodyMedium),
-                const SizedBox(height: 2),
-                Row(
-                  children: [
-                    Text(
-                      '${fmtNumber(hit.amount)} ${hit.currency}',
-                      style: theme.textTheme.labelMedium,
-                    ),
-                    if (cny != null) ...[
-                      const SizedBox(width: 8),
-                      Tooltip(
-                        message: hit.cnyNote ?? '',
-                        child: Text(
-                          '≈ ${fmtCny(cny)}',
-                          style: theme.textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
-                        ),
+      ],
+    );
+
+    final chip = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: context.toneContainerForExpiry(level),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        expiryText(hit.inDays),
+        style: theme.textTheme.labelSmall?.copyWith(color: color),
+      ),
+    );
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 9),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 3,
+                height: compact ? 44 : 34,
+                margin: const EdgeInsets.only(top: 2, right: 12),
+                decoration: BoxDecoration(color: color, borderRadius: BorderRadius.circular(2)),
+              ),
+              Expanded(
+                child: compact
+                    ? Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              clock,
+                              const Spacer(),
+                              chip,
+                            ],
+                          ),
+                          const SizedBox(height: 6),
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              Expanded(child: who),
+                              const SizedBox(width: 12),
+                              amount,
+                            ],
+                          ),
+                        ],
+                      )
+                    : Row(
+                        children: [
+                          clock,
+                          const SizedBox(width: 12),
+                          Expanded(child: who),
+                          amount,
+                          const SizedBox(width: 12),
+                          chip,
+                        ],
                       ),
-                    ],
-                  ],
-                ),
-              ],
-            ),
+              ),
+            ],
           ),
-          const SizedBox(width: 12),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-            decoration: BoxDecoration(
-              color: context.toneContainerForExpiry(level),
-              borderRadius: BorderRadius.circular(999),
-            ),
-            child: Text(
-              expiryText(hit.inDays),
-              style: theme.textTheme.labelSmall?.copyWith(color: color),
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }

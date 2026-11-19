@@ -168,3 +168,78 @@ int warningHits(DashboardPayload payload) => payload.expiryTimeline
         hit.inDays > payload.expiryThresholds.criticalDays &&
         hit.inDays <= payload.expiryThresholds.warningDays)
     .length;
+
+/* ------------------------------------------------------------------ *
+ * 「最先到期」首屏：时刻换算、按天分组、2/5 天窗口
+ * 口径对应 `public/app.js:2823-2984`。
+ * ------------------------------------------------------------------ */
+
+/// 收起时只看未来 2 天，展开上限 5 天（与 Web 的 EXPIRY_DEFAULT_DAYS / EXPIRY_MAX_DAYS 一致）。
+const int expiryWindowDays = 2;
+const int expiryMaxDays = 5;
+
+String _twoDigits(int value) => value.toString().padLeft(2, '0');
+
+/// 本地时区下的「哪天 + 几点」，用于分组标题与行内时刻。
+class ExpiryMoment {
+  const ExpiryMoment({required this.label, required this.clock, required this.dayKey});
+
+  /// 已过期 / 今天 / 明天 / 后天 / MM/DD。
+  final String label;
+
+  /// HH:mm。
+  final String clock;
+
+  /// `Y-M-D`，只用于把同一本地日期的批次切成一组。
+  final String dayKey;
+}
+
+ExpiryMoment expiryMomentOf(DateTime expiresAt, {DateTime? now}) {
+  final at = expiresAt.toLocal();
+  final current = (now ?? DateTime.now()).toLocal();
+  DateTime startOf(DateTime value) => DateTime(value.year, value.month, value.day);
+  final diffDays =
+      (startOf(at).difference(startOf(current)).inMilliseconds / 86400000).round();
+  final clock = '${_twoDigits(at.hour)}:${_twoDigits(at.minute)}';
+  final dayKey = '${at.year}-${at.month}-${at.day}';
+
+  if (diffDays < 0) return ExpiryMoment(label: '已过期', clock: clock, dayKey: dayKey);
+  if (diffDays == 0) return ExpiryMoment(label: '今天', clock: clock, dayKey: dayKey);
+  if (diffDays == 1) return ExpiryMoment(label: '明天', clock: clock, dayKey: dayKey);
+  if (diffDays == 2) return ExpiryMoment(label: '后天', clock: clock, dayKey: dayKey);
+  return ExpiryMoment(
+    label: '${_twoDigits(at.month)}/${_twoDigits(at.day)}',
+    clock: clock,
+    dayKey: dayKey,
+  );
+}
+
+/// 到期批次按本地时刻升序；同一时刻保持原顺序。
+List<ExpiryHit> sortedExpiryHits(List<ExpiryHit> hits) {
+  final sorted = [...hits];
+  sorted.sort((a, b) => a.expiresAt.compareTo(b.expiresAt));
+  return sorted;
+}
+
+class ExpiryDayGroup {
+  const ExpiryDayGroup({required this.label, required this.dayKey, required this.hits});
+
+  final String label;
+  final String dayKey;
+  final List<ExpiryHit> hits;
+}
+
+/// 先按本地时刻升序，再按本地日期连续切组（不重排、不跳组）。
+List<ExpiryDayGroup> groupExpiryHits(List<ExpiryHit> hits, {DateTime? now}) {
+  final groups = <ExpiryDayGroup>[];
+  for (final hit in sortedExpiryHits(hits)) {
+    final moment = expiryMomentOf(hit.expiresAt, now: now);
+    final last = groups.isEmpty ? null : groups.last;
+    if (last != null && last.dayKey == moment.dayKey) {
+      last.hits.add(hit);
+    } else {
+      groups.add(ExpiryDayGroup(label: moment.label, dayKey: moment.dayKey, hits: [hit]));
+    }
+  }
+  return groups;
+}
