@@ -72,11 +72,11 @@ cp desktop/macos/seed/accounts.template.json "$RES/seed/accounts.template.json"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName Power Meter" "$APP/Contents/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Add :CFBundleName string Power Meter" "$APP/Contents/Info.plist"
 
-# 复用旧壳生成的图标（如果存在）
-if [ -f "$ROOT/desktop/dist/PowerMeter.app/Contents/Resources/AppIcon.icns" ]; then
-  cp "$ROOT/desktop/dist/PowerMeter.app/Contents/Resources/AppIcon.icns" "$RES/AppIcon.icns"
-  /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile AppIcon" "$APP/Contents/Info.plist" 2>/dev/null || true
-fi
+# 图标：与仓库内 appiconset 同一画法（desktop/macos/AppIcon.swift），
+# 直接生成 .icns 覆盖 Flutter 产物，保证桌面版与 iOS/Android 视觉一致。
+bash "$ROOT/tools/generate-app-icons.sh" --icns "$ROOT/desktop/build/flutter-appicon/AppIcon.icns" >/dev/null
+cp "$ROOT/desktop/build/flutter-appicon/AppIcon.icns" "$RES/AppIcon.icns"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIconFile AppIcon" "$APP/Contents/Info.plist" 2>/dev/null || true
 
 say "4/5 ad-hoc 签名"
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || die "codesign 失败"
