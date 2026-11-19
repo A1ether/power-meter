@@ -19,6 +19,7 @@ import {
   normalizeCookieHeader,
   notConfigured,
   optString,
+  type CheckinResult,
   type ProbeContext,
   type ProviderAdapter,
 } from './base.js';
@@ -676,6 +677,147 @@ function invalidateJwtCaches(account: AccountConfig, ctx: ProbeContext): void {
   if (cookie) tokenCache.delete(cookieKey(cookie));
 }
 
+const TRAE_CHECKIN_BASE = 'https://api.trae.cn/trae/api/v2/ug/checkin_credits';
+/**
+ * 成长页（/trae/api/v2/ug/…）的 UA：Trae SOLO CN 的 Electron 外壳。
+ * 用脚本类 UA 请求会被上游按 9074（当前参与用户太多）拒绝，见 magpie `trae_checkin.go`。
+ */
+const TRAE_UG_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) TRAE-SOLO-CN/0.1.69 Chrome/120.0.6099.291 Electron/28.2.10 Safari/537.36';
+const TRAE_UG_BRAND = 'ASUS TUF Gaming A15 FA507RM_FA507RM';
+const TRAE_UG_CLIENT_VERSION = '0.1.69';
+
+/**
+ * 签到用的设备标识。
+ *
+ * Trae CN 的领取按设备判定：15 位数字才被接受，16/19 位实测返回 9074。
+ * 账号已有 15 位 `deviceId` 时原样使用；否则按「账号设备 + uid」派生一个
+ * **稳定**的 15 位数字（同一账号每次相同，不轮换、不冒充他人），
+ * 与 magpie 的 `ugDevice()` 同一算法。
+ */
+function traeCheckinDeviceId(account: AccountConfig): string {
+  const own = optString(account, 'deviceId');
+  if (/^\d{15}$/.test(own)) return own;
+  const uid = optString(account, 'uid');
+  const n = BigInt(
+    `0x${createHash('sha256').update(`trae-cn-device\0${own}\0${uid}`).digest('hex').slice(0, 30)}`,
+  );
+  return String(100_000_000_000_000n + (n % 900_000_000_000_000n));
+}
+
+interface TraeCheckinAnswer {
+  code?: number;
+  message?: string;
+  enable?: boolean;
+  checked_in?: boolean;
+  checkedIn?: boolean;
+  credits?: number;
+  extra_credits?: number;
+  extraCredits?: number;
+}
+
+/** 成长页请求：固定 IDE 形态的头，body 为 `{req_source:1}`。 */
+async function traeCheckinCall(
+  account: AccountConfig,
+  ctx: ProbeContext,
+  token: string,
+  action: 'status' | 'claim',
+): Promise<TraeCheckinAnswer> {
+  const { body } = await fetchJson(`${TRAE_CHECKIN_BASE}/${action}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Cloud-IDE-JWT ${token}`,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'User-Agent': TRAE_UG_USER_AGENT,
+      'x-device-id': traeCheckinDeviceId(account),
+      'x-device-brand': TRAE_UG_BRAND,
+      'x-device-type': 'Windows',
+      'x-os-version': '10.0.22631',
+      'x-app-version': TRAE_UG_CLIENT_VERSION,
+    },
+    body: JSON.stringify({ req_source: 1 }),
+    timeoutMs: ctx.timeoutMs || TRAE_TIMEOUT_FALLBACK,
+  });
+  return isRecord(body) ? (body as TraeCheckinAnswer) : {};
+}
+
+/** 每日签到（Trae 国内版）：先读状态，仅在开启且今日未签时领取。 */
+export async function traeCheckin(
+  account: AccountConfig,
+  ctx: ProbeContext,
+): Promise<CheckinResult> {
+  try {
+    const token = await resolveJwt(account, ctx);
+    return await traeWithAuthRetry({
+      label: 'Trae ',
+      ctx,
+      token,
+      resolve: (options) => resolveJwt(account, ctx, options),
+      invalidate: () => invalidateJwtCaches(account, ctx),
+      run: async (jwt) => {
+        const status = await traeCheckinCall(account, ctx, jwt, 'status');
+        const code = firstNumber(pick(status, 'code')) ?? 0;
+        if (code === 1001) {
+          throw new Error('Trae 登录态已失效，请重新登录');
+        }
+        if (code !== 0) {
+          return { outcome: 'failed', message: traeCheckinRefusal(code, status.message) };
+        }
+        const credits = firstNumber(pick(status, 'credits')) ?? 0;
+        if (pick(status, 'checked_in', 'checkedIn') === true) {
+          return {
+            outcome: 'done',
+            credit: credits,
+            message: credits > 0 ? `今日已签到（${credits} 积分）` : '今日已签到',
+          };
+        }
+        if (pick(status, 'enable') === false) {
+          return { outcome: 'inactive', message: 'Trae 当前没有开启每日签到活动' };
+        }
+
+        const claim = await traeCheckinCall(account, ctx, jwt, 'claim');
+        const claimCode = firstNumber(pick(claim, 'code')) ?? 0;
+        if (claimCode === 9095) {
+          return {
+            outcome: 'ineligible',
+            message: claim.message || '该设备今天已经签到过了',
+          };
+        }
+        if (claimCode === 9074) {
+          return {
+            outcome: 'ineligible',
+            message: claim.message || 'Trae 拒绝了本次领取（9074），请到 Trae 客户端内签到',
+          };
+        }
+        if (claimCode === 1001) {
+          throw new Error('Trae 登录态已失效，请重新登录');
+        }
+        if (claimCode !== 0) {
+          return { outcome: 'failed', message: traeCheckinRefusal(claimCode, claim.message) };
+        }
+        const got =
+          (firstNumber(pick(claim, 'credits')) ?? 0) +
+          (firstNumber(pick(claim, 'extra_credits', 'extraCredits')) ?? 0);
+        const total = got > 0 ? got : credits;
+        return {
+          outcome: 'claimed',
+          credit: total,
+          message: total > 0 ? `签到成功 +${total} 积分` : '签到成功',
+        };
+      },
+    });
+  } catch (error) {
+    return { outcome: 'failed', message: `签到失败：${(error as Error).message}` };
+  }
+}
+
+function traeCheckinRefusal(code: number, message?: string): string {
+  const said = typeof message === 'string' && message.trim() ? `：${message.trim()}` : '';
+  return `Trae 返回 code=${code}${said}`;
+}
+
 /**
  * 是否为「上游拒绝登录态」。
  *
@@ -1053,6 +1195,13 @@ export const traeAdapter: ProviderAdapter = {
     },
   },
 
+  checkin: {
+    support: (account) =>
+      Boolean(account.credentials.cookie) || Boolean(account.credentials.accessToken)
+        ? { ok: true }
+        : { ok: false, reason: '需要 Cookie 或登录令牌才能签到' },
+    run: (account, ctx) => traeCheckin(account, ctx),
+  },
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
     const hasCookie = Boolean(cred(account, ctx, ['cookie', 'cookieHeader']));
     const hasExplicitToken = Boolean(cred(account, ctx, ['accessToken', 'token', 'authorization']));

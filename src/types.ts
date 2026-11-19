@@ -161,6 +161,11 @@ export interface ProviderEntry {
   /** 补充说明，如「已用 17,888 quota · 4 次请求」 */
   note: string | null;
   secrets: SecretRef[];
+  /**
+   * 该条目仍在取数中（占位快照被合并进卡片时沿用）。
+   * 只用于首屏「边取边渲染」，取数完成后由真实快照替换。
+   */
+  pending?: boolean;
 }
 
 export interface ProviderSnapshot {
@@ -209,6 +214,11 @@ export interface ProviderSnapshot {
   /** true 表示本次刷新失败，展示的是上一次成功的数据 */
   stale: boolean;
   /**
+   * 占位快照：首屏立即返回时该账号尚未取到数据。
+   * 前端据此渲染「取数中」骨架，而不是把它当成失败卡片或 0 余额。
+   */
+  pending?: boolean;
+  /**
    * 日级用量 / 增量（本地采样历史推算）。由编排层在取数成功后填充；
    * 适配器不感知此字段，构建快照时统一置 null（见 base.ts 的 buildSnapshot）。
    */
@@ -239,6 +249,8 @@ export interface DashboardTotals {
   providers: number;
   ok: number;
   failed: number;
+  /** 仍在取数的占位平台数：既不算正常也不算异常，前端单独提示 */
+  pending?: number;
   /**
    * 可用额度合计：每个平台取「账户余额」，没有余额字段时退回「剩余批次之和」。
    * 批次是余额的拆分，两者相加会重复计算，所以汇总只保留这一个口径。
@@ -260,4 +272,12 @@ export interface DashboardPayload {
   /** 按最快到期升序排列的到期事件流 */
   expiryTimeline: ExpiryHit[];
   providers: ProviderSnapshot[];
+  /**
+   * 以下字段只由 `/api/summary?wait=0`（非阻塞模式）填充：
+   * 后台是否仍在取数、完成进度、以及当前展示数据的最后取数时间。
+   * 阻塞模式与旧客户端可以忽略它们。
+   */
+  refreshing?: boolean;
+  progress?: { done: number; total: number };
+  dataUpdatedAt?: string | null;
 }

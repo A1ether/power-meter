@@ -3,6 +3,22 @@ import './vendor/qrcode.js';
 
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
+/**
+ * 后台刷新期间的前端轮询间隔。
+ *
+ * 后端 `/api/summary?wait=0` 立即返回当前已知快照并继续取数；这里按 900ms
+ * 轮询进度，让卡片逐张出现。只读内存聚合，不会额外请求上游。
+ */
+const REFRESH_POLL_MS = 900;
+
+/**
+ * 上一份成功载荷的本地缓存：浏览器刷新时先同步画出来，不必等接口回来。
+ * 只在 `refreshing !== true` 时写入，避免把「取数中」的半成品固化到下次首屏。
+ */
+const PAYLOAD_STORAGE_KEY = ['power', 'meter', 'payload', 'v1'].join('.');
+/** 超过这个时长的缓存不再展示（避免一打开就是几天前的余额） */
+const PAYLOAD_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
 /** 每张卡片默认展示的积分数，其余折叠 */
 const VISIBLE_LOTS = 3;
 
@@ -85,6 +101,12 @@ const state = {
   themeChoice: 'light',
   timer: null,
   loading: false,
+  /** 后台刷新轮询定时器（0 = 未排）；与 autoRefresh 的 5 分钟定时器是两件事 */
+  pollTimer: 0,
+  /** 请求在飞时用户又点了「立即刷新」：落地后补一轮强制刷新 */
+  forceQueued: false,
+  /** 当前画面是否来自 localStorage 缓存（首屏加速），只影响文案与徽标 */
+  dataCached: false,
   /**
    * 已被显式「显示」或「复制」过的托管密钥明文（key = provider#accountId#field）。
    * 只活在内存里，手动刷新时清空——否则凭证轮换后这页还举着旧值。
@@ -108,6 +130,15 @@ const state = {
    * 登录各是一个会话，按钮按 provider+method 匹配自己的状态。
    */
   login: null,
+  /**
+   * 每日签到状态：`GET /api/checkin` 的结果。
+   * 与 summary 分开拉取，签到结果不进入余额快照，避免污染缓存口径。
+   */
+  checkin: null,
+  /** 正在签到的账号键（provider|accountId），用于按钮 loading 态 */
+  checkinBusy: new Set(),
+  /** 签到弹窗里的提示（一键签到的汇总 / 错误） */
+  checkinMessage: '',
   /**
    * 管理区处于展开状态的卡片（key = cardKeyOf）。
    * 登录轮询会整张重建卡片，展开态必须存在 state 里，否则二维码面板会被收起来。
@@ -176,6 +207,16 @@ const els = {
   platformsTitle: document.getElementById('platforms-title'),
   platformsSubtitle: document.getElementById('platforms-subtitle'),
   platformsBody: document.getElementById('platforms-body'),
+  // 每日签到
+  checkinBtn: document.getElementById('checkin-btn'),
+  checkinDialog: document.getElementById('checkin-dialog'),
+  checkinClose: document.getElementById('checkin-close'),
+  checkinAuto: document.getElementById('checkin-auto'),
+  checkinAt: document.getElementById('checkin-at'),
+  checkinAll: document.getElementById('checkin-all'),
+  checkinMessage: document.getElementById('checkin-message'),
+  checkinList: document.getElementById('checkin-list'),
+  checkinSubtitle: document.getElementById('checkin-subtitle'),
   // 新版看板外壳（public/index.html）：导航、徽标、状态条、命令面板、移动端停靠栏
   pageTitle: document.getElementById('page-title'),
   statusChip: document.getElementById('status-chip'),
@@ -318,34 +359,136 @@ function applyStagger(container, key) {
   items.forEach((item, index) => item.style.setProperty('--i', String(index)));
 }
 
+/**
+ * 读上一份成功载荷。损坏 / 过期 / 结构不对一律当没有：
+ * 首屏加速不能以显示错误数据为代价。
+ */
+function readCachedPayload() {
+  try {
+    const raw = localStorage.getItem(PAYLOAD_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (
+      !parsed ||
+      !Array.isArray(parsed.providers) ||
+      !parsed.totals ||
+      typeof parsed.totals !== 'object' ||
+      !parsed.expiryThresholds ||
+      typeof parsed.expiryThresholds !== 'object'
+    ) {
+      return null;
+    }
+    const stamp = Date.parse(parsed.cachedAt ?? parsed.generatedAt ?? '');
+    if (!Number.isFinite(stamp) || Date.now() - stamp > PAYLOAD_CACHE_MAX_AGE_MS) {
+      localStorage.removeItem(PAYLOAD_STORAGE_KEY);
+      return null;
+    }
+    // 旧版本可能把「取数中」占位一起存过：读出来前剔除，避免下次首屏误显示
+    parsed.providers = parsed.providers.filter((item) => item && item.pending !== true);
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedPayload(data) {
+  if (!data || data.refreshing) return;
+  try {
+    const copy = { ...data, cachedAt: new Date().toISOString() };
+    delete copy.refreshing;
+    delete copy.progress;
+    localStorage.setItem(PAYLOAD_STORAGE_KEY, JSON.stringify(copy));
+  } catch {
+    /* localStorage 不可用 / 配额满：缓存只是加速，失败不影响主流程 */
+  }
+}
+
+function setRefreshBusy(busy) {
+  const refreshing = state.data?.refreshing === true;
+  els.refreshBtn.disabled = busy || refreshing;
+  if (busy) {
+    els.refreshBtn.textContent = '刷新中…';
+    return;
+  }
+  if (refreshing) {
+    const progress = state.data?.progress;
+    els.refreshBtn.textContent = progress
+      ? `刷新中 ${progress.done}/${progress.total}`
+      : '刷新中…';
+    return;
+  }
+  els.refreshBtn.textContent = '立即刷新';
+}
+
+function stopPoll() {
+  if (!state.pollTimer) return;
+  clearTimeout(state.pollTimer);
+  state.pollTimer = 0;
+}
+
+/** 后台刷新未结束时排下一次轮询；已在排队则不重复排 */
+function schedulePoll() {
+  if (state.pollTimer) return;
+  state.pollTimer = setTimeout(() => {
+    state.pollTimer = 0;
+    load(false);
+  }, REFRESH_POLL_MS);
+}
+
+/**
+ * 拉取看板数据（非阻塞）：
+ *   - 请求 `/api/summary?wait=0`，服务端立即返回当前已知快照并后台继续取数；
+ *   - `refreshing=true` 时每 900ms 轮询一次，逐平台补齐；
+ *   - 首屏会先用 localStorage 缓存渲染（见启动段），这里只负责把真实数据换上去。
+ */
 async function load(force = false) {
-  if (state.loading) return;
+  if (state.loading) {
+    // 请求在飞时又点了「立即刷新」：等这次落地后补一轮强制刷新，不并发打上游
+    if (force) state.forceQueued = true;
+    return;
+  }
   state.loading = true;
-  els.refreshBtn.disabled = true;
-  els.refreshBtn.textContent = '刷新中…';
+  setRefreshBusy(true);
   // 手动刷新 = 「重新读一遍配置」，此时把上一轮读出来的明文密钥与配置清单都丢掉
   if (force) {
     state.revealed.clear();
     state.configuredAccounts.clear();
     state.platformOverview = null;
+    stopPoll();
   }
   try {
-    // 适配器元信息（「＋ 添加账号」的字段声明）先就位，否则首屏渲染不出表单字段
-    await loadAdapterMeta();
-    const response = await fetch(`/api/summary${force ? '?force=1' : ''}`, {
-      headers: { Accept: 'application/json' },
-    });
+    // 元信息与聚合结果并发：不要再把 /api/providers 的往返叠加到首屏等待上
+    const [, response] = await Promise.all([
+      loadAdapterMeta(),
+      fetch(`/api/summary?wait=0${force ? '&force=1' : ''}`, {
+        headers: { Accept: 'application/json' },
+      }),
+      // 签到状态是独立接口：失败不阻塞余额首屏
+      loadCheckin().catch(() => null),
+    ]);
     if (!response.ok) throw new Error(`接口返回 ${response.status}`);
-    state.data = await response.json();
+    const data = await response.json();
+    state.data = data;
+    state.dataCached = false;
     render();
+    writeCachedPayload(data);
+    if (data.refreshing) schedulePoll();
+    else stopPoll();
   } catch (error) {
+    // 有缓存时保留上一屏，只在诊断区提示；一次网络抖动不该把画面清空
     els.diagnostics.replaceChildren(
       element('div', 'diag diag--warn', `加载失败：${error.message}`),
     );
+    if (state.data?.refreshing) schedulePoll();
   } finally {
     state.loading = false;
-    els.refreshBtn.disabled = false;
-    els.refreshBtn.textContent = '立即刷新';
+    setRefreshBusy(false);
+    if (state.forceQueued) {
+      state.forceQueued = false;
+      load(true);
+    } else if (state.data?.refreshing && !state.pollTimer) {
+      schedulePoll();
+    }
   }
 }
 
@@ -360,10 +503,27 @@ function render() {
   renderDiagnostics(data);
   // 外壳（导航徽标 / 平台子菜单 / 状态条）跟着同一份数据走，放在业务渲染之后
   renderShell(data);
+  renderCheckin();
 
   els.meta.textContent = `共 ${data.providers.length} 个平台 · 服务端缓存 ${data.cacheTtlSeconds}s`;
-  els.subtitle.textContent = `多平台余额 / 积分看板 · ${data.totals.ok} 个平台数据正常`;
-  els.footerUpdated.textContent = `数据生成于 ${fmtDate(data.generatedAt)}`;
+  const pending = data.totals?.pending ?? 0;
+  els.subtitle.textContent =
+    `多平台余额 / 积分看板 · ${data.totals.ok} 个平台数据正常` +
+    (pending > 0 ? ` · ${pending} 个取数中` : '');
+
+  const stamp = data.dataUpdatedAt ?? data.cachedAt ?? data.generatedAt;
+  if (data.refreshing) {
+    const progress = data.progress ?? { done: 0, total: 0 };
+    els.footerUpdated.textContent = data.dataUpdatedAt
+      ? `数据更新于 ${fmtDate(data.dataUpdatedAt)} · 正在刷新 ${progress.done}/${progress.total}`
+      : `正在首次取数 ${progress.done}/${progress.total}`;
+  } else if (state.dataCached) {
+    els.footerUpdated.textContent =
+      `显示上次缓存（${fmtDate(data.cachedAt ?? stamp)}）` +
+      (state.loading ? ' · 正在刷新…' : '');
+  } else {
+    els.footerUpdated.textContent = `数据更新于 ${fmtDate(stamp)}`;
+  }
 }
 
 /**
@@ -437,13 +597,17 @@ function renderSummary(data) {
       key: 'providers',
       label: '平台总数',
       value: totals.providers,
-      hint: `${totals.ok} 正常 / ${totals.failed} 异常`,
+      hint:
+        `${totals.ok} 正常 / ${totals.failed} 异常` +
+        ((totals.pending ?? 0) > 0 ? ` / ${totals.pending} 取数中` : ''),
     },
     {
       key: 'available',
       label: '可用额度合计',
       rows: availableRows,
-      hint: '各币种余额独立汇总，数值之间互不换算',
+      hint:
+        '各币种余额独立汇总，数值之间互不换算' +
+        ((totals.pending ?? 0) > 0 ? ` · ${totals.pending} 个平台取数中` : ''),
     },
     {
       key: 'critical',
@@ -587,12 +751,18 @@ function sortedProviders(data) {
   }
 
   if (state.sort === 'risk') {
-    providers = providers.filter((provider) => urgencyOf(provider, thresholds) !== 'safe');
+    // 取数中的平台尚未知紧急程度，先留在列表里，等数据回来再按真实结果过滤
+    providers = providers.filter(
+      (provider) => provider.pending === true || urgencyOf(provider, thresholds) !== 'safe',
+    );
   }
 
   const rank = { critical: 0, warning: 1, safe: 2 };
   const sorted = [...providers];
   sorted.sort((a, b) => {
+    // 取数中的占位卡片始终排在最后：它们只是临时骨架，不该占据「最快到期」首屏位置
+    const pendingDiff = Number(a.pending === true) - Number(b.pending === true);
+    if (pendingDiff !== 0) return pendingDiff;
     switch (state.sort) {
       case 'amount-asc':
         return balanceFor(a) - balanceFor(b);
@@ -654,10 +824,277 @@ function renderGrid(data) {
   applyStagger(els.grid, 'grid');
 }
 
+/* ------------------------------------------------------------------ *
+ * 每日签到
+ * ------------------------------------------------------------------ */
+
+function checkinKeyOf(provider, accountId) {
+  return `${provider}|${accountId ?? ''}`;
+}
+
+function beijingDayKey(now = Date.now()) {
+  return new Date(now + 8 * 3_600_000).toISOString().slice(0, 10);
+}
+
+function checkinStateFor(provider, accountId) {
+  const list = state.checkin?.accounts ?? [];
+  const exact = list.find(
+    (item) => item.provider === provider && (item.accountId ?? '') === (accountId ?? ''),
+  );
+  if (exact) return exact;
+  // 昵称刚被上游解析、accounts.json 尚未热加载时，卡片名与本轮签名可能短暂不一致；
+  // 平台只有一个账号时退回到它，避免签到按钮整段时间不出现。
+  const sameProvider = list.filter((item) => item.provider === provider);
+  return sameProvider.length === 1 ? sameProvider[0] : null;
+}
+
+function checkinOutcomeText(record) {
+  if (!record) return '今天未签到';
+  switch (record.outcome) {
+    case 'claimed':
+      return record.credit ? `已领取 +${record.credit}` : '已领取';
+    case 'done':
+      return '今日已签到';
+    case 'inactive':
+      return '当前无活动';
+    case 'ineligible':
+      return '不可领取';
+    case 'unsupported':
+      return '不支持';
+    case 'failed':
+      return '签到失败';
+    default:
+      return record.outcome ?? '—';
+  }
+}
+
+function checkinOutcomeClass(record) {
+  if (!record) return '';
+  if (record.outcome === 'claimed' || record.outcome === 'done') return 'is-ok';
+  if (record.outcome === 'failed') return 'is-bad';
+  return 'is-muted';
+}
+
+function showCheckinMessage(text, kind = '') {
+  state.checkinMessage = text;
+  if (!els.checkinMessage) return;
+  els.checkinMessage.textContent = text;
+  els.checkinMessage.hidden = !text;
+  els.checkinMessage.dataset.kind = kind;
+}
+
+async function loadCheckin() {
+  const response = await fetch('/api/checkin', { headers: { Accept: 'application/json' } });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(payload?.error || `接口返回 ${response.status}`);
+  state.checkin = payload;
+  renderCheckin();
+  // 卡片上的签到按钮/徽标依赖这份状态；数据已就绪时同步重绘
+  if (state.data) renderGrid(state.data);
+  return payload;
+}
+
+function renderCheckin() {
+  const status = state.checkin;
+  // 兼容没有签到弹窗的旧静态页（如 Flutter 构建产物）：整段安静跳过
+  if (!els.checkinList || !els.checkinAuto || !els.checkinAt) return;
+
+  if (status?.settings) {
+    els.checkinAuto.checked = status.settings.auto === true;
+    // 用户正在改时间时不要抢输入框
+    if (document.activeElement !== els.checkinAt) els.checkinAt.value = status.settings.at ?? '09:00';
+  }
+
+  const running = new Set(status?.running ?? []);
+  /*
+   * 只展示「支持每日签到」的账号：没有签到能力的平台（A1etherOpenAi、千问办公、
+   * 只读示例平台等）不进列表，避免把 20 多个无关账号堆在签到弹窗里。
+   * 支持但已停用的账号仍保留，并标注「账号已停用」，方便用户知道为什么没签。
+   */
+  const accounts = (status?.accounts ?? []).filter((item) => item.supported);
+  if (accounts.length === 0) {
+    els.checkinList.replaceChildren(
+      element('p', 'checkin-empty muted', status ? '还没有支持每日签到的账号' : '读取签到状态…'),
+    );
+    return;
+  }
+
+  const today = beijingDayKey();
+  const rows = accounts
+    .slice()
+    .sort(
+      (a, b) =>
+        a.displayName.localeCompare(b.displayName, 'zh-CN') ||
+        a.accountId.localeCompare(b.accountId, 'zh-CN'),
+    )
+    .map((account) => {
+      const row = element('div', 'checkin-row');
+      const identity = element('div', 'checkin-row__identity');
+      identity.append(
+        element('strong', '', account.displayName),
+        element('span', 'muted', account.accountId || '默认账号'),
+      );
+      const record = account.record;
+      const isToday = record?.day === today;
+      const result = element('div', `checkin-row__result ${checkinOutcomeClass(record)}`);
+      result.append(element('span', '', isToday ? checkinOutcomeText(record) : '今天未签到'));
+      if (record?.message) result.title = record.message;
+      if (isToday && record?.at) {
+        result.append(element('span', 'checkin-row__time muted', fmtDate(record.at)));
+      }
+      row.append(identity, result);
+
+      const key = checkinKeyOf(account.provider, account.accountId);
+      if (!account.enabled) {
+        row.append(element('span', 'muted checkin-row__hint', '账号已停用'));
+      } else if (!account.supported) {
+        row.append(element('span', 'muted checkin-row__hint', account.reason || '不支持签到'));
+      } else {
+        const busy = state.checkinBusy.has(key) || running.has(key);
+        const settled = isToday && (record?.outcome === 'claimed' || record?.outcome === 'done');
+        const button = element(
+          'button',
+          'btn checkin-row__btn',
+          busy ? '签到中…' : settled ? '已签到' : '签到',
+        );
+        button.type = 'button';
+        button.disabled = busy || settled;
+        button.addEventListener('click', () =>
+          runCheckin(account.provider, account.accountId, button),
+        );
+        row.append(button);
+      }
+      return row;
+    });
+
+  els.checkinList.replaceChildren(...rows);
+  const disabled = accounts.filter((item) => !item.enabled).length;
+  if (els.checkinSubtitle) {
+    els.checkinSubtitle.textContent =
+      `共 ${accounts.length} 个账号支持签到` +
+      (disabled > 0 ? `（${disabled} 个已停用）` : '') +
+      '；按北京时间每天执行一次';
+  }
+}
+
+async function runCheckin(provider, accountId, button) {
+  const key = checkinKeyOf(provider, accountId);
+  if (state.checkinBusy.has(key)) return;
+  state.checkinBusy.add(key);
+  if (button) {
+    button.disabled = true;
+    button.textContent = '签到中…';
+  }
+  showCheckinMessage('');
+  try {
+    const response = await fetch('/api/checkin', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'X-Power-Meter-Intent': 'checkin',
+      },
+      body: JSON.stringify({ provider, accountId }),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(payload?.error || `接口返回 ${response.status}`);
+    const result = payload?.result;
+    if (result) {
+      showCheckinMessage(
+        `${provider} ${accountId || ''}：${checkinOutcomeText(result)}${result.message ? ` · ${result.message}` : ''}`,
+        result.outcome === 'failed' ? 'bad' : 'ok',
+      );
+    }
+    await loadCheckin();
+    // 领取成功才会改变余额；失败/已签到不必再打一轮全量探测
+    if (result?.outcome === 'claimed') load(true);
+  } catch (error) {
+    showCheckinMessage(`签到失败：${error.message}`, 'bad');
+  } finally {
+    state.checkinBusy.delete(key);
+    if (state.data) renderGrid(state.data);
+    renderCheckin();
+  }
+}
+
+async function runAllCheckins() {
+  if (!els.checkinAll) return;
+  els.checkinAll.disabled = true;
+  const label = els.checkinAll.textContent;
+  els.checkinAll.textContent = '签到中…';
+  showCheckinMessage('正在为所有支持签到的账号执行…');
+  try {
+    const response = await fetch('/api/checkin/all', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'X-Power-Meter-Intent': 'checkin-all',
+      },
+      body: '{}',
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(payload?.error || `接口返回 ${response.status}`);
+    const results = payload?.results ?? [];
+    const claimed = results.filter((item) => item.outcome === 'claimed').length;
+    const done = results.filter((item) => item.outcome === 'done').length;
+    const failed = results.filter((item) => item.outcome === 'failed').length;
+    showCheckinMessage(
+      `签到完成：成功 ${claimed} · 已签到 ${done} · 失败 ${failed}` +
+        (results.length === 0 ? '（没有可签到的账号）' : ''),
+      failed > 0 ? 'bad' : 'ok',
+    );
+    await loadCheckin();
+    if (claimed > 0) load(true);
+  } catch (error) {
+    showCheckinMessage(`一键签到失败：${error.message}`, 'bad');
+  } finally {
+    els.checkinAll.disabled = false;
+    els.checkinAll.textContent = label;
+  }
+}
+
+async function updateCheckinSettings(patch) {
+  try {
+    const response = await fetch('/api/checkin/settings', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'X-Power-Meter-Intent': 'checkin-settings',
+      },
+      body: JSON.stringify(patch),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(payload?.error || `接口返回 ${response.status}`);
+    if (payload?.settings) {
+      if (state.checkin) state.checkin.settings = payload.settings;
+      else state.checkin = { settings: payload.settings, accounts: [], running: [] };
+    }
+    showCheckinMessage('设置已保存', 'ok');
+    renderCheckin();
+  } catch (error) {
+    showCheckinMessage(`设置保存失败：${error.message}`, 'bad');
+    // 回滚 UI 到服务端真实状态
+    await loadCheckin().catch(() => null);
+  }
+}
+
+function openCheckinDialog() {
+  if (!els.checkinDialog) return;
+  if (!els.checkinDialog.open) els.checkinDialog.showModal();
+  void loadCheckin().catch((error) => showCheckinMessage(error.message, 'bad'));
+}
+
 function buildCard(provider, thresholds) {
   const node = els.cardTemplate.content.firstElementChild.cloneNode(true);
-  const healthy = provider.status === 'ok' || provider.status === 'demo';
-  node.dataset.state = healthy ? 'ok' : 'failed';
+  /*
+   * pending = 服务端首屏立即返回时的占位快照（见 src/service.ts 的 pendingSnapshot）。
+   * 它不是失败：卡片按「取数中」渲染骨架，不显示 0 余额，也不计入异常统计。
+   */
+  const pending = provider.pending === true;
+  const healthy = !pending && (provider.status === 'ok' || provider.status === 'demo');
+  node.dataset.state = pending ? 'loading' : healthy ? 'ok' : 'failed';
   node.dataset.urgency = urgencyOf(provider, thresholds);
 
   node.querySelector('.card__name').textContent = provider.displayName;
@@ -666,11 +1103,17 @@ function buildCard(provider, thresholds) {
   // 一个平台一个站点：徽标就是该平台归属的区域，不再有「同平台跨站点」需要区分
   const regionText = provider.region === 'cn' ? '国内' : '国际';
   tags.append(element('span', `chip chip--${provider.region}`, regionText));
-  if (provider.status === 'demo') tags.append(element('span', 'chip chip--demo', '示例数据'));
+  if (pending) {
+    tags.append(element('span', 'chip chip--loading', '取数中'));
+  } else if (provider.status === 'demo') {
+    tags.append(element('span', 'chip chip--demo', '示例数据'));
+  }
   if (provider.stale) tags.append(element('span', 'chip chip--warning', '数据可能过期'));
   // 有到期概念的走三色分级；明确不过期的（如 A1etherOpenAi 的 quota）直接给绿色标签。
   // 两者互斥：一旦声明了永不过期，就不该再出现任何到期倒计时
-  if (provider.neverExpires) {
+  if (pending) {
+    // 取数完成前不猜到期状态
+  } else if (provider.neverExpires) {
     tags.append(element('span', 'chip chip--ok', '永不过期'));
   } else if (provider.nextExpiryInDays !== null) {
     const level = levelFor(provider.nextExpiryInDays, thresholds);
@@ -683,9 +1126,62 @@ function buildCard(provider, thresholds) {
       ),
     );
   }
-  if (!healthy) tags.append(element('span', 'chip chip--danger', provider.status));
+  if (!healthy && !pending) tags.append(element('span', 'chip chip--danger', provider.status));
 
-  node.querySelector('.card__amount').textContent = healthy ? fmtNumber(balanceFor(provider)) : '—';
+  /*
+   * 每日签到：只对「支持 + 账号启用 + 卡片健康」的账号展示。
+   * 结果今天有效时才把结论做成徽标；隔天的记录只在弹窗里展示，避免卡片长期挂着旧状态。
+   */
+  const checkin = healthy && !pending
+    ? checkinStateFor(provider.provider, provider.accountId)
+    : null;
+  const checkinRecord = checkin?.record ?? null;
+  const checkinToday = checkinRecord?.day === beijingDayKey();
+  if (checkin && checkinToday) {
+    const outcome = checkinRecord.outcome;
+    if (outcome === 'claimed') {
+      tags.append(
+        element(
+          'span',
+          'chip chip--ok',
+          checkinRecord.credit ? `签到 +${checkinRecord.credit}` : '已签到',
+        ),
+      );
+    } else if (outcome === 'done') {
+      tags.append(element('span', 'chip chip--ok', '已签到'));
+    } else if (outcome === 'failed') {
+      tags.append(element('span', 'chip chip--danger', '签到失败'));
+    }
+  }
+  const checkinBtn = node.querySelector('.card__checkin');
+  if (checkinBtn) {
+    if (checkin?.supported && checkin.enabled) {
+      const key = checkinKeyOf(checkin.provider, checkin.accountId);
+      const busy = state.checkinBusy.has(key) || (state.checkin?.running ?? []).includes(key);
+      const settled =
+        checkinToday &&
+        (checkinRecord?.outcome === 'claimed' || checkinRecord?.outcome === 'done');
+      checkinBtn.hidden = false;
+      checkinBtn.disabled = busy || settled;
+      checkinBtn.textContent = busy
+        ? '签到中…'
+        : settled
+          ? '已签到'
+          : '签到';
+      checkinBtn.title = checkinRecord?.message || '为该账号执行今天的签到';
+      checkinBtn.addEventListener('click', () =>
+        runCheckin(checkin.provider, checkin.accountId, checkinBtn),
+      );
+    } else {
+      checkinBtn.hidden = true;
+    }
+  }
+
+  node.querySelector('.card__amount').textContent = pending
+    ? '读取中…'
+    : healthy
+      ? fmtNumber(balanceFor(provider))
+      : '—';
   node.querySelector('.card__currency').textContent = healthy ? currencyFor(provider) : '';
 
   const planText = [provider.plan, provider.source === 'local' ? '本地示例' : null]
@@ -717,7 +1213,11 @@ function buildCard(provider, thresholds) {
     (a, b) => (daysUntil(a.expiresAt) ?? Number.POSITIVE_INFINITY) - (daysUntil(b.expiresAt) ?? Number.POSITIVE_INFINITY),
   );
 
-  if (!healthy) {
+  if (pending) {
+    lotsContainer.replaceChildren(
+      element('p', 'card__note muted card__loading', provider.message || '正在取数…'),
+    );
+  } else if (!healthy) {
     lotsContainer.replaceChildren(element('p', 'card__error', provider.message || '取数失败'));
   } else if (credits.length === 0) {
     lotsContainer.replaceChildren(
@@ -788,7 +1288,9 @@ function buildCard(provider, thresholds) {
     },
   });
 
-  node.querySelector('.card__updated').textContent = `更新于 ${fmtDate(provider.updatedAt)}`;
+  node.querySelector('.card__updated').textContent = pending
+    ? '正在取数…'
+    : `更新于 ${fmtDate(provider.updatedAt)}`;
   const link = node.querySelector('.card__link');
   if (provider.dashboardUrl) {
     link.href = provider.dashboardUrl;
@@ -898,12 +1400,13 @@ function renderEntries(node, provider) {
 }
 
 function buildEntry(provider, entry) {
-  const healthy = entry.status === 'ok' || entry.status === 'demo';
+  const pending = entry.pending === true;
+  const healthy = !pending && (entry.status === 'ok' || entry.status === 'demo');
   // 额度归零是事实判断，不需要阈值：0 就是调不动了
   const empty = healthy && entry.amount <= 0;
   const row = element(
     'div',
-    `entry${healthy ? '' : ' entry--failed'}${empty ? ' entry--empty' : ''}`,
+    `entry${pending ? ' entry--pending' : healthy ? '' : ' entry--failed'}${empty ? ' entry--empty' : ''}`,
   );
 
   const head = element('div', 'entry__head');
@@ -911,8 +1414,8 @@ function buildEntry(provider, entry) {
   head.append(
     element(
       'span',
-      `entry__amount${healthy && !empty ? '' : ' entry__amount--failed'}`,
-      healthy ? `${fmtNumber(entry.amount)} ${entry.currency}` : entry.status,
+      `entry__amount${pending ? '' : healthy && !empty ? '' : ' entry__amount--failed'}`,
+      pending ? '取数中…' : healthy ? `${fmtNumber(entry.amount)} ${entry.currency}` : entry.status,
     ),
   );
   row.append(head);
@@ -2355,9 +2858,17 @@ function renderTimeline(data) {
   els.timeline.replaceChildren();
 
   if (hits.length === 0) {
-    els.timeline.append(element('p', 'expiry__empty muted', '暂无可用的到期信息'));
+    // 首屏立即返回时可能还没有任何到期数据：明确说「正在取数」，不要让人以为真的没有额度
+    const loading = data.refreshing === true;
+    els.timeline.append(
+      element('p', 'expiry__empty muted', loading ? '正在取数…' : '暂无可用的到期信息'),
+    );
     els.timeline.dataset.enter = 'instant';
-    if (els.expirySummary) els.expirySummary.textContent = '没有任何带过期时间的积分批次';
+    if (els.expirySummary) {
+      els.expirySummary.textContent = loading
+        ? '正在从各平台取数，到期批次会逐条出现'
+        : '没有任何带过期时间的积分批次';
+    }
     return;
   }
 
@@ -2485,6 +2996,8 @@ function renderDiagnostics(data) {
     items.push({ warn: true, text: warning });
   }
   for (const provider of data.providers) {
+    // 取数中的占位卡片不是诊断项：数据回来之前不该在「诊断」里报错
+    if (provider.pending === true) continue;
     if (provider.status === 'ok' || provider.status === 'demo') continue;
     items.push({
       warn: provider.status !== 'notConfigured',
@@ -2581,12 +3094,24 @@ function renderShell(data) {
     els.navBadgeDiag.classList.toggle('nav__badge--hot', diagCount > 0);
   }
 
-  // 状态条：N 正常 / M 异常；有异常时整条转 warning 色
+  // 状态条：刷新中显示进度；空闲时 N 正常 / M 异常（占位卡片单列「取数中」）
   if (els.statusText) {
-    els.statusText.textContent = `${totals.ok ?? 0} 正常 / ${totals.failed ?? 0} 异常`;
+    if (data.refreshing) {
+      const progress = data.progress ?? { done: 0, total: totals.providers ?? 0 };
+      els.statusText.textContent =
+        state.dataCached
+          ? `显示缓存 · 刷新中 ${progress.done}/${progress.total}`
+          : `正在刷新 ${progress.done}/${progress.total}`;
+    } else {
+      const pending = totals.pending ?? 0;
+      els.statusText.textContent =
+        `${totals.ok ?? 0} 正常 / ${totals.failed ?? 0} 异常` +
+        (pending > 0 ? ` / ${pending} 取数中` : '');
+    }
   }
   if (els.statusChip) {
-    els.statusChip.classList.toggle('status--warn', (totals.failed ?? 0) > 0);
+    els.statusChip.classList.toggle('status--warn', !data.refreshing && (totals.failed ?? 0) > 0);
+    els.statusChip.classList.toggle('status--busy', data.refreshing === true);
   }
 
   renderNavPlatforms(data);
@@ -2611,6 +3136,7 @@ function countDiagnostics(data) {
   const warnings = (data.warnings ?? []).length;
   const unhealthy = (data.providers ?? []).filter(
     (provider) =>
+      provider.pending !== true &&
       provider.status !== 'ok' &&
       provider.status !== 'demo' &&
       provider.status !== 'notConfigured',
@@ -3242,6 +3768,18 @@ function scheduleAutoRefresh() {
 }
 
 els.refreshBtn.addEventListener('click', () => load(true));
+els.checkinBtn?.addEventListener('click', openCheckinDialog);
+els.checkinClose?.addEventListener('click', () => els.checkinDialog.close());
+els.checkinDialog?.addEventListener('click', (event) => {
+  if (event.target === els.checkinDialog) els.checkinDialog.close();
+});
+els.checkinAuto?.addEventListener('change', (event) => {
+  void updateCheckinSettings({ auto: event.target.checked });
+});
+els.checkinAt?.addEventListener('change', (event) => {
+  void updateCheckinSettings({ at: event.target.value });
+});
+els.checkinAll?.addEventListener('click', () => void runAllCheckins());
 els.platformsBtn.addEventListener('click', () => openPlatformsDialog());
 els.platformsClose.addEventListener('click', () => els.platformsDialog.close());
 // 点遮罩关闭（dialog 内部点击不冒泡到 dialog 本身时才算遮罩）
@@ -3274,6 +3812,25 @@ document.addEventListener('visibilitychange', () => {
     scheduleLoginPoll(state.login.providerId);
   }
 });
+
+// 首屏先用上一份成功载荷同步画出来（浏览器刷新 / 重新进入都立即有画面）；
+// 随后 load(false) 用 /api/summary?wait=0 的非阻塞结果逐平台替换。
+const cachedPayload = readCachedPayload();
+if (cachedPayload) {
+  state.data = cachedPayload;
+  state.dataCached = true;
+  // 缓存数据要「立刻可见」：不重放首次入场的错开动画（最多 32ms × N 的延迟）
+  entered.add('summary');
+  entered.add('grid');
+  try {
+    render();
+  } catch (error) {
+    // 缓存结构异常（旧版本字段变更等）：丢掉缓存，等接口返回真实数据
+    state.data = null;
+    state.dataCached = false;
+    void error;
+  }
+}
 
 // 外壳交互先就位：即使 /api/summary 还没回来，导航、命令面板、停靠栏也能用
 bindShell();

@@ -19,6 +19,7 @@ import {
   optBool,
   optString,
   splitByExpiry,
+  type CheckinResult,
   type ProbeContext,
   type ProviderAdapter,
   type ProviderLogin,
@@ -549,7 +550,9 @@ async function minimaxGet(
   ctx: ProbeContext,
   path: string,
   params: Array<[string, string | number]> = [],
+  options: { method?: 'GET' | 'POST'; body?: string } = {},
 ): Promise<unknown> {
+  const method = options.method ?? 'GET';
   if (isOauthAccount(account)) {
     let accessToken = await ensureOauthAccessToken(account, ctx);
     const userId = await ensureOauthUserId(account, ctx, accessToken);
@@ -561,9 +564,12 @@ async function minimaxGet(
         params,
         accessToken: token,
         userId,
+        body: options.body,
       });
       const { body } = await fetchJson(request.url, {
+        method,
         headers: request.headers,
+        ...(options.body === undefined ? {} : { body: options.body }),
         timeoutMs: ctx.timeoutMs || MINIMAX_TIMEOUT_FALLBACK,
       });
       return body;
@@ -596,12 +602,15 @@ async function minimaxGet(
     userId: identity.userId,
     opTicket: identity.opTicket,
     uuid: identity.uuid,
-    method: 'GET',
+    method,
+    body: options.body,
     skipSignature: optBool(account, 'skipSignature'),
   });
   const cookie = resolveCookie(account, ctx);
   const { body } = await fetchJson(request.url, {
+    method,
     headers: cookie ? { ...request.headers, Cookie: cookie } : request.headers,
+    ...(options.body === undefined ? {} : { body: options.body }),
     timeoutMs: ctx.timeoutMs || MINIMAX_TIMEOUT_FALLBACK,
   });
   return body;
@@ -619,6 +628,82 @@ function assertBaseResp(body: unknown, fallbackMessage: string): void {
     throw new Error(
       `${fallbackMessage}：${String(pick(baseResp, 'status_msg', 'statusMsg') ?? `status_code=${code}`)}`,
     );
+  }
+}
+
+/**
+ * 每日签到（移植自 magpie `minimax_checkin.go`）：
+ * 先读面板，再仅在「今天可领取」时 POST /claim。已领取 / 未开始 / 不可用
+ * 都按结果返回，不重复请求领取接口。
+ */
+export async function minimaxCheckin(
+  account: AccountConfig,
+  ctx: ProbeContext,
+): Promise<CheckinResult> {
+  try {
+    const statusBody = await minimaxGet(account, ctx, '/minimax-cloud/api/v1/signin/status', [
+      ['timezone_id', 'Asia/Shanghai'],
+    ]);
+    assertBaseResp(statusBody, '签到状态请求失败');
+    const statusPayload = isRecord(statusBody) && isRecord(statusBody.data) ? statusBody.data : statusBody;
+    const days = pick(statusPayload, 'days');
+    if (!Array.isArray(days)) {
+      return { outcome: 'failed', message: '签到面板响应缺少 days 字段（接口可能已改版）' };
+    }
+    const today = days.find((raw) => isRecord(raw) && pick(raw, 'is_today', 'isToday') === true);
+    if (!isRecord(today)) {
+      return { outcome: 'inactive', message: '当前没有可参与的签到活动' };
+    }
+    const dayNo = firstNumber(pick(today, 'day_no', 'dayNo')) ?? undefined;
+    const points = firstNumber(pick(today, 'points')) ?? 0;
+    const status = firstNumber(pick(today, 'status'));
+    if (status === 3) {
+      return {
+        outcome: 'done',
+        credit: points,
+        ...(dayNo ? { streak: dayNo } : {}),
+        message: points > 0 ? `今日已签到（${points} 积分）` : '今日已签到',
+      };
+    }
+    if (status === 4) {
+      return { outcome: 'ineligible', message: '今日签到对该账号不可用' };
+    }
+    if (status === 1) {
+      return { outcome: 'inactive', message: '今日签到尚未开始' };
+    }
+
+    const claimBody = await minimaxGet(
+      account,
+      ctx,
+      '/minimax-cloud/api/v1/signin/claim',
+      [['timezone_id', 'Asia/Shanghai']],
+      { method: 'POST', body: '{}' },
+    );
+    assertBaseResp(claimBody, '签到领取失败');
+    const claimPayload =
+      isRecord(claimBody) && isRecord(claimBody.data) ? claimBody.data : claimBody;
+    const result = firstNumber(pick(claimPayload, 'claim_result', 'claimResult'));
+    const gotDay = firstNumber(pick(claimPayload, 'day_no', 'dayNo')) ?? dayNo;
+    const gotPoints = firstNumber(pick(claimPayload, 'points')) ?? points;
+    if (result === 1) {
+      return {
+        outcome: 'claimed',
+        credit: gotPoints,
+        ...(gotDay ? { streak: gotDay } : {}),
+        message: gotPoints > 0 ? `签到成功 +${gotPoints} 积分` : '签到成功',
+      };
+    }
+    if (result === 2) {
+      return {
+        outcome: 'done',
+        credit: gotPoints,
+        ...(gotDay ? { streak: gotDay } : {}),
+        message: gotPoints > 0 ? `今日已签到（${gotPoints} 积分）` : '今日已签到',
+      };
+    }
+    return { outcome: 'failed', message: `签到接口返回未知 claim_result=${String(result)}` };
+  } catch (error) {
+    return { outcome: 'failed', message: `签到失败：${(error as Error).message}` };
   }
 }
 
@@ -730,9 +815,11 @@ export async function fetchMinimaxSigninState(
   return { todayStatus, cycleClaimed };
 }
 
-/** 客户端「类别」列的同类判定：非购买即签到 */
+/** 客户端「类别」列的同类判定：购买之外是签到；未知类型带上原值便于排查 */
 function creditLabel(creditType: number): string {
-  return creditType === CREDIT_TYPE_PURCHASED ? '购买积分' : '签到积分';
+  if (creditType === CREDIT_TYPE_PURCHASED) return '购买积分';
+  if (creditType === CREDIT_TYPE_CHECKIN) return '签到积分';
+  return `积分（类型 ${creditType}）`;
 }
 
 function formatAmount(value: number): string {
@@ -1245,6 +1332,18 @@ export const minimaxAdapter: ProviderAdapter = {
     }
   },
 
+  checkin: {
+    support: (account) => {
+      const ok = isOauthAccount(account)
+        ? Boolean(account.credentials.accessToken || account.credentials.access_token)
+        : Boolean(account.credentials.token || account.credentials.accessToken) &&
+          Boolean(account.credentials.cookie);
+      return ok
+        ? { ok: true }
+        : { ok: false, reason: '缺少 MiniMax 登录 token / Cookie，无法签到' };
+    },
+    run: (account, ctx) => minimaxCheckin(account, ctx),
+  },
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
     if (isOauthAccount(account)) {
       if (!resolveAccessToken(account, ctx)) {

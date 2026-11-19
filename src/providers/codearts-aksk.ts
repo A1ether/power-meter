@@ -12,6 +12,7 @@ import {
   makeWindow,
   optString,
   splitByExpiry,
+  type CheckinResult,
   type ProbeContext,
   type ProviderAdapter,
 } from './base.js';
@@ -181,6 +182,153 @@ export async function fetchCodeArtsSubscription(
     );
   }
   return parseStatisticsPlugin(result.json);
+}
+
+/* ------------------------------------------------------------------ *
+ * 每日签到（AK/SK 签名 snap-access）
+ * ------------------------------------------------------------------ */
+
+/** snap-access 的业务头：必须在签名完成后追加，参与签名会破坏签名 */
+const SNAP_EXTRA_HEADERS = { 'Agent-Type': 'PromptCenter', 'X-Language': 'zh-cn' };
+const DAILY_CHECKIN_TYPE = 'USER_LOGIN';
+const DAILY_CHECKIN_TITLE = /签到|每日/;
+const CLAIMED_STATUSES = new Set(['CLAIMED', 'CONFIRMED', 'CONSUMED']);
+
+async function codeartsSnapCall(
+  aksk: CodeArtsAkSk,
+  method: 'GET' | 'POST',
+  path: string,
+  body: string | undefined,
+  timeoutMs: number,
+): Promise<unknown> {
+  const result = await huaweiSignedFetch({
+    accessKey: aksk.accessKey,
+    secretKey: aksk.secretKey,
+    method,
+    url: `${SNAP_ACCESS_BASE}${path}`,
+    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    body,
+    // 与余额探测同一套签名参数；POST 的 body 参与 payload 哈希
+    signatureStyle: 'newline',
+    unsignedPayload: false,
+    unsignedHeaders: SNAP_EXTRA_HEADERS,
+    timeoutMs: Math.min(timeoutMs || AK_SK_TIMEOUT_FALLBACK, AK_SK_TIMEOUT_FALLBACK),
+  });
+  if (!result.ok) {
+    const detail = result.text.replace(/\s+/g, ' ').trim().slice(0, 200);
+    throw new HttpError(`snap-access 返回 HTTP ${result.status}${detail ? `：${detail}` : ''}`, result.status);
+  }
+  if (!isRecord(result.json)) throw new Error('签到响应不是 JSON 对象');
+  const code = firstNumber(pick(result.json, 'code'));
+  if (code !== null && code !== 0) {
+    const message = firstString(pick(result.json, 'message', 'msg')) ?? `code=${code}`;
+    throw new Error(message);
+  }
+  return pick(result.json, 'data') ?? result.json;
+}
+
+interface CodeArtsCampaign {
+  campaignId?: string | number;
+  type?: string;
+  title?: string;
+  claimable?: boolean;
+  status?: string;
+  benefitAmount?: number;
+}
+
+/**
+ * 每日签到：「限时福利 → 每日领取」。
+ *
+ * 与 CodeArts IDE 一致：先列活动，对每个可领取的 `USER_LOGIN` 活动
+ * `claim`，若 claim 返回了 benefit.id 再 `confirm`（不确认积分会一直 pending）。
+ * 移植自 magpie `opencode-codearts-auth` 的 `dailyCheckin()`。
+ */
+export async function codeartsCheckin(
+  account: AccountConfig,
+  ctx: ProbeContext,
+): Promise<CheckinResult> {
+  const aksk = readCodeArtsAkSk(account, ctx);
+  if (!aksk) {
+    return {
+      outcome: 'unsupported',
+      message: 'CodeArts 签到需要 AK/SK；Cookie 模式无法签 snap-access',
+    };
+  }
+  const timeoutMs = ctx.timeoutMs || AK_SK_TIMEOUT_FALLBACK;
+  try {
+    const listed = await codeartsSnapCall(aksk, 'GET', '/v1/ops/delivery?channel=IDE', undefined, timeoutMs);
+    const items = isRecord(listed) && Array.isArray(listed.items) ? listed.items : [];
+    const daily = items.filter(
+      (item): item is CodeArtsCampaign =>
+        isRecord(item) &&
+        String(pick(item, 'type') ?? '') === DAILY_CHECKIN_TYPE &&
+        DAILY_CHECKIN_TITLE.test(String(pick(item, 'title') ?? '')),
+    );
+    if (daily.length === 0) {
+      return { outcome: 'inactive', message: '当前没有每日领取活动' };
+    }
+
+    let credit = 0;
+    let claimed = 0;
+    let done = 0;
+    let failed: string | null = null;
+    for (const item of daily) {
+      const status = String(item.status ?? '');
+      if (item.claimable !== true && CLAIMED_STATUSES.has(status)) {
+        done += 1;
+        continue;
+      }
+      const campaignId = item.campaignId;
+      if (campaignId === undefined || campaignId === null || campaignId === '') {
+        failed = '活动缺少 campaignId';
+        continue;
+      }
+      if (item.claimable !== true) {
+        failed = `当前不可领取（status=${status || 'null'}）`;
+        continue;
+      }
+      try {
+        const claimedRaw = await codeartsSnapCall(
+          aksk,
+          'POST',
+          '/v1/ops/claim',
+          JSON.stringify({ campaignId, channel: 'IDE' }),
+          timeoutMs,
+        );
+        const benefit = isRecord(claimedRaw) ? claimedRaw : {};
+        // benefit.id 非 null 表示积分处于 pending，必须再 confirm
+        if (pick(benefit, 'id') !== null && pick(benefit, 'id') !== undefined) {
+          await codeartsSnapCall(
+            aksk,
+            'POST',
+            '/v1/ops/confirm',
+            JSON.stringify({ campaignId }),
+            timeoutMs,
+          );
+        }
+        claimed += 1;
+        credit +=
+          firstNumber(pick(benefit, 'benefitAmount', 'benefit_amount')) ??
+          firstNumber(item.benefitAmount) ??
+          0;
+      } catch (error) {
+        failed = (error as Error).message;
+      }
+    }
+
+    if (failed) return { outcome: 'failed', message: `CodeArts 签到失败：${failed}` };
+    if (claimed > 0) {
+      return {
+        outcome: 'claimed',
+        ...(credit > 0 ? { credit } : {}),
+        message: credit > 0 ? `签到成功 +${credit} 积分` : '签到成功',
+      };
+    }
+    if (done > 0) return { outcome: 'done', message: '今天已领取' };
+    return { outcome: 'ineligible', message: '当前不可领取' };
+  } catch (error) {
+    return { outcome: 'failed', message: `CodeArts 签到失败：${(error as Error).message}` };
+  }
 }
 
 /**

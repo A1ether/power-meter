@@ -74,6 +74,7 @@ function toEntry(snapshot: ProviderSnapshot): ProviderEntry {
     message: snapshot.message,
     note: snapshot.note,
     secrets: snapshot.secrets,
+    pending: snapshot.pending === true,
   };
 }
 
@@ -84,8 +85,9 @@ function finalizeCard(
 ): ProviderSnapshot {
   // 额度升序：最少的排最前，也就是最该关注的排最前
   const entries = [...input].sort((a, b) => a.amount - b.amount);
-  const healthy = entries.filter((entry) => OK_STATUSES.has(entry.status));
-  const failed = entries.filter((entry) => !OK_STATUSES.has(entry.status));
+  // 取数中的条目不算失败：它们只是还没返回，别把「正在取数」写进「N 个异常」
+  const healthy = entries.filter((entry) => !entry.pending && OK_STATUSES.has(entry.status));
+  const failed = entries.filter((entry) => !entry.pending && !OK_STATUSES.has(entry.status));
 
   // 同一平台的条目理论上同币种；真有混币种就只汇总额度最大的那一种，
   // 避免把不同单位硬加在一起给出一个假数字
@@ -98,6 +100,9 @@ function finalizeCard(
   return {
     ...card,
     entries,
+    // 所有条目都还是占位（一次都没取到）时，整张卡也按「取数中」处理；
+    // 只要有一条真实数据，就按真实状态渲染，未完成的账号等下一轮快照补齐
+    pending: card.pending === true && entries.every((entry) => entry.pending === true),
     // 账号身份已经下移到 entries[].id，卡片本身不再代表某一个账号
     accountId: '',
     // 只要有一个账号可用，这张卡片就不算坏——失败的账号在它自己那条上显示原因
@@ -161,6 +166,7 @@ export function buildTotals(snapshots: ProviderSnapshot[]): DashboardTotals {
   const availableByCurrency: Record<string, number> = {};
   let ok = 0;
   let failed = 0;
+  let pending = 0;
 
   const add = (bucket: Record<string, number>, currency: string, amount: number): number => {
     const next = round((bucket[currency] ?? 0) + amount);
@@ -169,7 +175,10 @@ export function buildTotals(snapshots: ProviderSnapshot[]): DashboardTotals {
   };
 
   for (const snapshot of snapshots) {
-    if (OK_STATUSES.has(snapshot.status)) ok += 1;
+    // 占位快照既不算正常也不算异常：它只是「还没取到」，单列出来给界面提示进度
+    if (snapshot.pending) {
+      pending += 1;
+    } else if (OK_STATUSES.has(snapshot.status)) ok += 1;
     else failed += 1;
 
     // basis='granted' 的批次只表达「何时到期」，不参与累加
@@ -192,6 +201,7 @@ export function buildTotals(snapshots: ProviderSnapshot[]): DashboardTotals {
     providers: snapshots.length,
     ok,
     failed,
+    pending,
     availableByCurrency,
     creditsByCurrency,
     balanceByCurrency,
@@ -309,6 +319,8 @@ export function buildPayload(
  *   2 = 取数失败的（排最后，避免干扰注意力）
  */
 function sortRank(snapshot: ProviderSnapshot): number {
+  // 取数中的占位卡片排在「有数据」与「失败」之间：不和失败混在一起，也不抢占首屏判断
+  if (snapshot.pending) return 1;
   if (!OK_STATUSES.has(snapshot.status)) return 2;
   return snapshot.nextExpiryAt ? 0 : 1;
 }

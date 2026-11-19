@@ -1,10 +1,12 @@
-import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { adoptResolvedAccountName } from './account-store.js';
 import { buildPayload, type AggregateSettings } from './aggregate.js';
 import {
   loadConfig,
   loadDotEnv,
   resolveDotEnvPath,
+  resolveRuntimeDir,
   type AccountConfig,
   type LoadConfigResult,
 } from './config.js';
@@ -23,6 +25,48 @@ export interface RefreshOutcome {
 }
 
 const MAX_CONCURRENCY = 6;
+
+/**
+ * 后台刷新任务的进度句柄。
+ *
+ * 非阻塞模式（`/api/summary?wait=0`）在任务进行期间反复读这里：`done/total`
+ * 让界面能显示「刷新中 3/11」，`queuedForce` 保证刷新途中点「立即刷新」不会丢。
+ */
+interface RefreshJob {
+  force: boolean;
+  startedAt: number;
+  total: number;
+  done: number;
+  queuedForce: boolean;
+  promise: Promise<void>;
+}
+
+interface PersistedSnapshot {
+  key: string;
+  snapshot: ProviderSnapshot;
+}
+
+interface PersistedSnapshotsFile {
+  version: 1;
+  savedAt: number;
+  snapshots: PersistedSnapshot[];
+}
+
+/** 磁盘快照路径：与 usage-history 同源锚定到运行时目录（`.run/`，已 gitignore） */
+function snapshotStorePath(): string {
+  return resolve(resolveRuntimeDir(), 'summary-cache.json');
+}
+
+/** 当前这批快照里最近一次成功取数的时间（占位快照不参与） */
+function latestUpdatedAt(snapshots: ProviderSnapshot[]): string | null {
+  let latest = 0;
+  for (const snapshot of snapshots) {
+    if (snapshot.pending) continue;
+    const ts = Date.parse(snapshot.updatedAt);
+    if (Number.isFinite(ts) && ts > latest) latest = ts;
+  }
+  return latest > 0 ? new Date(latest).toISOString() : null;
+}
 
 /** `.env` 写入串行队列：令牌刷新可能并发发生，避免两次读改写互相覆盖 */
 let envWriteChain: Promise<void> = Promise.resolve();
@@ -205,6 +249,19 @@ export class DashboardService {
   private ledgerCache: TtlCache<UsageLedger | null>;
   private accountsMtimeMs = 0;
   private dotEnvMtimeMs = 0;
+  /**
+   * 本轮 / 最近一次已知的账号快照（key 与缓存键一致）。
+   *
+   * 与 TtlCache 的区别：`live` 在**每个账号 probe 返回时立即更新**，
+   * 供非阻塞接口在整批取数结束前就能把已完成的部分画出来；缓存则要等
+   * `resolve()` 成功后才写入。
+   */
+  private readonly live = new Map<string, ProviderSnapshot>();
+  /** 正在进行的后台刷新；同一时刻只允许一个，避免重复打上游 */
+  private job: RefreshJob | null = null;
+  /** 上一轮后台刷新结束时间：失败账号 15s 后过期，冷却 10s 防止轮询把上游打爆 */
+  private refreshEndedAt = 0;
+  private readonly snapshotStorePath = snapshotStorePath();
 
   constructor() {
     this.configResult = loadConfig();
@@ -216,6 +273,8 @@ export class DashboardService {
     );
     this.accountsMtimeMs = this.readMtime();
     this.dotEnvMtimeMs = this.readDotEnvMtime();
+    // 进程重启后先用磁盘快照出画面（统一标 stale），再由后台刷新覆盖
+    this.restoreSnapshots();
   }
 
   get settings(): AggregateSettings {
@@ -246,6 +305,17 @@ export class DashboardService {
     };
   }
 
+  /**
+   * 后台强制刷新（签到成功后调用）。
+   *
+   * 走与 `/api/summary?wait=0&force=1` 同一个单任务通道：前端紧接着的强制刷新
+   * 不会另起一轮上游请求，而是并入当前任务 / 排队一轮。
+   */
+  refreshInBackground(providerFilter?: string[]): void {
+    this.ensureConfigFresh();
+    this.startBackgroundRefresh(true, providerFilter);
+  }
+
   async getPayload(): Promise<RefreshOutcome> {
     this.ensureConfigFresh();
     const snapshots = await this.collect(false);
@@ -256,23 +326,54 @@ export class DashboardService {
     };
   }
 
+  /**
+   * 非阻塞取数（`/api/summary?wait=0`）：立即返回「当前已知」的聚合结果，
+   * 需要刷新时把取数放到后台，由前端轮询逐平台补齐。
+   *
+   * 这是首屏 / 浏览器刷新 / 「立即刷新」不再长时间空白的核心：
+   * HTTP 响应不再依赖上游探测完成，画面先出来，数据边取边更新。
+   */
+  getImmediateOutcome(options: { force?: boolean } = {}): RefreshOutcome {
+    this.ensureConfigFresh();
+    const selected = this.selectedAccounts();
+    this.startBackgroundRefresh(options.force === true);
+
+    const snapshots = this.immediateSnapshots(selected);
+    const payload = buildPayload(snapshots, this.settings);
+    const job = this.job;
+    return {
+      payload: {
+        ...payload,
+        refreshing: job !== null,
+        progress: job
+          ? { done: Math.min(job.done, job.total), total: job.total }
+          : { done: selected.length, total: selected.length },
+        dataUpdatedAt: latestUpdatedAt(snapshots),
+      },
+      warnings: this.warnings,
+      missingEnvVars: this.missingEnvVars,
+    };
+  }
+
+  private selectedAccounts(providerFilter?: string[]): AccountConfig[] {
+    const enabled = this.configResult.config.accounts.filter((account) => account.enabled);
+    if (!providerFilter || providerFilter.length === 0) return enabled;
+    return enabled.filter((account) =>
+      providerFilter.some(
+        (name) =>
+          name === account.provider ||
+          name === account.displayName ||
+          name.toLowerCase() === account.provider.toLowerCase(),
+      ),
+    );
+  }
+
   private async collect(
     force: boolean,
     providerFilter?: string[],
+    job: RefreshJob | null = null,
   ): Promise<ProviderSnapshot[]> {
-    const enabled = this.configResult.config.accounts.filter((account) => account.enabled);
-    const selected =
-      providerFilter && providerFilter.length > 0
-        ? enabled.filter((account) =>
-            providerFilter.some(
-              (name) =>
-                name === account.provider ||
-                name === account.displayName ||
-                name.toLowerCase() === account.provider.toLowerCase(),
-            ),
-          )
-        : enabled;
-
+    const selected = this.selectedAccounts(providerFilter);
     if (selected.length === 0) return [];
 
     const keys = accountKeys(selected);
@@ -285,25 +386,55 @@ export class DashboardService {
           const index = cursor++;
           const account = selected[index];
           if (!account) continue;
-          results.push(await this.probeAccount(account, keys[index] ?? '', force));
+          const result = await this.probeAccount(
+            account,
+            keys[index] ?? '',
+            force,
+            // 进度按「probe 已返回」计：用量明细稍后才会补齐，不该拖住进度条
+            job ? () => { job.done += 1; } : undefined,
+          );
+          results.push(result);
         }
       },
     );
     await Promise.all(workers);
     // 一批采样结束统一落盘一次，避免每个平台各写一遍
     this.usage.flush();
+    // 成功快照落盘：进程重启后仍能立即出画面（数据标 stale，后台会刷新）
+    this.persistSnapshots();
     return results;
+  }
+
+  /**
+   * 构造一次探测 / 签到用的上下文。
+   *
+   * 签到复用同一套凭证写回与日志口径：令牌续期仍然写回 `.env`，
+   * 平台昵称仍只替换占位名。`now` 可注入，便于纯函数测试与结果落盘。
+   */
+  createProbeContext(account: AccountConfig, now = Date.now()): ProbeContext {
+    return {
+      now,
+      timeoutMs: this.configResult.config.settings.requestTimeoutMs,
+      log: (message: string, extra?: Record<string, unknown>) => {
+        console.log(`[${account.provider}] ${message}`, extra ? JSON.stringify(extra) : '');
+      },
+      // 令牌刷新后写回 .env；失败只记日志，不阻断本次取数
+      persistCredentials: (patch) => persistRefreshedCredentials(account, patch),
+      // 平台昵称 → 展示名（只替换「登录账号」占位名）
+      persistAccountName: (resolvedName) => persistResolvedName(account, resolvedName),
+    };
   }
 
   private async probeAccount(
     account: AccountConfig,
     key: string,
     force: boolean,
+    onProbed?: () => void,
   ): Promise<ProviderSnapshot> {
     const adapter = resolveAdapter(account.provider);
     const now = Date.now();
     if (!adapter) {
-      return {
+      const unknown: ProviderSnapshot = {
         provider: account.provider,
         displayName: account.displayName || account.provider,
         accountId: account.displayName ?? '',
@@ -329,19 +460,12 @@ export class DashboardService {
         stale: false,
         dailyUsage: null,
       };
+      this.live.set(key, unknown);
+      onProbed?.();
+      return unknown;
     }
 
-    const ctx: ProbeContext = {
-      now,
-      timeoutMs: this.configResult.config.settings.requestTimeoutMs,
-      log: (message: string, extra?: Record<string, unknown>) => {
-        console.log(`[${account.provider}] ${message}`, extra ? JSON.stringify(extra) : '');
-      },
-      // 令牌刷新后写回 .env；失败只记日志，不阻断本次取数
-      persistCredentials: (patch) => persistRefreshedCredentials(account, patch),
-      // 平台昵称 → 展示名（只替换「登录账号」占位名）
-      persistAccountName: (resolvedName) => persistResolvedName(account, resolvedName),
-    };
+    const ctx = this.createProbeContext(account, now);
 
     try {
       const snapshot = await this.cache.resolve(key, () => adapter.probe(account, ctx), { force });
@@ -349,13 +473,34 @@ export class DashboardService {
         this.lastGood.set(key, snapshot);
         // 本地采样兜底：采样的就是「页面即将展示的数值」，保证时间序列与卡片口径一致
         this.usage.observe(key, displayedAmount(snapshot), now);
+        /*
+         * 先发布「余额已就绪」的中间态，再去取用量明细：
+         * 明细接口是另一条上游请求（同样受 timeout 约束），不该挡住卡片余额首屏。
+         * 中间态优先复用上一轮明细缓存，没有就退回本地采样。
+         */
+        const quick = this.withDailyUsage(
+          snapshot,
+          key,
+          now,
+          this.ledgerCache.peek(key)?.value ?? null,
+        );
+        this.live.set(key, quick);
+        onProbed?.();
+
         const ledger = await this.fetchLedger(adapter, account, key, ctx, force);
-        return this.withDailyUsage(snapshot, key, now, ledger);
+        const complete = this.withDailyUsage(snapshot, key, now, ledger);
+        this.live.set(key, complete);
+        return complete;
       }
       const previous = this.lastGood.get(key);
-      if (!previous) return { ...snapshot, dailyUsage: null };
+      if (!previous) {
+        const failed = { ...snapshot, dailyUsage: null };
+        this.live.set(key, failed);
+        onProbed?.();
+        return failed;
+      }
       // 保留上次成功数值，但把失败状态透出，让界面能提示「数据可能已过期」
-      return {
+      const stale = {
         ...previous,
         status: snapshot.status,
         message: snapshot.message,
@@ -363,13 +508,19 @@ export class DashboardService {
         // 失败卡片不展示日级用量（与界面「失败卡片只显示原因」的现状一致）
         dailyUsage: null,
       };
+      this.live.set(key, stale);
+      onProbed?.();
+      return stale;
     } catch (error) {
       const previous = this.lastGood.get(key);
       const message = (error as Error).message;
       if (previous) {
-        return { ...previous, status: 'error', message, stale: true, dailyUsage: null };
+        const stale = { ...previous, status: 'error' as const, message, stale: true, dailyUsage: null };
+        this.live.set(key, stale);
+        onProbed?.();
+        return stale;
       }
-      return {
+      const failed: ProviderSnapshot = {
         provider: account.provider,
         displayName: adapter.groupAccounts
           ? adapter.displayName
@@ -398,6 +549,9 @@ export class DashboardService {
         stale: false,
         dailyUsage: null,
       };
+      this.live.set(key, failed);
+      onProbed?.();
+      return failed;
     }
   }
 
@@ -470,6 +624,185 @@ export class DashboardService {
     };
   }
 
+  /**
+   * 启动后台刷新（同一时刻只允许一个）。
+   *
+   * - `force=true`：手动刷新，跳过 TTL 重新探测；
+   * - 任务进行中再次请求 force：只置 `queuedForce`，当前这轮结束后再补一轮，
+   *   避免两个 collect 同时打上游；
+   * - 非 force：缓存全新鲜就什么都不做；刚结束的一轮有失败账号时冷却 10s
+   *   （失败缓存 TTL 是 15s，冷却后才会重试），防止前端 1s 轮询把上游打爆。
+   */
+  private startBackgroundRefresh(force: boolean, providerFilter?: string[]): void {
+    if (this.job) {
+      if (force && !this.job.force) this.job.queuedForce = true;
+      return;
+    }
+    const selected = this.selectedAccounts(providerFilter);
+    if (selected.length === 0) return;
+    if (!force) {
+      if (this.allFresh(selected)) return;
+      if (Date.now() - this.refreshEndedAt < 10_000) return;
+    }
+
+    const job: RefreshJob = {
+      force,
+      startedAt: Date.now(),
+      total: selected.length,
+      done: 0,
+      queuedForce: false,
+      promise: Promise.resolve(),
+    };
+    this.job = job;
+    job.promise = this.collect(force, providerFilter, job)
+      .then(() => undefined)
+      .catch((error) => {
+        console.log(`[refresh] 后台取数失败：${(error as Error).message}`);
+      })
+      .finally(() => {
+        this.refreshEndedAt = Date.now();
+        if (this.job === job) this.job = null;
+        if (job.queuedForce) {
+          job.queuedForce = false;
+          // 同步接上排队中的强制刷新：中间不留「refreshing=false」的窗口，
+          // 否则前端刚好在那个 tick 轮询会误以为刷新结束而停掉轮询
+          this.startBackgroundRefresh(true);
+        }
+      });
+  }
+
+  /** 所有启用账号的缓存都在 TTL 内且拿到了值（失败缓存的 value 为 null，视为不新鲜） */
+  private allFresh(selected: AccountConfig[]): boolean {
+    const keys = accountKeys(selected);
+    return keys.every((key) => {
+      const entry = this.cache.peek(key);
+      return entry !== null && !entry.expired && entry.value !== null;
+    });
+  }
+
+  /**
+   * 立即组装快照：已完成的进度 > TTL 缓存（含过期值的 stale 兜底）> 上次成功值。
+   * 完全没有数据的账号给出 pending 占位，界面据此画「取数中」而不是空白或 0 余额。
+   */
+  private immediateSnapshots(selected: AccountConfig[]): ProviderSnapshot[] {
+    const keys = accountKeys(selected);
+    const out: ProviderSnapshot[] = [];
+    const missing: number[] = [];
+
+    selected.forEach((_account, index) => {
+      const key = keys[index] ?? '';
+      const cached = this.cache.peek(key);
+      const known =
+        this.live.get(key) ?? cached?.value ?? cached?.stale ?? this.lastGood.get(key) ?? null;
+      if (known) out.push(known);
+      else missing.push(index);
+    });
+
+    /*
+     * 没取到的账号一律补占位快照：
+     *   - 单账号平台 = 一张「取数中」卡片；
+     *   - 合并平台（groupAccounts）会被聚合层并进同一张卡片，成为一行「取数中」，
+     *     卡片结构与账号数保持不变，逐行补齐时不跳变。
+     */
+    const now = Date.now();
+    for (const index of missing) {
+      const account = selected[index];
+      if (!account) continue;
+      out.push(this.pendingSnapshot(account, now));
+    }
+    return out;
+  }
+
+  private pendingSnapshot(account: AccountConfig, now: number): ProviderSnapshot {
+    const adapter = resolveAdapter(account.provider);
+    return {
+      provider: account.provider,
+      displayName: adapter?.groupAccounts
+        ? adapter.displayName
+        : account.displayName || adapter?.displayName || account.provider,
+      accountId: account.displayName ?? '',
+      groupAccounts: adapter?.groupAccounts === true,
+      neverExpires: adapter?.neverExpires === true,
+      manageAccounts: adapter?.manageAccounts === true,
+      entries: [],
+      region: adapter?.region ?? 'global',
+      status: 'unavailable',
+      source: 'api',
+      updatedAt: new Date(now).toISOString(),
+      plan: null,
+      balance: null,
+      credits: [],
+      windows: [],
+      nextExpiryAt: null,
+      nextExpiryInDays: null,
+      dashboardUrl: adapter?.dashboardUrl ?? '',
+      usageUrl: adapter?.usageUrl ?? '',
+      message: '正在取数…',
+      note: null,
+      // 取数未完成也能复制托管密钥：secrets 与余额解耦（与 probe 异常分支同口径）
+      secrets: adapter ? describeSecrets(adapter, account) : [],
+      stale: false,
+      pending: true,
+      dailyUsage: null,
+    };
+  }
+
+  /**
+   * 成功快照落盘（`.run/summary-cache.json`，原子写）。
+   *
+   * 只存 `OK_STATUSES`：失败 / 占位快照没有复用价值，还会让下次首屏误报。
+   * 文件内容只有掩码预览与额度，不含凭证明文。
+   */
+  private persistSnapshots(): void {
+    const selected = this.selectedAccounts();
+    if (selected.length === 0) return;
+    const keys = accountKeys(selected);
+    const snapshots: PersistedSnapshot[] = [];
+    for (const key of keys) {
+      const snapshot = this.live.get(key);
+      if (!snapshot || snapshot.pending || !OK_STATUSES.has(snapshot.status)) continue;
+      snapshots.push({ key, snapshot });
+    }
+    if (snapshots.length === 0) return;
+
+    const payload: PersistedSnapshotsFile = { version: 1, savedAt: Date.now(), snapshots };
+    try {
+      mkdirSync(dirname(this.snapshotStorePath), { recursive: true });
+      const tmp = `${this.snapshotStorePath}.tmp`;
+      writeFileSync(tmp, `${JSON.stringify(payload)}\n`, { encoding: 'utf8', mode: 0o600 });
+      renameSync(tmp, this.snapshotStorePath);
+    } catch (error) {
+      // 快照只是首屏加速，写盘失败不影响取数主链路
+      console.log(`[cache] 快照写入失败：${(error as Error).message}`);
+    }
+  }
+
+  /** 服务启动时恢复磁盘快照：只认当前配置里仍启用的账号，并统一标 stale */
+  private restoreSnapshots(): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(this.snapshotStorePath, 'utf8'));
+    } catch {
+      return;
+    }
+    if (typeof parsed !== 'object' || parsed === null) return;
+    const file = parsed as Partial<PersistedSnapshotsFile>;
+    if (file.version !== 1 || !Array.isArray(file.snapshots)) return;
+
+    const enabled = new Set(accountKeys(this.selectedAccounts()));
+    for (const item of file.snapshots) {
+      if (typeof item !== 'object' || item === null) continue;
+      const { key, snapshot } = item as Partial<PersistedSnapshot>;
+      if (typeof key !== 'string' || !enabled.has(key)) continue;
+      if (!snapshot || typeof snapshot !== 'object') continue;
+      if (key !== `${snapshot.provider}#${snapshot.accountId ?? ''}`) continue;
+      const restored: ProviderSnapshot = { ...snapshot, pending: false, stale: true };
+      this.live.set(key, restored);
+      // 也当作上次成功值：这一轮失败时可以继续展示，而不是整张卡片变白
+      this.lastGood.set(key, restored);
+    }
+  }
+
   private static mtimeOf(path: string): number {
     try {
       return statSync(path).mtimeMs;
@@ -493,7 +826,8 @@ export class DashboardService {
    * 若只盯 accounts.json，长驻服务会一直拿着过期凭证，表现为
    * 「npm run probe 正常，但页面刷新无效」。
    */
-  private ensureConfigFresh(): void {
+  /** 配置热加载：accounts.json / .env 的 mtime 变化时重建内存配置（签到状态接口也复用它） */
+  ensureConfigFresh(): void {
     const accountsMtime = this.readMtime();
     const dotEnvMtime = this.readDotEnvMtime();
     if (accountsMtime === this.accountsMtimeMs && dotEnvMtime === this.dotEnvMtimeMs) return;
@@ -511,8 +845,22 @@ export class DashboardService {
     this.ledgerCache = new TtlCache<UsageLedger | null>(
       this.configResult.config.settings.cacheTtlSeconds * 1_000,
     );
-    // 配置变了说明用户期待新数据：清掉兜底值，避免用旧数字掩盖新凭证的失败
-    this.lastGood.clear();
+    // 配置变了说明用户期待新数据：缓存必须重建，但**已知快照要留下**——
+    // 否则正在进行的刷新会被中途清空，界面退回一片「取数中」。
+    // 只保留新配置里仍启用的账号，并标 stale：新凭证的结果回来前，旧数值如实标「可能过期」。
+    const keep = new Set(accountKeys(this.selectedAccounts()));
+    for (const key of [...this.lastGood.keys()]) {
+      if (!keep.has(key)) this.lastGood.delete(key);
+    }
+    for (const [key, snapshot] of [...this.live]) {
+      if (!keep.has(key)) {
+        this.live.delete(key);
+        continue;
+      }
+      this.live.set(key, { ...snapshot, stale: true });
+    }
+    // 允许下一轮立即重试（否则会被 10s 冷却挡住，用户刚改完凭证却看不到刷新）
+    this.refreshEndedAt = 0;
     console.log(`[config] 检测到 ${changed.join(' / ')} 变更，已重新加载配置与凭证`);
   }
 }

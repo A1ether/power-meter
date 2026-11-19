@@ -111,6 +111,7 @@
             <button class="btn btn--ghost" id="cmd-btn" type="button">
               <span>搜索</span><kbd>⌘K</kbd>
             </button>
+            <button class="btn btn--ghost" id="checkin-btn" type="button">每日签到</button>
             <button class="btn" id="platforms-btn" type="button">平台与账号</button>
             <!--
               真开关：input 只做语义与焦点载体（视觉隐藏），轨道与滑块由样式画，
@@ -148,10 +149,20 @@
               <button class="expiry__toggle" type="button" id="expiry-toggle"
                       aria-expanded="false" hidden>展开</button>
             </div>
-            <div class="expiry" id="timeline"></div>
+            <div class="expiry" id="timeline">
+              <!-- 首屏骨架：JS 首次 render() 会整体替换；无缓存时先给出结构，避免长时间空白 -->
+              <div class="skeleton skeleton--row" aria-hidden="true"></div>
+              <div class="skeleton skeleton--row" aria-hidden="true"></div>
+              <div class="skeleton skeleton--row" aria-hidden="true"></div>
+            </div>
           </section>
 
-          <section class="summary" id="summary" data-section="summary" aria-label="总体汇总"></section>
+          <section class="summary" id="summary" data-section="summary" aria-label="总体汇总">
+            <div class="skeleton skeleton--stat" aria-hidden="true"></div>
+            <div class="skeleton skeleton--stat" aria-hidden="true"></div>
+            <div class="skeleton skeleton--stat" aria-hidden="true"></div>
+            <div class="skeleton skeleton--stat" aria-hidden="true"></div>
+          </section>
 
           <section class="toolbar" data-section="toolbar" aria-label="排序与筛选">
             <div class="toolbar__group">
@@ -174,7 +185,12 @@
             <div class="toolbar__meta" id="meta"></div>
           </section>
 
-          <section class="grid" id="grid" data-section="providers" aria-live="polite"></section>
+          <section class="grid" id="grid" data-section="providers" aria-live="polite">
+            <!-- 同上：额度卡片的骨架，数据回来后替换为真实卡片 -->
+            <div class="skeleton skeleton--card" aria-hidden="true"></div>
+            <div class="skeleton skeleton--card" aria-hidden="true"></div>
+            <div class="skeleton skeleton--card" aria-hidden="true"></div>
+          </section>
 
           <section class="panel" id="diagnostics-panel" data-section="diagnostics-panel" aria-label="诊断信息">
             <div class="panel__head">
@@ -242,6 +258,8 @@
             展开的面板（登录块 + 手工凭证兜底）在下面 .manage-slot 里。
           -->
           <div class="card__actions">
+            <button class="secret__btn secret__btn--primary card__checkin" type="button"
+                    hidden>签到</button>
             <button class="secret__btn secret__btn--primary manage__toggle" type="button"
                     aria-expanded="false" hidden>＋ 添加账号</button>
             <button class="secret__btn manage__relogin" type="button"
@@ -370,6 +388,37 @@
         <button class="dialog__close" id="platforms-close" type="button" aria-label="关闭">×</button>
       </div>
       <div class="dialog__body" id="platforms-body"></div>
+    </dialog>
+
+    <!-- 每日签到：自动开关 / 执行时间 / 一键签到全部 / 逐账号结果 -->
+    <dialog class="dialog dialog--checkin" id="checkin-dialog" aria-label="每日签到">
+      <div class="dialog__head">
+        <div>
+          <h2>每日签到</h2>
+          <p class="muted" id="checkin-subtitle">按北京时间每天执行一次；已签到账号当天不重复请求</p>
+        </div>
+        <button class="dialog__close" id="checkin-close" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="dialog__body">
+        <div class="checkin-toolbar">
+          <label class="switch" title="到达设定时间后自动签到">
+            <input type="checkbox" id="checkin-auto" />
+            <span class="switch__track" aria-hidden="true"><span class="switch__thumb"></span></span>
+            <span class="switch__label">自动签到</span>
+          </label>
+          <label class="checkin-time">
+            <span>每天</span>
+            <input type="time" id="checkin-at" value="09:00" />
+            <span class="muted">（北京时间）</span>
+          </label>
+          <button class="btn btn--primary" id="checkin-all" type="button">一键签到全部</button>
+        </div>
+        <p class="checkin-message" id="checkin-message" hidden></p>
+        <div class="checkin-list" id="checkin-list">
+          <div class="skeleton skeleton--row" aria-hidden="true"></div>
+          <div class="skeleton skeleton--row" aria-hidden="true"></div>
+        </div>
+      </div>
     </dialog>
 
     <script type="module" src="/app.js"></script>

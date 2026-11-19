@@ -14,6 +14,7 @@ import {
   startLogin,
 } from './login-session.js';
 import { describeRegistry, resolveAdapter } from './providers/index.js';
+import { CheckinError, CheckinManager } from './checkin.js';
 import { DashboardService } from './service.js';
 
 // sidecar 选项要在 loadConfig() 之前解析：--config-dir 会重定位 .env / accounts.json 的基准目录，
@@ -67,6 +68,16 @@ const MIME: Record<string, string> = {
 };
 
 const service = new DashboardService();
+/**
+ * 每日签到编排：账号来自 DashboardService（配置热加载后自动生效），
+ * 签到成功后的余额刷新也走同一个服务实例。
+ */
+const checkins = new CheckinManager({
+  ensureFresh: () => service.ensureConfigFresh(),
+  accounts: () => service.accounts,
+  context: (account) => service.createProbeContext(account),
+  refreshProvider: (provider) => service.refreshInBackground([provider]),
+});
 const bootstrap = loadConfig().config;
 
 /**
@@ -83,8 +94,9 @@ function serverOrigin(): string {
   return `http://${bootstrap.server.host}:${port}`;
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const payload = JSON.stringify(body, null, 2);
+function sendJson(res: ServerResponse, status: number, body: unknown, pretty = true): void {
+  // 看板响应可达数百 KB：紧凑输出省传输与浏览器解析时间；诊断接口保持缩进便于人工查看
+  const payload = pretty ? JSON.stringify(body, null, 2) : JSON.stringify(body);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
@@ -324,12 +336,23 @@ const server = createServer(async (req, res) => {
 
     if (pathname === '/api/summary') {
       const force = url.searchParams.get('force') === '1';
-      const outcome = force ? await service.refresh() : await service.getPayload();
+      /*
+       * `wait=0`（或 `nonblocking=1`）：立即返回当前已知快照并开始后台刷新，
+       * 由前端轮询逐平台补齐——避免冷缓存时首屏一直空白。
+       * 不带该参数时保持旧的阻塞语义，Flutter 端与脚本无需改动。
+       */
+      const nonblocking =
+        url.searchParams.get('wait') === '0' || url.searchParams.get('nonblocking') === '1';
+      const outcome = nonblocking
+        ? service.getImmediateOutcome({ force })
+        : force
+          ? await service.refresh()
+          : await service.getPayload();
       sendJson(res, 200, {
         ...outcome.payload,
         warnings: outcome.warnings,
         missingEnvVars: outcome.missingEnvVars,
-      });
+      }, false);
       return;
     }
 
@@ -344,7 +367,70 @@ const server = createServer(async (req, res) => {
         ...outcome.payload,
         warnings: outcome.warnings,
         missingEnvVars: outcome.missingEnvVars,
-      });
+      }, false);
+      return;
+    }
+
+    /*
+     * 每日签到：状态只读，执行类接口走 privilegedGuard（会真实请求上游）。
+     * 结果文件是运行态（.run/checkin.json），不涉及账号配置写入。
+     */
+    if (pathname === '/api/checkin' && req.method === 'GET') {
+      sendJson(res, 200, checkins.status());
+      return;
+    }
+
+    if (pathname === '/api/checkin' && req.method === 'POST') {
+      const guard = privilegedGuard(req);
+      if (!guard.ok) {
+        sendJson(res, guard.status, { error: guard.error });
+        return;
+      }
+      const body = (await readBody(req)) as { provider?: unknown; accountId?: unknown };
+      try {
+        const result = await checkins.runOne(
+          typeof body.provider === 'string' ? body.provider : '',
+          typeof body.accountId === 'string' ? body.accountId : '',
+        );
+        sendJson(res, 200, { ok: true, result });
+      } catch (error) {
+        if (error instanceof CheckinError) {
+          sendJson(res, error.status, { error: error.message });
+          return;
+        }
+        throw error;
+      }
+      return;
+    }
+
+    if (pathname === '/api/checkin/all' && req.method === 'POST') {
+      const guard = privilegedGuard(req);
+      if (!guard.ok) {
+        sendJson(res, guard.status, { error: guard.error });
+        return;
+      }
+      const results = await checkins.runAll();
+      sendJson(res, 200, { ok: true, results });
+      return;
+    }
+
+    if (pathname === '/api/checkin/settings' && req.method === 'POST') {
+      const guard = privilegedGuard(req);
+      if (!guard.ok) {
+        sendJson(res, guard.status, { error: guard.error });
+        return;
+      }
+      const body = (await readBody(req)) as { auto?: unknown; at?: unknown };
+      try {
+        const settings = checkins.updateSettings({ auto: body.auto, at: body.at });
+        sendJson(res, 200, { ok: true, settings });
+      } catch (error) {
+        if (error instanceof CheckinError) {
+          sendJson(res, error.status, { error: error.message });
+          return;
+        }
+        throw error;
+      }
       return;
     }
 
@@ -774,6 +860,9 @@ server.listen(bootstrap.server.port, bootstrap.server.host, () => {
       `  提示：还没有启用的真实账号。打开 ${origin} → 顶栏「平台与账号」即可添加（无需编辑文件）\n`,
     );
   }
+
+  // 自动签到默认关闭；启动后按 .run/checkin.json 的开关与时间运行
+  checkins.startScheduler();
 });
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {

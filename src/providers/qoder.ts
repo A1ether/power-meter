@@ -19,6 +19,7 @@ import {
   optBool,
   optString,
   splitByExpiry,
+  type CheckinResult,
   type ProbeContext,
   type ProviderAdapter,
   type ProviderLogin,
@@ -248,6 +249,194 @@ async function qoderOpenApiQuota(
     timeoutMs: ctx.timeoutMs || QODER_TIMEOUT_FALLBACK,
   });
   return parseQoderOpenApiQuota(body);
+}
+
+/* ------------------------------------------------------------------ *
+ * 每日签到（仅设备令牌模式）
+ * ------------------------------------------------------------------ */
+
+interface QoderCampaign {
+  campaignId?: string;
+  actionType?: string;
+  claimStatus?: string;
+  startAt?: number;
+  endAt?: number;
+  benefit?: { amount?: number };
+}
+
+function qoderWhen(value: number | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0;
+  return value > 1e12 ? value : value * 1000;
+}
+
+function qoderCampaignActive(campaign: QoderCampaign, now: number): boolean {
+  const start = qoderWhen(campaign.startAt);
+  const end = qoderWhen(campaign.endAt);
+  return (!start || now >= start) && (!end || now < end);
+}
+
+/** 设备头：Qoder 的 openapi 只认设备令牌 + Cosy-* 身份；账号已存的选项原样透传。 */
+function qoderCheckinHeaders(account: AccountConfig, token: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    'Cosy-ClientType': optString(account, 'clientType') || '10',
+    'User-Agent': 'Qoder/claim',
+  };
+  const passthrough: Array<[string, string]> = [
+    ['machineOS', 'Cosy-MachineOS'],
+    ['machineHostname', 'Cosy-MachineHostname'],
+    ['machineId', 'Cosy-MachineId'],
+    ['machineToken', 'Cosy-MachineToken'],
+    ['machineCode', 'Cosy-MachineCode'],
+    ['machineType', 'Cosy-MachineType'],
+    ['version', 'Cosy-Version'],
+  ];
+  for (const [option, header] of passthrough) {
+    const value = optString(account, option);
+    if (value) headers[header] = value;
+  }
+  return headers;
+}
+
+async function qoderCampaignCall(
+  site: QoderSiteId,
+  account: AccountConfig,
+  ctx: ProbeContext,
+  token: string,
+  path: string,
+  method: 'GET' | 'POST',
+): Promise<unknown> {
+  const { body } = await fetchJson(`${QODER_LOGIN[site].openapi}${path}`, {
+    method,
+    headers: qoderCheckinHeaders(account, token),
+    ...(method === 'POST' ? { body: '{}' } : {}),
+    timeoutMs: ctx.timeoutMs || QODER_TIMEOUT_FALLBACK,
+  });
+  return body;
+}
+
+/**
+ * Qoder 的每日 Credits：`campaigns` 里 `actionType === CLAIM_BENEFIT` 的活动，
+ * 对 `CLAIMABLE` 的逐个领取（移植自 magpie `qoder_checkin.go`）。
+ * Cookie 账号没有设备令牌，`support()` 已提前拒绝。
+ */
+export async function qoderCheckin(
+  account: AccountConfig,
+  ctx: ProbeContext,
+  site: QoderSiteId,
+): Promise<CheckinResult> {
+  const refreshToken = cred(account, ctx, ['refreshToken', 'refresh_token']);
+  const initial = cred(account, ctx, ['accessToken', 'token']);
+  if (!initial) {
+    return {
+      outcome: 'unsupported',
+      message: 'Qoder Cookie 模式没有设备令牌，暂时无法签到；请使用令牌账号或在 Qoder 客户端签到',
+    };
+  }
+
+  const run = async (token: string) => {
+    const body = await qoderCampaignCall(site, account, ctx, token, '/sash/api/v1/me/campaigns', 'GET');
+    const campaignsRaw = isRecord(body) ? pick(body, 'campaigns', 'data') : undefined;
+    const list = Array.isArray(campaignsRaw)
+      ? campaignsRaw
+      : isRecord(campaignsRaw) && Array.isArray(pick(campaignsRaw, 'campaigns'))
+        ? (pick(campaignsRaw, 'campaigns') as unknown[])
+        : [];
+    const daily = list.filter(
+      (item): item is QoderCampaign =>
+        isRecord(item) && String(pick(item, 'actionType') ?? '') === 'CLAIM_BENEFIT',
+    );
+    if (daily.length === 0) {
+      return { outcome: 'inactive', message: 'Qoder 当前没有每日领取活动' } satisfies CheckinResult;
+    }
+
+    let claimed = 0;
+    let credit = 0;
+    let failed: string | null = null;
+    let validUntil: string | null = null;
+    const now = ctx.now;
+
+    for (const campaign of daily) {
+      const end = qoderWhen(campaign.endAt);
+      if (end && qoderCampaignActive(campaign, now)) {
+        const iso = new Date(end).toISOString();
+        if (!validUntil || Date.parse(iso) < Date.parse(validUntil)) validUntil = iso;
+      }
+      if (String(campaign.claimStatus ?? '') !== 'CLAIMABLE') continue;
+      const id = String(campaign.campaignId ?? '');
+      if (!id) {
+        failed = '活动缺少 campaignId';
+        continue;
+      }
+      try {
+        const claimedBody = await qoderCampaignCall(
+          site,
+          account,
+          ctx,
+          token,
+          `/sash/api/v1/me/campaigns/${encodeURIComponent(id)}/claim`,
+          'POST',
+        );
+        const payload =
+          isRecord(claimedBody) && isRecord(claimedBody.data) ? claimedBody.data : claimedBody;
+        const status = isRecord(payload) ? String(pick(payload, 'status') ?? '') : '';
+        if (status && status !== 'CLAIMED') {
+          failed = `领取接口返回 status=${status}`;
+          continue;
+        }
+        claimed += 1;
+        const got = isRecord(payload) ? firstNumber(pick(payload, 'benefit', 'benefitAmount')) : null;
+        credit += got ?? firstNumber(pick(campaign.benefit, 'amount')) ?? 0;
+      } catch (error) {
+        failed = (error as Error).message;
+      }
+    }
+
+    if (failed) return { outcome: 'failed', message: `Qoder 签到失败：${failed}` } satisfies CheckinResult;
+    if (claimed > 0) {
+      return {
+        outcome: 'claimed',
+        ...(credit > 0 ? { credit } : {}),
+        message: credit > 0 ? `签到成功 +${credit} Credits` : '签到成功',
+        validUntil,
+      } satisfies CheckinResult;
+    }
+    const done = daily.some(
+      (campaign) =>
+        String(campaign.claimStatus ?? '') === 'CLAIMED' && qoderCampaignActive(campaign, now),
+    );
+    if (done) {
+      return {
+        outcome: 'done',
+        credit: firstNumber(pick(daily.find((item) => String(item.claimStatus ?? '') === 'CLAIMED')?.benefit, 'amount')) ?? undefined,
+        message: '今日已签到',
+        validUntil,
+      } satisfies CheckinResult;
+    }
+    return { outcome: 'failed', message: '今日积分尚未开放领取' } satisfies CheckinResult;
+  };
+
+  try {
+    try {
+      return await run(initial);
+    } catch (error) {
+      const authError =
+        error instanceof HttpError && (error.status === 401 || error.status === 403);
+      if (!authError || !refreshToken) throw error;
+      ctx.log('Qoder 登录令牌已失效，尝试用 refreshToken 续期');
+      const refreshed = await qoderRefreshToken(account, ctx, refreshToken, site);
+      if (ctx.persistCredentials) {
+        const patch: Record<string, string> = { accessToken: refreshed.accessToken };
+        if (refreshed.refreshToken) patch.refreshToken = refreshed.refreshToken;
+        await ctx.persistCredentials(patch).catch(() => undefined);
+      }
+      return await run(refreshed.accessToken);
+    }
+  } catch (error) {
+    return { outcome: 'failed', message: `Qoder 签到失败：${(error as Error).message}` };
+  }
 }
 
 /**
@@ -1445,6 +1634,16 @@ function createQoderAdapter(siteId: QoderSiteId): ProviderAdapter {
       }
     },
 
+    checkin: {
+      support: (account) =>
+        Boolean(account.credentials.accessToken || account.credentials.token)
+          ? { ok: true }
+          : {
+              ok: false,
+              reason: 'Cookie 模式没有设备令牌，Qoder 签到只支持令牌账号（或在 Qoder 客户端签到）',
+            },
+      run: (account, ctx) => qoderCheckin(account, ctx, siteId),
+    },
     async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
       const legacy = legacySiteOptions(account);
       // 旧配置显式跨站：这份凭证属于另一站点，用本平台站点探测必然 401/403。

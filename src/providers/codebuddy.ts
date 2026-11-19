@@ -18,6 +18,7 @@ import {
   notConfigured,
   optString,
   splitByExpiry,
+  type CheckinResult,
   type ProbeContext,
   type ProviderAdapter,
   type ProviderLogin,
@@ -568,6 +569,145 @@ async function cbProbeWithToken(
     ),
     fallbackExpiryFromWindow: false,
   });
+}
+
+/* ------------------------------------------------------------------ *
+ * 每日签到（CodeBuddy CN / WorkBuddy 国际版）
+ * ------------------------------------------------------------------ */
+
+interface CbCheckinAnswer {
+  active?: boolean;
+  today_checked_in?: boolean;
+  todayCheckedIn?: boolean;
+  today_credit?: number;
+  todayCredit?: number;
+  daily_credit?: number;
+  dailyCredit?: number;
+  credit?: number;
+  streak_days?: number;
+  streakDays?: number;
+  message?: string;
+}
+
+/**
+ * 每日签到：先查活动状态，仅在「开启且今天未签」时领取。
+ * 中国站与国际站走同一个 `/v2/billing/meter` 接口（移植自 magpie `workbuddy_checkin.go`）。
+ */
+export async function cbCheckin(
+  site: CodeBuddySiteMeta,
+  adapter: ProviderAdapter,
+  account: AccountConfig,
+  ctx: ProbeContext,
+): Promise<CheckinResult> {
+  const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+  const timeoutMs = ctx.timeoutMs || CB_TIMEOUT_FALLBACK;
+
+  const headerSets: Record<string, string>[] = [];
+  if (cookie) {
+    headerSets.push({
+      Cookie: cookie,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      Origin: site.billingOrigin,
+      Referer: site.usageUrl,
+      'x-client-platform': 'web',
+    });
+  }
+  const token = cred(account, ctx, ['accessToken', 'token']);
+  if (!cookie && token) {
+    headerSets.push(cbBillingHeaders(site, token, cbIdentity(account)));
+  }
+  if (headerSets.length === 0) {
+    return { outcome: 'unsupported', message: '缺少 Cookie 或登录令牌，无法签到' };
+  }
+
+  const post = async (headers: Record<string, string>, path: string): Promise<unknown> => {
+    const { body } = await fetchJson(`${site.billingOrigin}${path}`, {
+      method: 'POST',
+      headers,
+      body: '{}',
+      timeoutMs,
+    });
+    const envelope = cbEnvelope(body);
+    if (envelope.code === 1001) {
+      const error = new Error('今日已签到') as Error & { checkinDone?: boolean };
+      error.checkinDone = true;
+      throw error;
+    }
+    if (envelope.code !== 0) {
+      throw new Error(
+        `上游返回 code=${envelope.code}` +
+          (isRecord(body) && body.msg ? `：${String(body.msg)}` : ''),
+      );
+    }
+    return envelope.data;
+  };
+
+  const run = async (headers: Record<string, string>): Promise<CheckinResult> => {
+    try {
+      const statusRaw = await post(headers, '/v2/billing/meter/checkin-activity-status');
+      const status: CbCheckinAnswer = isRecord(statusRaw) ? statusRaw : {};
+      if (status.active === false) {
+        return { outcome: 'inactive', message: '当前没有开启每日签到活动' };
+      }
+      if (status.today_checked_in === true || status.todayCheckedIn === true) {
+        const credit =
+          firstNumber(pick(status, 'today_credit', 'todayCredit', 'daily_credit', 'dailyCredit')) ?? 0;
+        return {
+          outcome: 'done',
+          ...(credit > 0 ? { credit } : {}),
+          message: credit > 0 ? `今日已签到（${credit} 积分）` : '今日已签到',
+        };
+      }
+
+      const claimRaw = await post(headers, '/v2/billing/meter/daily-checkin');
+      const claim: CbCheckinAnswer = isRecord(claimRaw) ? claimRaw : {};
+      const credit = firstNumber(pick(claim, 'credit', 'today_credit', 'todayCredit')) ?? 0;
+      const streak = firstNumber(pick(claim, 'streak_days', 'streakDays')) ?? undefined;
+      return {
+        outcome: 'claimed',
+        ...(credit > 0 ? { credit } : {}),
+        ...(streak ? { streak } : {}),
+        message:
+          claim.message ||
+          (credit > 0 ? `签到成功 +${credit} 积分` : '签到成功'),
+      };
+    } catch (error) {
+      if ((error as { checkinDone?: boolean }).checkinDone) {
+        return { outcome: 'done', message: '今日已签到' };
+      }
+      const message = (error as Error).message;
+      // 令牌模式的登录态失效（HTTP 401 或业务码 12153/10085）交给 cbWithToken 续期后重试
+      if (!cookie && cbIsAuthError(error)) throw error;
+      if (/code=1002/.test(message)) {
+        return { outcome: 'ineligible', message: message.replace(/^上游返回 /, '') };
+      }
+      if (/code=1003/.test(message)) {
+        return { outcome: 'inactive', message: message.replace(/^上游返回 /, '') };
+      }
+      if (error instanceof HttpError && error.status === 401) {
+        // Cookie 模式无法续期：如实返回；令牌模式交给 cbWithToken 刷新后重试
+        if (cookie) {
+          return {
+            outcome: 'ineligible',
+            message: 'CodeBuddy 拒绝了本次签到（401），请在本机客户端内签到',
+          };
+        }
+        throw error;
+      }
+      return { outcome: 'failed', message: `签到失败：${message}` };
+    }
+  };
+
+  if (cookie) return run(headerSets[0] as Record<string, string>);
+  const accessToken = token;
+  try {
+    return await cbWithToken(site, adapter, account, ctx, accessToken, (fresh) =>
+      run(cbBillingHeaders(site, fresh, cbIdentity(account))),
+    );
+  } catch (error) {
+    return { outcome: 'failed', message: `签到失败：${(error as Error).message}` };
+  }
 }
 
 /**
@@ -1244,6 +1384,13 @@ function createCodeBuddyAdapter(siteId: CodeBuddySiteId): ProviderAdapter {
     /** 默认登录方法（扫码）；完整清单在对象外组装成 `loginMethods` */
     login: scanLogin,
 
+    checkin: {
+      support: (account) =>
+        Boolean(account.credentials.cookie || account.credentials.accessToken)
+          ? { ok: true }
+          : { ok: false, reason: '需要 Cookie 或登录令牌才能签到' },
+      run: (account, ctx) => cbCheckin(site, adapter, account, ctx),
+    },
     async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
       const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
       // 令牌分支：手工 Cookie 优先（历史账号行为完全不变），没有 Cookie 才走插件令牌

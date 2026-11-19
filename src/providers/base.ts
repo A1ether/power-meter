@@ -75,6 +75,42 @@ export interface ManageFieldDescriptor {
 }
 
 /* ------------------------------------------------------------------ *
+ * 「每日签到」契约
+ * ------------------------------------------------------------------ */
+
+/** 签到结果：所有平台收敛到同一组语义，前端只认这些值 */
+export type CheckinOutcome =
+  | 'claimed' // 本次领取成功
+  | 'done' // 今天已经领过 / 平台回答已签到
+  | 'inactive' // 平台当前没有可参与的签到活动
+  | 'ineligible' // 有活动但当前账号/设备不可领取（含平台按设备限流）
+  | 'unsupported' // 当前凭证形态不支持签到
+  | 'failed'; // 请求失败或平台返回未知错误
+
+export interface CheckinResult {
+  outcome: CheckinOutcome;
+  /** 本次新增积分（平台给出时才有） */
+  credit?: number;
+  /** 平台给出的连续 / 周期天数（有则带） */
+  streak?: number;
+  /** 面向用户的一句话，不含凭证 */
+  message: string;
+  /** 平台给的本次签到有效期（ISO），没有则为 null */
+  validUntil?: string | null;
+}
+
+/**
+ * 平台的签到能力。
+ *
+ * `support()` 只做凭证形态判断，不发上游请求；不支持时 UI 直接给出原因，
+ * 避免用户点了按钮才看到「此凭证不支持」。
+ */
+export interface ProviderCheckin {
+  support(account: AccountConfig): { ok: true } | { ok: false; reason: string };
+  run(account: AccountConfig, ctx: ProbeContext): Promise<CheckinResult>;
+}
+
+/* ------------------------------------------------------------------ *
  * 「扫码 / 打开链接登录」契约
  * ------------------------------------------------------------------ */
 
@@ -291,6 +327,11 @@ export interface ProviderAdapter {
    * 未实现此方法 = 该平台四个字段全部走本地采样，行为与 v1 一致。
    */
   fetchUsageLedger?: (account: AccountConfig, ctx: ProbeContext) => Promise<UsageLedger | null>;
+  /**
+   * 每日签到（可选）。声明后看板会为该平台账号展示「签到」入口，
+   * 并由 `src/checkin.ts` 统一调度；未声明 = 该平台没有每日签到。
+   */
+  checkin?: ProviderCheckin;
   probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot>;
 }
 

@@ -5,6 +5,9 @@
 
 - 运行时**零第三方依赖**（只用 Node 内置模块），`npm install` 只装 `tsx` / `typescript`
 - CodeBuddy / Trae 支持**扫码或打开链接登录**；Qoder 只保留**网页端登录**（自动抓 Cookie），授权后自动落库，一个账号一张卡片
+- 支持 **每日签到领积分**：卡片可单独签到，顶栏「每日签到」支持一键全部与自动签到（北京时间、默认关闭）；
+  覆盖 MiniMax / Trae 国内版 / Qoder 令牌账号 / CodeBuddy / CodeArts（AK/SK）/ 商汤小浣熊。
+  Qoder 的纯 Cookie 账号与 CodeArts 的纯 Cookie 账号没有签到所需身份/签名能力，界面会明确显示「不支持」
 - 后端聚合 + 缓存 + 失败降级，前端纯静态（无构建步骤）
 - 凭证默认**不下发到浏览器**：只有被显式声明为「可托管」的密钥才提供
   掩码预览 + 按需复制（默认仅限本机），`accounts.json` / `.env` 改动后**热加载**，无需重启
@@ -622,7 +625,7 @@ A1etherOpenAi 走的是官方 OpenAPI（<https://api.d1v.ai/api/openapi.json>）
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/summary` | 聚合结果（汇总 + 各平台快照 + 到期时间线）。`?force=1` 跳过缓存强制刷新 |
+| GET | `/api/summary` | 聚合结果（汇总 + 各平台快照 + 到期时间线）。`?force=1` 跳过缓存强制刷新。`&wait=0` 立即返回当前已知快照并在后台取数（响应带 `refreshing` / `progress`），未取到的平台以 `pending` 占位 |
 | POST | `/api/refresh` | 手动刷新，body 可带 `{ "providers": ["qoder"] }` 只刷指定平台 |
 | GET | `/api/providers` | 已注册的适配器清单、各自需要的凭证，以及「添加账号」表单的字段声明（`manageFields`）|
 | GET | `/api/config` | 当前配置概览（**仅凭证 key 名，不含值**）+ 告警 + 缺失环境变量 |
@@ -669,12 +672,16 @@ Trae 的 OAuth 回调 `/authorize` 是唯一例外：浏览器从 trae.cn 跳回
   generatedAt: string;
   cacheTtlSeconds: number;
   expiryThresholds: { criticalDays: number; warningDays: number };
-  totals: { providers, ok, failed, creditsByCurrency, balanceByCurrency };
+  totals: { providers, ok, failed, pending?, creditsByCurrency, balanceByCurrency };
   nextExpiry: ExpiryHit | null;      // 全局最快到期
   expiryTimeline: ExpiryHit[];       // 按到期升序
-  providers: ProviderSnapshot[];     // 各平台完整快照
+  providers: ProviderSnapshot[];     // 各平台完整快照（pending: true 表示仍在取数）
   warnings: string[];
   missingEnvVars: string[];
+  // 仅 ?wait=0 模式返回：
+  refreshing?: boolean;
+  progress?: { done: number; total: number };
+  dataUpdatedAt?: string | null;     // 当前展示数据的最后取数时间
 }
 ```
 

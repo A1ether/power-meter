@@ -84,13 +84,23 @@ export interface HuaweiSignInput {
   securityToken?: string;
   /**
    * true 时携带 `X-Sdk-Content-Sha256: UNSIGNED-PAYLOAD`（CLI 的 signSimple 就这么做），
-   * 适合 GET / 大 body；false 时按空 body 哈希签名。
+   * 适合 GET / 大 body；false 时按请求体哈希签名（无 body 时为空 body 哈希）。
    */
   unsignedPayload?: boolean;
   /** 待签字符串风格，默认 legacy（带日期） */
   signatureStyle?: HuaweiSignatureStyle;
   /** 便于复现相同签名（默认当前时间） */
   date?: Date;
+  /**
+   * 请求体（POST 用）。`unsignedPayload === false` 时参与 payload 哈希；
+   * 不传或 `unsignedPayload !== false` 时行为与改造前完全一致。
+   */
+  body?: string;
+  /**
+   * 签名完成后追加、**不参与签名**的请求头。
+   * 用于 snap-access 这类「加了头就破坏签名」的业务头（Agent-Type / X-Language）。
+   */
+  unsignedHeaders?: Record<string, string>;
 }
 
 /** 计算并返回「可直接交给 fetch 的完整请求头」 */
@@ -99,20 +109,32 @@ export function signHuaweiRequest(input: HuaweiSignInput): Record<string, string
   const headers: Record<string, string> = { ...(input.headers ?? {}) };
 
   if (input.securityToken) headers['X-Security-Token'] = input.securityToken;
-  if (input.unsignedPayload !== false) headers['X-Sdk-Content-Sha256'] = 'UNSIGNED-PAYLOAD';
 
   const sdkDate = huaweiSdkDate(input.date);
   headers['X-Sdk-Date'] = sdkDate;
   headers.Host = url.host;
 
+  const style = input.signatureStyle ?? 'legacy';
+  const separator = style === 'newline' ? '\n' : ' ';
+  const payloadHash =
+    input.unsignedPayload !== false
+      ? 'UNSIGNED-PAYLOAD'
+      : input.body === undefined
+        ? EMPTY_BODY_SHA256
+        : sha256Hex(input.body);
+
+  // 与华为 SDK / CodeArts 插件一致：有实体 body 时把它的哈希也放进签名头。
+  // GET（无 body）保持原行为，避免改变已实测通过的余额探测签名。
+  if (input.unsignedPayload !== false) {
+    headers['X-Sdk-Content-Sha256'] = 'UNSIGNED-PAYLOAD';
+  } else if (input.body !== undefined) {
+    headers['X-Sdk-Content-Sha256'] = payloadHash;
+  }
+
   const signedHeaders = Object.keys(headers)
     .map((key) => key.toLowerCase())
     .sort((a, b) => a.localeCompare(b))
     .join(';');
-
-  const style = input.signatureStyle ?? 'legacy';
-  const separator = style === 'newline' ? '\n' : ' ';
-  const payloadHash = input.unsignedPayload !== false ? 'UNSIGNED-PAYLOAD' : EMPTY_BODY_SHA256;
   const canonicalRequest = [
     input.method,
     canonicalUri(url.pathname),
@@ -129,12 +151,15 @@ export function signHuaweiRequest(input: HuaweiSignInput): Record<string, string
       : [SDK_SIGNING_ALGORITHM, sdkDate, hashedCanonicalRequest].join(separator);
   const signature = hmacSHA256Hex(input.secretKey, stringToSign);
 
-  return {
+  const signed: Record<string, string> = {
     ...headers,
     Authorization:
       `${SDK_SIGNING_ALGORITHM} Access=${input.accessKey}, ` +
       `SignedHeaders=${signedHeaders}, Signature=${signature}`,
   };
+  // 不参与签名的业务头必须在签名计算完成后再追加
+  for (const [key, value] of Object.entries(input.unsignedHeaders ?? {})) signed[key] = value;
+  return signed;
 }
 
 export interface HuaweiFetchResult {
@@ -154,6 +179,7 @@ export async function huaweiSignedFetch(
   const response = await fetch(input.url, {
     method: input.method,
     headers,
+    ...(input.body === undefined ? {} : { body: input.body }),
     signal: AbortSignal.timeout(input.timeoutMs ?? 12_000),
   });
   const text = await response.text();

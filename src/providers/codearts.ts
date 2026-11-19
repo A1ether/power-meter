@@ -6,6 +6,7 @@ import type { AccountConfig } from '../config.js';
 import type { CreditLot, ProviderSnapshot } from '../types.js';
 import {
   buildCodeArtsSnapshot,
+  codeartsCheckin,
   fetchCodeArtsSubscription,
   readCodeArtsAkSk,
 } from './codearts-aksk.js';
@@ -796,6 +797,13 @@ export const codeartsAdapter: ProviderAdapter = {
     return { records, covers: { use: useCovered, grant: grantCovered } };
   },
 
+  checkin: {
+    support: (account) =>
+      readCodeArtsAkSk(account) !== null
+        ? { ok: true }
+        : { ok: false, reason: 'CodeArts 签到需要 AK/SK；Cookie 模式无法签 snap-access' },
+    run: (account, ctx) => codeartsCheckin(account, ctx),
+  },
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
     // 凭证优先级：AK/SK（长期有效，走 snap-access 网关）→ 控制台 Cookie（会话过期需重抓）
     // options.authMode: 'auto'（默认）| 'aksk'（只用 AK/SK）| 'cookie'（只用登录态）
