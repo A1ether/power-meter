@@ -19,6 +19,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { landLoginAccount, type LandLoginResult } from './account-store.js';
+import { loadConfig, type AccountConfig } from './config.js';
 import { resolveLoginMethod, type ProbeContext, type ProviderLogin } from './providers/base.js';
 import { resolveAdapter } from './providers/index.js';
 
@@ -150,6 +151,13 @@ export interface StartLoginInput {
    * 弹窗里的「登录 / 添加账号」不传，走身份去重。
    */
   targetAccountId?: string;
+  /**
+   * 目标账号当前解析后的配置（凭证已展开）。
+   *
+   * 由会话层按 `targetAccountId` 从配置里补全，供适配器复用已有设备身份；
+   * 含明文凭证，只在服务端内存流转。
+   */
+  existingAccount?: AccountConfig;
   /** 用哪个登录方法（`ProviderLogin.id`）；缺省 = 平台默认方法（`login`） */
   method?: string;
   options?: Record<string, string>;
@@ -162,6 +170,27 @@ export interface StartLoginInput {
 export type StartLoginResult =
   | { ok: true; session: LoginSessionView }
   | { ok: false; status: number; error: string };
+
+/**
+ * 按卡片级重新登录的目标展示名，取出该账号当前的解析后配置。
+ *
+ * 读配置失败（文件损坏 / 环境变量缺失）不阻断登录：返回 undefined，
+ * 适配器会退化为「新建设备身份」。
+ */
+function findExistingAccount(
+  provider: string,
+  displayName: string | undefined,
+): AccountConfig | undefined {
+  const name = (displayName ?? '').trim();
+  if (!name) return undefined;
+  try {
+    return loadConfig().config.accounts.find(
+      (account) => account.provider === provider && (account.displayName ?? '') === name,
+    );
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * 发起登录：按 `method` 选方法、申请 authUrl、建会话、启动后台轮询。
@@ -202,6 +231,7 @@ export async function startLogin(input: StartLoginInput): Promise<StartLoginResu
       sessionId,
       callbackBase: input.callbackBase,
       options: { ...(input.options ?? {}) },
+      existingAccount: input.existingAccount ?? findExistingAccount(adapter.id, input.targetAccountId),
       log: (message) => log(`[login:${adapter.id}] ${message}`),
     });
   } catch (error) {

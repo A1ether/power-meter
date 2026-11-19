@@ -26,9 +26,12 @@ import {
   traeDeviceLimitMessage,
   traeDeviceProof,
   traeHostAllowed,
-  traeLoginDeviceIdentity,
+  traeIsAuthRejection,
   traePkce,
   traeReadCallback,
+  traeReusableDeviceIdentity,
+  traeWithAuthRetry,
+  type ResolveJwtOptions,
   type TraeDeviceKey,
   type TraePack,
 } from './trae.js';
@@ -206,7 +209,7 @@ async function globalRefreshJwt(
   ctx: ProbeContext,
   refreshToken: string,
   key: TraeDeviceKey,
-): Promise<{ accessToken: string; refreshToken: string | null }> {
+): Promise<{ accessToken: string; refreshToken: string | null; expiresAtMs: number }> {
   const proof = traeDeviceProof('POST', GLOBAL_EXCHANGE_PATH, GLOBAL_CLIENT_ID, refreshToken, key.privateKeyPem);
   const { body } = await fetchJson(`${host}${GLOBAL_EXCHANGE_PATH}`, {
     method: 'POST',
@@ -225,9 +228,11 @@ async function globalRefreshJwt(
   if (!isRecord(result)) throw new Error('ExchangeToken 响应缺少 Result');
   const accessToken = firstString(pick(result, 'Token', 'token'));
   if (!accessToken) throw new Error('ExchangeToken 未返回 Token，需重新登录');
+  const expiresAt = toIso(pick(result, 'ExpiredAt', 'expiredAt'));
   return {
     accessToken,
     refreshToken: firstString(pick(result, 'RefreshToken', 'refreshToken')) || null,
+    expiresAtMs: expiresAt ? Date.parse(expiresAt) : Date.now() + 10 * 60_000,
   };
 }
 
@@ -236,10 +241,13 @@ async function globalTokenFromCookie(
   host: string,
   cookie: string,
   ctx: ProbeContext,
+  options: { ignoreCache?: boolean } = {},
 ): Promise<string> {
   const cacheKey = globalCookieKey(host, cookie);
   const cached = globalTokenCache.get(cacheKey);
-  if (cached && cached.expiresAtMs - Date.now() > 5 * 60 * 1000) return cached.token;
+  if (!options.ignoreCache && cached && cached.expiresAtMs - Date.now() > 5 * 60 * 1000) {
+    return cached.token;
+  }
 
   const { body } = await fetchJson(`${host}${GLOBAL_TOKEN_PATH}`, {
     method: 'POST',
@@ -264,29 +272,45 @@ async function globalTokenFromCookie(
 }
 
 /**
- * 解析可用的 Cloud-IDE-JWT。三条路径按顺序，与国内版一致：
+ * 解析可用的 Cloud-IDE-JWT。顺序与国内版一致：
+ *   ⓪ refreshToken 续期缓存（同一轮刷新里 probe 与明细复用同一枚新令牌）；
  *   ① 显式 accessToken；② refreshToken + deviceKey 续期并写回 `.env`；③ Cookie 换 JWT。
+ *
+ * `renewOnly` 跳过 ⓪①：显式令牌刚被上游拒绝时不能再用它。
  */
-async function resolveGlobalJwt(account: AccountConfig, ctx: ProbeContext): Promise<string> {
+async function resolveGlobalJwt(
+  account: AccountConfig,
+  ctx: ProbeContext,
+  options: ResolveJwtOptions = {},
+): Promise<string> {
+  const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+  const hosts = accountHostsOf(account, cookie);
+  const refreshToken = cred(account, ctx, ['refreshToken', 'refresh_token']);
+  const key = globalDeviceKeyOf(account, ctx);
+
+  if (refreshToken && !options.renewOnly) {
+    const cached = globalTokenCache.get(globalRefreshKey(refreshToken));
+    if (cached && cached.expiresAtMs - Date.now() > 60_000) return cached.token;
+  }
+
   const explicit = extractHeaderValue(
     cred(account, ctx, ['accessToken', 'token', 'authorization']),
     'authorization',
   )
     .replace(/^cloud-ide-jwt\s+/i, '')
     .trim();
-  if (explicit) return explicit;
-
-  const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
-  const hosts = accountHostsOf(account, cookie);
-  const refreshToken = cred(account, ctx, ['refreshToken', 'refresh_token']);
-  const key = globalDeviceKeyOf(account, ctx);
+  if (explicit && !options.renewOnly) return explicit;
 
   if (refreshToken && key) {
     let lastError: Error | null = null;
     for (const host of hosts) {
       try {
-        ctx.log('Trae 国际版令牌缺失，尝试用 refreshToken + DeviceProof 续期');
+        ctx.log('Trae 国际版令牌缺失或被拒，尝试用 refreshToken + DeviceProof 续期');
         const refreshed = await globalRefreshJwt(host, account, ctx, refreshToken, key);
+        globalTokenCache.set(globalRefreshKey(refreshToken), {
+          token: refreshed.accessToken,
+          expiresAtMs: refreshed.expiresAtMs,
+        });
         if (ctx.persistCredentials) {
           const patch: Record<string, string> = { accessToken: refreshed.accessToken };
           if (refreshed.refreshToken) patch.refreshToken = refreshed.refreshToken;
@@ -313,12 +337,29 @@ async function resolveGlobalJwt(account: AccountConfig, ctx: ProbeContext): Prom
   let lastError: Error | null = null;
   for (const host of hosts) {
     try {
-      return await globalTokenFromCookie(host, cookie, ctx);
+      return await globalTokenFromCookie(host, cookie, ctx, { ignoreCache: options.renewOnly === true });
     } catch (error) {
       lastError = error as Error;
     }
   }
   throw lastError ?? new Error('Trae 国际版 Cookie 换令牌失败');
+}
+
+/** refreshToken 续期结果的缓存键（与 Cookie 缓存共用一张表，前缀区分） */
+function globalRefreshKey(refreshToken: string): string {
+  return globalCookieKey('refresh', refreshToken);
+}
+
+/** 令牌被上游拒绝后清掉缓存，确保下一次解析真的去换新令牌 */
+function invalidateGlobalJwtCaches(account: AccountConfig, ctx: ProbeContext): void {
+  const refreshToken = cred(account, ctx, ['refreshToken', 'refresh_token']);
+  if (refreshToken) globalTokenCache.delete(globalRefreshKey(refreshToken));
+  const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+  if (cookie) {
+    for (const host of accountHostsOf(account, cookie)) {
+      globalTokenCache.delete(globalCookieKey(host, cookie));
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -636,15 +677,41 @@ async function fetchGlobalUsageBody(
 }
 
 /**
+ * 用量接口带「登录态自愈」：显式 accessToken 过期 / 被拒（401、业务码 1001）时，
+ * 清缓存 → 用 refreshToken / Cookie 换新令牌 → 重试一次。
+ *
+ * 国际版的 JWT 与国内版同为约 1 天有效期，而登录产物会长期保存 accessToken；
+ * 没有这层自愈时，令牌一过期就会一直 401，且手工补 Cookie 也会被显式令牌短路。
+ */
+async function fetchGlobalUsageWithAuth(
+  account: AccountConfig,
+  ctx: ProbeContext,
+  payHosts: string[],
+): Promise<{ body: unknown; host: string; path: string }> {
+  const token = await resolveGlobalJwt(account, ctx);
+  return traeWithAuthRetry({
+    label: 'Trae 国际版',
+    ctx,
+    token,
+    resolve: (options) => resolveGlobalJwt(account, ctx, options),
+    invalidate: () => invalidateGlobalJwtCaches(account, ctx),
+    run: (jwt) => fetchGlobalUsageBody(payHosts, jwt, ctx),
+  });
+}
+
+/**
  * 把状态错误映射成 `ProviderStatus`。
  *
  * `HttpError.status === 0` 是「一个字节都没拿到」的网络层失败（见 `src/lib/http.ts:190`），
  * 它不携带任何上游语义，按 `error` 报，避免把断网显示成「平台不可用」。
  */
 function statusOfGlobalError(error: unknown): ProviderSnapshot['status'] {
-  if (!(error instanceof HttpError)) return 'error';
-  if (error.status === 0) return 'error';
-  return error.kind;
+  if (error instanceof HttpError) {
+    if (error.status === 0) return 'error';
+    return error.kind;
+  }
+  // 自愈失败时抛的是带「登录态已失效」语义的普通 Error：仍按未授权展示
+  return traeIsAuthRejection(error) ? 'unauthorized' : 'error';
 }
 
 /* ------------------------------------------------------------------ *
@@ -718,7 +785,13 @@ export const traeGlobalAdapter: ProviderAdapter = {
     let usageBody: unknown;
     let usageHost = payHosts[0] ?? GLOBAL_ACCOUNT_HOST;
     try {
-      const fetched = await fetchGlobalUsageBody(payHosts, token, ctx);
+      const fetched = await fetchGlobalUsageWithAuth(account, ctx, payHosts);
+      // 自愈可能已换过新令牌：后续逐笔请求沿用（缓存命中，不会重复续期）
+      try {
+        token = await resolveGlobalJwt(account, ctx);
+      } catch {
+        // 沿用第一次的令牌：用量已经成功，不因二次解析失败丢弃结果
+      }
       usageBody = fetched.body;
       // 复用**真正成功的那台主机**：首台候选可能 404，明细接口未必同在首台上
       usageHost = fetched.host;
@@ -833,7 +906,9 @@ export const traeGlobalAdapter: ProviderAdapter = {
     async start(input) {
       const { verifier, challenge } = traePkce();
       // 与国内版共用同一套持久化设备身份逻辑，但按 provider 分文件，互不覆盖
-      const identity = traeLoginDeviceIdentity('trae-global');
+      // 卡片级重新登录优先复用该账号已注册的设备：每次生成新密钥会被上游当成新设备，
+      // 触发设备上限（040034）
+      const identity = traeReusableDeviceIdentity(input.existingAccount, 'trae-global');
       const key = traeDeviceKeyFromPem(identity.privateKeyPem);
       const traceId = randomUUID();
       const machineId = identity.machineId;
@@ -1030,7 +1105,7 @@ export const traeGlobalAdapter: ProviderAdapter = {
       const token = await resolveGlobalJwt(account, ctx);
       // 订阅状态是补充信息（拿不到也照常出余额）：与用量请求并发，避免串行叠加超时
       const planPromise = fetchGlobalPlan(accountHosts, token, ctx);
-      const { body, host, path } = await fetchGlobalUsageBody(payHosts, token, ctx);
+      const { body, host, path } = await fetchGlobalUsageWithAuth(account, ctx, payHosts);
       const parsed = parseGlobalUsage(body, ctx.now);
       const meta = DIMENSION_META[parsed.dimension];
       const status = await planPromise;

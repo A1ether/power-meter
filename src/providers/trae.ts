@@ -153,6 +153,42 @@ export function traeLoginDeviceIdentity(providerId: string): TraeLoginDeviceIden
 }
 
 /**
+ * 重新登录**已有账号**时优先复用该账号已注册的设备身份。
+ *
+ * 为什么不能只用 `.run/login-device/<provider>.json`：Trae 按账号限制设备数，
+ * 并向每台设备签发凭证。若本机身份文件在历史登录之后被重建（换机器、删 `.run`、
+ * 桌面端与 Web 端配置目录不同），它与账号里保存的 `deviceKey/deviceId/machineId`
+ * 就不是同一台设备；再次登录会被上游按**新设备**计数，直接返回
+ * `040034 Device limit reached`。
+ *
+ * 判定：三件套齐全且私钥可解析才复用；否则退回本机持久化身份（新设备场景）。
+ */
+export function traeReusableDeviceIdentity(
+  existing: AccountConfig | undefined,
+  providerId: string,
+): TraeLoginDeviceIdentity {
+  const rawKey = existing
+    ? (existing.credentials.deviceKey ?? existing.credentials.devicePrivateKey ?? '')
+    : '';
+  const deviceId =
+    existing && typeof existing.options.deviceId === 'string' ? existing.options.deviceId.trim() : '';
+  const machineId =
+    existing && typeof existing.options.machineId === 'string'
+      ? existing.options.machineId.trim()
+      : '';
+  if (rawKey && deviceId && machineId) {
+    const pem = rawKey.includes('BEGIN') ? rawKey : Buffer.from(rawKey, 'base64').toString('utf8');
+    try {
+      traeDeviceKeyFromPem(pem); // 私钥损坏时不带病复用
+      return { deviceId, machineId, privateKeyPem: pem };
+    } catch {
+      // 退回本机身份
+    }
+  }
+  return traeLoginDeviceIdentity(providerId);
+}
+
+/**
  * 把上游的「设备数量已达上限」翻译成可操作的中文提示。
  * 其他错误返回 null，交给登录会话层按网络抖动继续重试。
  */
@@ -237,7 +273,7 @@ async function traeRefreshJwt(
   ctx: ProbeContext,
   refreshToken: string,
   key: TraeDeviceKey,
-): Promise<{ accessToken: string; refreshToken: string | null }> {
+): Promise<{ accessToken: string; refreshToken: string | null; expiresAtMs: number }> {
   const apiHost = optString(account, 'apiHost') || TRAE_API_HOST;
   const path = '/trae/api/v3/oauth/ExchangeToken';
   const proof = traeDeviceProof('POST', path, TRAE_CLIENT_ID, refreshToken, key.privateKeyPem);
@@ -262,7 +298,12 @@ async function traeRefreshJwt(
   const accessToken = firstString(pick(result, 'Token', 'token'));
   if (!accessToken) throw new Error('ExchangeToken 未返回 Token，需重新登录');
   const nextRefresh = firstString(pick(result, 'RefreshToken', 'refreshToken'));
-  return { accessToken, refreshToken: nextRefresh || null };
+  const expiresAt = toIso(pick(result, 'ExpiredAt', 'expiredAt'));
+  return {
+    accessToken,
+    refreshToken: nextRefresh || null,
+    expiresAtMs: expiresAt ? Date.parse(expiresAt) : Date.now() + 10 * 60_000,
+  };
 }
 
 /** 用 JWT 取账号身份（登录落库时用于生成卡片名） */
@@ -370,6 +411,19 @@ interface CachedToken {
 
 /** 按 Cookie 缓存换来的 JWT，避免每次刷新都多打一次接口 */
 const tokenCache = new Map<string, CachedToken>();
+
+/**
+ * 按 refreshToken 缓存续期得到的 JWT。
+ *
+ * 场景：一轮刷新里 `probe()` 与 `fetchUsageLedger()` 各解析一次令牌，若第一次
+ * 因显式令牌过期而续期，第二次仍拿着旧快照；缓存让两次都用同一枚新令牌
+ * （否则明细可能再续期一次，甚至因 refreshToken 轮换而失败）。
+ */
+const refreshTokenCache = new Map<string, CachedToken>();
+
+function refreshTokenKey(refreshToken: string): string {
+  return `refresh-${cookieKey(refreshToken)}`;
+}
 
 function cookieKey(cookie: string): string {
   let hash = 0;
@@ -507,45 +561,76 @@ export function mergeLots(
     );
 }
 
+export interface ResolveJwtOptions {
+  /**
+   * 只走可续期路径（refreshToken → Cookie）：跳过显式 accessToken 与内存缓存。
+   * 用于令牌被上游拒绝后的自愈重试。
+   */
+  renewOnly?: boolean;
+}
+
 /**
- * 解析可用的 Cloud-IDE-JWT。三条路径按顺序：
+ * 解析可用的 Cloud-IDE-JWT。顺序：
+ *   ⓪ refreshToken 续期缓存（同一轮刷新里 probe 与明细复用同一枚新令牌）；
  *   ① 显式 accessToken（登录产物或手工粘贴）——直接使用；
  *   ② 登录产物的 refreshToken + deviceKey——刷新一次并写回 `.env`；
  *   ③ Cookie 换 JWT（历史路径，行为不变）。
+ *
+ * `renewOnly` 跳过 ⓪①：显式令牌刚被上游拒绝时不能再用它。
  */
-async function resolveJwt(account: AccountConfig, ctx: ProbeContext): Promise<string> {
+async function resolveJwt(
+  account: AccountConfig,
+  ctx: ProbeContext,
+  options: ResolveJwtOptions = {},
+): Promise<string> {
+  const refreshToken = cred(account, ctx, ['refreshToken', 'refresh_token']);
+  if (refreshToken && !options.renewOnly) {
+    const cached = refreshTokenCache.get(refreshTokenKey(refreshToken));
+    if (cached && cached.expiresAtMs - Date.now() > 60_000) return cached.token;
+  }
+
   const explicit = extractHeaderValue(
     cred(account, ctx, ['accessToken', 'token', 'authorization']),
     'authorization',
   )
     .replace(/^cloud-ide-jwt\s+/i, '')
     .trim();
-  if (explicit) return explicit;
+  if (explicit && !options.renewOnly) return explicit;
 
-  const refreshToken = cred(account, ctx, ['refreshToken', 'refresh_token']);
+  const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
   const key = traeDeviceKeyOf(account, ctx);
   if (refreshToken && key) {
-    ctx.log('Trae 登录令牌缺失，尝试用 refreshToken + DeviceProof 续期');
-    const refreshed = await traeRefreshJwt(account, ctx, refreshToken, key);
-    if (ctx.persistCredentials) {
-      const patch: Record<string, string> = { accessToken: refreshed.accessToken };
-      if (refreshed.refreshToken) patch.refreshToken = refreshed.refreshToken;
-      try {
-        await ctx.persistCredentials(patch);
-      } catch (persistError) {
-        ctx.log(`Trae 新令牌写回 .env 失败（不影响本次取数）：${(persistError as Error).message}`);
+    try {
+      ctx.log('Trae 登录令牌缺失或被拒，尝试用 refreshToken + DeviceProof 续期');
+      const refreshed = await traeRefreshJwt(account, ctx, refreshToken, key);
+      refreshTokenCache.set(refreshTokenKey(refreshToken), {
+        token: refreshed.accessToken,
+        expiresAtMs: refreshed.expiresAtMs,
+      });
+      if (ctx.persistCredentials) {
+        const patch: Record<string, string> = { accessToken: refreshed.accessToken };
+        if (refreshed.refreshToken) patch.refreshToken = refreshed.refreshToken;
+        try {
+          await ctx.persistCredentials(patch);
+        } catch (persistError) {
+          ctx.log(`Trae 新令牌写回 .env 失败（不影响本次取数）：${(persistError as Error).message}`);
+        }
       }
+      return refreshed.accessToken;
+    } catch (refreshError) {
+      if (!cookie) throw refreshError;
+      ctx.log(`Trae refreshToken 续期失败，改用 Cookie：${(refreshError as Error).message}`);
     }
-    return refreshed.accessToken;
   }
 
-  return resolveTokenFromCookie(account, ctx);
+  return resolveTokenFromCookie(account, ctx, { ignoreCache: options.renewOnly === true });
 }
 
 /** 用 Cookie 换取（并缓存）Cloud-IDE-JWT */
 async function resolveTokenFromCookie(
   account: AccountConfig,
   ctx: ProbeContext,
+  options: { ignoreCache?: boolean } = {},
 ): Promise<string> {
   const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
   if (!cookie) {
@@ -554,7 +639,9 @@ async function resolveTokenFromCookie(
 
   const key = cookieKey(cookie);
   const cached = tokenCache.get(key);
-  if (cached && cached.expiresAtMs - Date.now() > 5 * 60 * 1000) return cached.token;
+  if (!options.ignoreCache && cached && cached.expiresAtMs - Date.now() > 5 * 60 * 1000) {
+    return cached.token;
+  }
 
   const { body } = await fetchJson(TRAE_TOKEN_URL, {
     method: 'POST',
@@ -579,6 +666,64 @@ async function resolveTokenFromCookie(
   });
   ctx.log('已用 Cookie 续签 Trae Token');
   return token;
+}
+
+/** 令牌被上游拒绝后清掉缓存，确保下一次解析真的去换新令牌 */
+function invalidateJwtCaches(account: AccountConfig, ctx: ProbeContext): void {
+  const refreshToken = cred(account, ctx, ['refreshToken', 'refresh_token']);
+  if (refreshToken) refreshTokenCache.delete(refreshTokenKey(refreshToken));
+  const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+  if (cookie) tokenCache.delete(cookieKey(cookie));
+}
+
+/**
+ * 是否为「上游拒绝登录态」。
+ *
+ * 只认 401/403 与 Trae 的业务码 1001；网络层失败（`HttpError.status === 0`）
+ * 与服务端 5xx 不属于登录态问题，不能触发续期重试（否则会把断网误当成过期）。
+ */
+export function traeIsAuthRejection(error: unknown): boolean {
+  if (error instanceof HttpError) {
+    if (error.status === 0) return false;
+    if (error.status === 401 || error.status === 403) return true;
+  }
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /"code"\s*:\s*1001\b|not able to authenticate|未授权|登录态已失效/i.test(message);
+}
+
+/**
+ * 用「当前令牌」执行一次请求；被上游拒绝登录态时，清缓存 → 只走续期路径
+ * 换一枚新令牌 → 重试一次。
+ *
+ * 两个 Trae 平台共用：国内版与国际版的续期协议相同，只是主机不同。
+ */
+export async function traeWithAuthRetry<T>(args: {
+  label: string;
+  ctx: ProbeContext;
+  token: string;
+  resolve: (options?: ResolveJwtOptions) => Promise<string>;
+  invalidate: () => void;
+  run: (token: string) => Promise<T>;
+}): Promise<T> {
+  try {
+    return await args.run(args.token);
+  } catch (error) {
+    if (!traeIsAuthRejection(error)) throw error;
+    args.ctx.log(`${args.label}令牌被上游拒绝，尝试自动续期后重试`);
+    args.invalidate();
+    let renewed: string;
+    try {
+      renewed = await args.resolve({ renewOnly: true });
+    } catch (renewError) {
+      throw new Error(
+        `${args.label}登录态已失效（${(error as Error).message}），自动续期失败：` +
+          `${(renewError as Error).message}。请重新登录，或在「手工填写凭证」里粘贴 Cookie。`,
+      );
+    }
+    if (renewed === args.token) throw error;
+    args.ctx.log(`${args.label}续期成功，已用新令牌重试`);
+    return await args.run(renewed);
+  }
 }
 
 export const traeAdapter: ProviderAdapter = {
@@ -630,7 +775,7 @@ export const traeAdapter: ProviderAdapter = {
     const hasLoginTokens = Boolean(cred(account, ctx, ['refreshToken', 'refresh_token']));
     if (!hasCookie && !hasExplicitToken && !hasLoginTokens) return null;
 
-    const token = await resolveJwt(account, ctx);
+    let token = await resolveJwt(account, ctx);
     // 与页面请求同源同参：usage_type=[7] 对应页面「使用记录」列表；
     // page_size 实测上限 20（再大会返回 400 code 9004），因此按 20 分页、上限 10 页
     const origin = new URL(optString(account, 'usageUrl') || TRAE_USAGE_URL).origin;
@@ -640,11 +785,11 @@ export const traeAdapter: ProviderAdapter = {
     const pageSize = 20;
     const records: UsageRecord[] = [];
 
-    for (let pageNum = 1; pageNum <= 10; pageNum += 1) {
-      const { body } = await fetchJson(recordsUrl, {
+    const send = (jwt: string, pageNum: number) =>
+      fetchJson(recordsUrl, {
         method: 'POST',
         headers: {
-          Authorization: `Cloud-IDE-JWT ${token}`,
+          Authorization: `Cloud-IDE-JWT ${jwt}`,
           'X-User-Region': 'CN',
           'Content-Type': 'application/json',
           Origin: 'https://www.trae.cn',
@@ -659,6 +804,28 @@ export const traeAdapter: ProviderAdapter = {
         }),
         timeoutMs: ctx.timeoutMs || TRAE_TIMEOUT_FALLBACK,
       });
+
+    for (let pageNum = 1; pageNum <= 10; pageNum += 1) {
+      // 首页承担自愈：显式令牌过期时续期一次，后续页与「获取明细」沿用新令牌
+      const { body } =
+        pageNum === 1
+          ? await traeWithAuthRetry({
+              label: 'Trae ',
+              ctx,
+              token,
+              resolve: (options) => resolveJwt(account, ctx, options),
+              invalidate: () => invalidateJwtCaches(account, ctx),
+              run: (jwt) => send(jwt, pageNum),
+            })
+          : await send(token, pageNum);
+      if (pageNum === 1) {
+        // 自愈可能已换过新令牌：后续页与「获取明细」沿用（缓存命中，不会重复续期）
+        try {
+          token = await resolveJwt(account, ctx);
+        } catch {
+          // 沿用第一次的令牌：首页已经成功，不因二次解析失败丢弃结果
+        }
+      }
       const list = isRecord(body)
         ? pick(body, 'user_usage_group_by_sessions', 'userUsageGroupBySessions')
         : undefined;
@@ -735,8 +902,9 @@ export const traeAdapter: ProviderAdapter = {
       const consoleHost = TRAE_CONSOLE_HOST;
       const apiHost = TRAE_API_HOST;
       const { verifier, challenge } = traePkce();
-      // 复用本机固定的设备身份：每次生成新密钥会被上游当成新设备，触发设备上限
-      const identity = traeLoginDeviceIdentity('trae');
+      // 卡片级重新登录优先复用该账号已注册的设备：每次生成新密钥会被上游当成新设备，
+      // 触发设备上限（040034）
+      const identity = traeReusableDeviceIdentity(input.existingAccount, 'trae');
       const key = traeDeviceKeyFromPem(identity.privateKeyPem);
       const traceId = randomUUID();
       const machineId = identity.machineId;
@@ -897,16 +1065,25 @@ export const traeAdapter: ProviderAdapter = {
 
     try {
       const token = await resolveJwt(account, ctx);
-      const { body } = await fetchJson(usageUrl, {
-        method: 'POST',
-        headers: {
-          Authorization: `Cloud-IDE-JWT ${token}`,
-          'X-User-Region': 'CN',
-          Origin: 'https://www.trae.cn',
-          Referer: 'https://www.trae.cn/',
-        },
-        body: '{}',
-        timeoutMs: ctx.timeoutMs || TRAE_TIMEOUT_FALLBACK,
+      // 显式 accessToken 只有约 1 天有效期；被上游拒绝时自愈续期一次再重试
+      const { body } = await traeWithAuthRetry({
+        label: 'Trae ',
+        ctx,
+        token,
+        resolve: (options) => resolveJwt(account, ctx, options),
+        invalidate: () => invalidateJwtCaches(account, ctx),
+        run: (jwt) =>
+          fetchJson(usageUrl, {
+            method: 'POST',
+            headers: {
+              Authorization: `Cloud-IDE-JWT ${jwt}`,
+              'X-User-Region': 'CN',
+              Origin: 'https://www.trae.cn',
+              Referer: 'https://www.trae.cn/',
+            },
+            body: '{}',
+            timeoutMs: ctx.timeoutMs || TRAE_TIMEOUT_FALLBACK,
+          }),
       });
 
       const parsed = parseTraeUsage(body);
@@ -969,7 +1146,11 @@ export const traeAdapter: ProviderAdapter = {
         fallbackExpiryFromWindow: false,
       });
     } catch (error) {
-      const status = error instanceof HttpError ? error.kind : 'error';
+      const status = error instanceof HttpError
+        ? error.kind
+        : traeIsAuthRejection(error)
+          ? 'unauthorized'
+          : 'error';
       return failure(traeAdapter, account, ctx, status, (error as Error).message);
     }
   },

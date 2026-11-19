@@ -88,6 +88,13 @@ export interface LoginStartInput {
   /** 非敏感选项（目前只用于站点选择，登录固定 cn） */
   options: Record<string, string>;
   /**
+   * 卡片级「重新登录」的目标账号（服务端从 `accounts.json` + `.env` 解析后的明文配置）。
+   *
+   * 只服务端内存使用，**不下发前端、不写日志**。Trae 用它复用已注册的设备身份，
+   * 避免重新登录被上游当成新设备（`040034 Device limit reached`）。
+   */
+  existingAccount?: AccountConfig;
+  /**
    * 用哪个登录方法（`ProviderLogin.id`）。缺省 = 平台的默认方法（`login`）。
    * 只有声明了 `loginMethods` 的平台才有多个可选值。
    */
