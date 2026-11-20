@@ -365,6 +365,17 @@ const TARGETS: Target[] = [
     usageUrl: 'https://qwenwork.cn/app/settings/usage',
     apiHost: 'qwenwork.cn',
   },
+  {
+    // WPS 灵犀：智点接口只认 WPS 网页登录态 Cookie（credentials: "include"）。
+    // 登录态由 account.kdocs.cn 写入 `.kdocs.cn` 父域；wps.cn 的 Cookie 不会被浏览器
+    // 发往 lingxi.kdocs.cn，混进 header 只会造成误导，因此只收集 kdocs.cn。
+    id: 'lingxi',
+    label: 'WPS 灵犀',
+    envKey: 'LINGXI_COOKIE',
+    cookieSites: ['kdocs.cn'],
+    usageUrl: 'https://lingxi.kdocs.cn/',
+    apiHost: 'lingxi.kdocs.cn',
+  },
 ];
 
 // ---------------------------------------------------------------- .env 读写

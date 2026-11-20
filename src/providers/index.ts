@@ -4,6 +4,7 @@ import { codeartsAdapter } from './codearts.js';
 import { codebuddyAdapter, codebuddyIntlAdapter } from './codebuddy.js';
 import { a1etheropenaiAdapter } from './a1etheropenai.js';
 import { demoAdapters } from './demo.js';
+import { lingxiAdapter } from './lingxi.js';
 import { minimaxAdapter } from './minimax.js';
 import { sessionApiAdapters } from './presets.js';
 import { qoderAdapter, qoderIntlAdapter } from './qoder.js';
@@ -30,6 +31,7 @@ for (const adapter of [
   minimaxAdapter,
   xiaohuanxiongAdapter,
   qwenworkAdapter,
+  lingxiAdapter,
   ...sessionApiAdapters,
   ...demoAdapters,
 ]) {
@@ -106,6 +108,10 @@ const ALIASES: Record<string, string> = {
   'qwen-office': 'qwenwork',
   'qianwen': 'qwenwork',
   'qw': 'qwenwork',
+  'lingxi.kdocs.cn': 'lingxi',
+  'kdocs-lingxi': 'lingxi',
+  'wps-lingxi': 'lingxi',
+  'wpslingxi': 'lingxi',
 };
 
 export function describeRegistry(): Array<{

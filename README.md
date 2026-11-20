@@ -99,10 +99,11 @@ A1etherOpenAi 是多账号合并成一张卡，卡片级没有单一账号身份
 ```bash
 npm run chrome:debug     # ① 弹出一个调试专用 Chrome 窗口
                          #   ② 在里面登录 Qoder / Trae / CodeBuddy / CodeArts / MiniMax Code /
-                         #      商汤小浣熊 / 千问办公，并各自打开「用量 / 账单」页面
+                         #      商汤小浣熊 / 千问办公 / WPS 灵犀，并各自打开「用量 / 账单」页面
                          #      （MiniMax Code 停在 agent.minimax.cn；小浣熊停在
                          #      xiaohuanxiong.com/work/settings/resource；千问办公停在
-                         #      qwenwork.cn/app/settings/usage；
+                         #      qwenwork.cn/app/settings/usage；WPS 灵犀停在
+                         #      lingxi.kdocs.cn 的「设置 → 智点详情」；
                          #      Qoder 国际站账号停在 qoder.com/account/usage，用
                          #      npm run capture -- qoder-intl 抓取；
                          #      Trae 国际版账号停在 trae.ai/account-setting#usage，用
@@ -113,7 +114,7 @@ npm run probe            # ④ 验证取数是否正常
 ```
 
 除 A1etherOpenAi（API 密钥）、MiniMax Code（网页端登录态 token + Cookie）与商汤小浣熊
-（令牌藏在登录态 Cookie 里）外，其余平台（含千问办公）都只需要**一个 Cookie**，
+（令牌藏在登录态 Cookie 里）外，其余平台（含千问办公 / WPS 灵犀）都只需要**一个 Cookie**，
 其余全部自动完成 —— 包括 Trae 那个只有 1 天有效期的 JWT，由适配器用 Cookie 自动续签，不需要手工维护。
 
 > 调试窗口用的是独立 profile（`~/.power-meter/chrome-profile`），与你日常的 Chrome 完全隔离。
@@ -132,6 +133,7 @@ npm run probe            # ④ 验证取数是否正常
 | `npm run capture -- trae-global` | 抓 Trae 国际版（trae.ai）登录态，写进 `TRAE_GLOBAL_COOKIE`（国内站用 `npm run capture -- trae` → `TRAE_COOKIE`）|
 | `npm run capture -- xiaohuanxiong` | 抓商汤小浣熊登录态，一次写入 `XIAOHUANXIONG_COOKIE` / `XIAOHUANXIONG_TOKEN` / `XIAOHUANXIONG_REFRESH_TOKEN` |
 | `npm run capture -- qwenwork` | 抓千问办公登录态，写入 `QWENWORK_COOKIE`（也可用卡片上的「网页端登录」）|
+| `npm run capture -- lingxi` | 抓 WPS 灵犀登录态，写入 `LINGXI_COOKIE`（也可用卡片上的「网页端登录」）|
 | `npm run migrate:qoder-sites --dry-run` | 预览 Qoder 旧站点配置（`options.site`）的迁移；去掉 `--dry-run` 才写入（自动备份到 `.run/`）|
 | `npm run capture -- --dry-run` | 只预览，不写文件 |
 | `npm run probe` | **命令行探测取数是否正常**（改配置后先跑这个最快）|
@@ -371,7 +373,7 @@ interface ProviderSnapshot {
 ### 各平台配置
 
 除 A1etherOpenAi（API 密钥）、MiniMax Code（网页登录态或 OAuth 令牌）、商汤小浣熊（令牌藏在 Cookie 里）
-与 CodeArts（推荐 AK/SK）外，其余平台（含千问办公）的凭证都只需要 **一个 Cookie**：
+与 CodeArts（推荐 AK/SK）外，其余平台（含千问办公 / WPS 灵犀）的凭证都只需要 **一个 Cookie**：
 
 | 平台 | `provider` | 需要的凭证 | 关键 `options` |
 | --- | --- | --- | --- |
@@ -384,6 +386,7 @@ interface ProviderSnapshot {
 | CodeArts | `codearts` | **网页端登录（推荐，一键添加）**：卡片上点「网页端登录」，在自动打开的调试 Chrome 里登录华为云即可，Cookie 自动落 `CODEARTS_COOKIE` 并由 `npm run codearts:refresh` 定时续期<br>`accessKey` + `secretKey`（长期有效，多账号路径）<br>`cookie`（兼容，会话过期需重抓） | 可选 `authMode: "auto" \| "aksk" \| "cookie"`、`resourceType`、`region` |
 | MiniMax Code | `minimax` / `minimax-code` / `agent.minimax.cn` | **扫码登录（推荐，一键添加）**：卡片上点「扫码登录」，手机确认后写入 `accessToken` + `refreshToken`（`MINIMAX_ACCESS_TOKEN` / `MINIMAX_REFRESH_TOKEN`）<br>**网页端登录（一键添加）**：在自动打开的调试 Chrome 里登录 `agent.minimax.cn`，自动抓取 `token`（`_token`）+ `cookie`（SSO）+ 真实身份 `userId`/`opTicket`/`uuid`<br>手工兜底：`token` + `cookie` + `userId` | `site: "cn"`（默认）或 `"global"`；`authMode: "web" \| "oauth"`（登录自动写入） |
 | 千问办公 | `qwenwork` / `qwenwork.cn` / `qwen-office` | `cookie`（`QWENWORK_COOKIE`，网页登录态；生产环境不带 `Authorization`）| 无；`origin` 可覆盖为代理地址 |
+| WPS 灵犀 | `lingxi` / `lingxi.kdocs.cn` / `wps-lingxi` | `cookie`（`LINGXI_COOKIE`，WPS 网页登录态；`kdocs.cn` 域）| 无；`origin` 可覆盖为代理地址 |
 | 商汤小浣熊 | `xiaohuanxiong` / `xiaohuanxiong.com` / `raccoon` | `token`（`XIAOHUANXIONG_TOKEN`，可从 Cookie 的 `xhx_token` / `raccoon_token` 推导）+ `cookie` + `refreshToken`（capture / 网页端登录一并写入）| 无；`origin` 可覆盖为代理地址 |
 | A1etherOpenAi | `a1etheropenai` / `d1v.ai`（上游服务域名保持不变，也是它的解析别名） | `apiKey`（查余额）<br>`paiApiKey`（托管复制） | `baseUrl`、`revealApiKey` |
 | 任意平台 | `custom` | 按需 `headers` | `providerId`、`endpoint`、`mapping` |
@@ -729,6 +732,16 @@ Trae 的 OAuth 回调 `/authorize` 是唯一例外：浏览器从 trae.cn 跳回
   看板「网页端登录」用「页面自己请求 `/user/balance` 拿到 2xx」作为登录判据。
   企业版配额（`/biz/user/v1/settings/enterprise/quota`）是另一套鉴权与口径，本轮未纳入，
   企业账号仍能看到个人积分三桶。
+- **WPS 灵犀取的是网页端内部接口**（没有公开查询 API）：
+  `GET /api/public/v1/credits/balance` 给「当前智点余额」与逐批明细
+  （`bonus_credits[]` 活动赠送 / `purchased_credits[]` 加量包，每批带 `expire_time`），
+  `GET /api/public/v1/credits/transaction/list` 给逐笔流水。卡片按上游批次拆 `CreditLot`，
+  到期时间直接取 `expire_time`，进入「最快到期」；批次合计与余额不一致时以余额为准并注明。
+  团队智点与个人智点不通用，只在 note 提示、不计入余额；本轮**只读**，
+  不调用「获取智点」、任务奖励领取或兑换接口。
+  鉴权只认 **WPS 网页登录态 Cookie**（由 `account.kdocs.cn` 写入 `.kdocs.cn` 父域），未登录时余额接口返回
+  `401 UserUnauthorized`，因此 `npm run capture -- lingxi` 按 `kdocs.cn` 收集；看板「网页端登录」
+  用「页面自己请求 `/api/public/v1/credits/balance` 拿到 2xx」作为登录判据。
 - **商汤小浣熊取的是网页端内部接口**（官方只公开「积分规则」，没有查询 API）：
   `GET /api/web/points/v1/balance` 给四类积分的当前剩余，`GET /api/web/points/v2/bills`
   给发放 / 消耗流水。卡片**按每一笔发放拆批次**：**每日赠送**（每笔发放各有自己的
