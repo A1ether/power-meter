@@ -92,7 +92,7 @@ say "5/5 生成 dmg"
 rm -f "$OUT/PowerMeter-$VERSION.dmg"
 hdiutil create -volname "Power Meter" -srcfolder "$APP" -ov -format UDZO "$OUT/PowerMeter-$VERSION.dmg" >/dev/null
 
-ok "中间产物：$APP（打包结束后清理，只保留 DMG 与安装副本）"
+ok "中间产物：${APP}（打包结束后清理，只保留 DMG 与安装副本）"
 ok "安装包：$OUT/PowerMeter-$VERSION.dmg"
 ok "sidecar：$RES/power-meter-sidecar（--port 0 --no-static --token 由 App 每次启动随机生成）"
 
