@@ -21,6 +21,8 @@ import {
   type ProbeContext,
   type ProviderAdapter,
   type ProviderLogin,
+  type CheckinRemoteState,
+  type CheckinResult,
 } from './base.js';
 
 /**
@@ -65,6 +67,18 @@ const LINGXI_USAGE_URL = 'https://lingxi.kdocs.cn/';
 /** 登录判据 / 余额接口（网页端自己会请求它） */
 const LINGXI_BALANCE_PATH = '/api/public/v1/credits/balance';
 const LINGXI_IDENTITY_PATH = '/api/aigc/v3/assistant/identity';
+/**
+ * 任务中心：每日签到是其中的 `daily_check_in` 任务（前端 TaskCenter 的 taskKey）。
+ *
+ *   GET  /api/public/v1/tasks                     → { tasks[], total_claimed_credits }
+ *   POST /api/public/v1/tasks/daily_check_in/claim → { extra, total_claimed_credits }
+ *
+ * 每日任务的 `extra` 里带 `today_day` 与 `check_in_days[]`（`{day,status}`），
+ * 今天那一项 `status === "claimed"` 就是「已签到」——只看这一项，
+ * 不拿任务级 `status` 反推，避免一次性任务的状态串味。
+ */
+const LINGXI_TASKS_PATH = '/api/public/v1/tasks';
+const LINGXI_SIGNIN_TASK_KEY = 'daily_check_in';
 
 /**
  * 逐笔流水的单页条数。
@@ -163,6 +177,22 @@ async function lingxiGet(
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+async function lingxiPost(
+  account: AccountConfig,
+  ctx: ProbeContext,
+  path: string,
+  label: string,
+): Promise<unknown> {
+  const cookie = resolveCookie(account, ctx);
+  const origin = resolveOrigin(account);
+  const { body } = await fetchJson(`${origin}${path}`, {
+    method: 'POST',
+    headers: lingxiHeaders(cookie, origin),
+    timeoutMs: ctx.timeoutMs || LINGXI_TIMEOUT_FALLBACK,
+  });
+  return unwrap(body, label);
 }
 
 function fmtAmount(value: number | null): string {
@@ -580,6 +610,160 @@ function makeLingxiWebLogin(usageUrl: string): ProviderLogin {
 }
 
 /* ------------------------------------------------------------------ *
+ * 每日签到（任务中心的 daily_check_in）
+ * ------------------------------------------------------------------ */
+
+export interface LingxiSigninDay {
+  /** 周期内第几天（上游从 1 开始） */
+  day: number;
+  /** `available` / `claimed` / 其它（未开放、已错过） */
+  status: string;
+}
+
+export interface LingxiDailyTask {
+  taskKey: string;
+  /** 任务级状态：`incomplete` / `claimable` / `claimed` */
+  taskStatus: string;
+  rewardAmount: number | null;
+  /** 当前是周期里的第几天 */
+  todayDay: number | null;
+  /** 今天这一签的奖励 */
+  todayReward: number | null;
+  days: LingxiSigninDay[];
+  totalClaimed: number | null;
+}
+
+/** 从 `GET /tasks` 的 data 里取每日签到任务；没有则 null */
+export function parseLingxiDailyTask(data: unknown): LingxiDailyTask | null {
+  const tasks = isRecord(data) && Array.isArray(data.tasks) ? (data.tasks as unknown[]) : [];
+  const records = tasks.filter(isRecord);
+  const daily =
+    records.find((item) => String(pick(item, 'task_key', 'taskKey') ?? '') === LINGXI_SIGNIN_TASK_KEY) ??
+    records.find((item) => String(pick(item, 'type') ?? '') === 'daily');
+  if (!daily) return null;
+
+  const extra = isRecord(daily.extra) ? daily.extra : {};
+  const rawDays = Array.isArray(extra.check_in_days) ? (extra.check_in_days as unknown[]) : [];
+  const days: LingxiSigninDay[] = [];
+  for (const raw of rawDays) {
+    if (!isRecord(raw)) continue;
+    const day = firstNumber(pick(raw, 'day'));
+    if (day === null) continue;
+    days.push({ day, status: firstString(pick(raw, 'status')) ?? '' });
+  }
+
+  return {
+    taskKey: firstString(pick(daily, 'task_key', 'taskKey')) ?? LINGXI_SIGNIN_TASK_KEY,
+    taskStatus: firstString(pick(daily, 'status')) ?? '',
+    rewardAmount: firstNumber(pick(daily, 'reward_amount', 'rewardAmount')),
+    todayDay: firstNumber(pick(extra, 'today_day', 'todayDay')),
+    todayReward: firstNumber(pick(extra, 'today_reward', 'todayReward')),
+    days,
+    totalClaimed: isRecord(data) ? firstNumber(pick(data, 'total_claimed_credits', 'totalClaimedCredits')) : null,
+  };
+}
+
+/** 今天是否已签到：以 `check_in_days` 里今天那一项为准 */
+export function lingxiSignedToday(task: LingxiDailyTask): boolean {
+  const today = task.todayDay === null
+    ? null
+    : task.days.find((item) => item.day === task.todayDay) ?? null;
+  if (today) return today.status === 'claimed';
+  // 没有天维度（上游改版）时退回任务级状态；`claimable` 仍算未签
+  return task.taskStatus === 'claimed';
+}
+
+function lingxiSigninCredit(task: LingxiDailyTask): number | undefined {
+  const credit = task.todayReward ?? task.rewardAmount;
+  return credit !== null && credit > 0 ? credit : undefined;
+}
+
+/** 只读：今天签没签、今天这一签值多少 */
+export async function lingxiCheckinStatus(
+  account: AccountConfig,
+  ctx: ProbeContext,
+): Promise<CheckinRemoteState> {
+  const data = await lingxiGet(account, ctx, LINGXI_TASKS_PATH, '任务面板请求失败');
+  const task = parseLingxiDailyTask(data);
+  if (!task) return { signedToday: false, inactive: true, message: '当前没有每日签到活动' };
+
+  if (lingxiSignedToday(task)) {
+    const credit = lingxiSigninCredit(task);
+    return {
+      signedToday: true,
+      ...(credit !== undefined ? { credit } : {}),
+      message: credit !== undefined ? `今日已签到（${credit} 智点）` : '今日已签到',
+    };
+  }
+
+  const today = task.todayDay === null
+    ? null
+    : task.days.find((item) => item.day === task.todayDay) ?? null;
+  if (today && today.status !== 'available') {
+    return {
+      signedToday: false,
+      inactive: true,
+      message: `今天不可签到（status=${today.status || 'unknown'}）`,
+    };
+  }
+  return { signedToday: false, message: '今天未签到' };
+}
+
+/** 每日签到：先读只读状态，已签 / 无活动不重复领 */
+export async function lingxiCheckin(
+  account: AccountConfig,
+  ctx: ProbeContext,
+): Promise<CheckinResult> {
+  try {
+    const before = await lingxiCheckinStatus(account, ctx);
+    if (before.signedToday) {
+      return {
+        outcome: 'done',
+        ...(before.credit !== undefined ? { credit: before.credit } : {}),
+        message: before.message ?? '今日已签到',
+      };
+    }
+    if (before.inactive) {
+      return { outcome: 'inactive', message: before.message ?? '当前没有每日签到活动' };
+    }
+  } catch (error) {
+    // 状态接口失败不阻断签到：直接尝试领取，失败原因如实返回
+    ctx.log(`WPS 灵犀签到状态读取失败（继续尝试签到）：${(error as Error).message}`);
+  }
+
+  try {
+    const data = await lingxiPost(
+      account,
+      ctx,
+      `${LINGXI_TASKS_PATH}/${LINGXI_SIGNIN_TASK_KEY}/claim`,
+      '签到失败',
+    );
+    const extra = isRecord(data) && isRecord(data.extra) ? data.extra : {};
+    const credit = firstNumber(pick(extra, 'today_reward', 'todayReward'));
+    return {
+      outcome: 'claimed',
+      ...(credit !== null && credit > 0 ? { credit } : {}),
+      message: credit !== null && credit > 0 ? `签到成功 +${credit} 智点` : '签到成功',
+    };
+  } catch (error) {
+    // 领取失败后再核对一次：可能是「已在别处签过」，避免误报失败
+    try {
+      const after = await lingxiCheckinStatus(account, ctx);
+      if (after.signedToday) {
+        return {
+          outcome: 'done',
+          ...(after.credit !== undefined ? { credit: after.credit } : {}),
+          message: after.message ?? '今日已签到',
+        };
+      }
+    } catch {
+      // 状态也查不到：保留原始错误
+    }
+    return { outcome: 'failed', message: `签到失败：${(error as Error).message}` };
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * 适配器
  * ------------------------------------------------------------------ */
 
@@ -640,6 +824,15 @@ export const lingxiAdapter: ProviderAdapter = {
       ctx.log(`WPS 灵犀智点流水获取失败（退回本地采样）：${(error as Error).message}`);
       return null;
     }
+  },
+
+  checkin: {
+    support: (account) =>
+      Boolean(account.credentials.cookie || account.credentials.cookieHeader)
+        ? { ok: true }
+        : { ok: false, reason: '需要 WPS 网页登录态 Cookie 才能签到' },
+    status: (account, ctx) => lingxiCheckinStatus(account, ctx),
+    run: (account, ctx) => lingxiCheckin(account, ctx),
   },
 
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {

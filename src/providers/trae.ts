@@ -20,6 +20,7 @@ import {
   notConfigured,
   optString,
   type CheckinResult,
+  type CheckinRemoteState,
   type ProbeContext,
   type ProviderAdapter,
 } from './base.js';
@@ -813,6 +814,39 @@ export async function traeCheckin(
   }
 }
 
+/** 只读：今天签了没有（同一个 status 接口，不调 claim） */
+export async function traeCheckinStatus(
+  account: AccountConfig,
+  ctx: ProbeContext,
+): Promise<CheckinRemoteState> {
+  const token = await resolveJwt(account, ctx);
+  return traeWithAuthRetry({
+    label: 'Trae ',
+    ctx,
+    token,
+    resolve: (options) => resolveJwt(account, ctx, options),
+    invalidate: () => invalidateJwtCaches(account, ctx),
+    run: async (jwt) => {
+      const status = await traeCheckinCall(account, ctx, jwt, 'status');
+      const code = firstNumber(pick(status, 'code')) ?? 0;
+      if (code === 1001) throw new Error('Trae 登录态已失效，请重新登录');
+      if (code !== 0) throw new Error(traeCheckinRefusal(code, status.message));
+      const credits = firstNumber(pick(status, 'credits')) ?? 0;
+      if (pick(status, 'checked_in', 'checkedIn') === true) {
+        return {
+          signedToday: true,
+          ...(credits > 0 ? { credit: credits } : {}),
+          message: credits > 0 ? `今日已签到（${credits} 积分）` : '今日已签到',
+        };
+      }
+      if (pick(status, 'enable') === false) {
+        return { signedToday: false, inactive: true, message: 'Trae 当前没有开启每日签到活动' };
+      }
+      return { signedToday: false, message: '今天未签到' };
+    },
+  });
+}
+
 function traeCheckinRefusal(code: number, message?: string): string {
   const said = typeof message === 'string' && message.trim() ? `：${message.trim()}` : '';
   return `Trae 返回 code=${code}${said}`;
@@ -1200,6 +1234,7 @@ export const traeAdapter: ProviderAdapter = {
       Boolean(account.credentials.cookie) || Boolean(account.credentials.accessToken)
         ? { ok: true }
         : { ok: false, reason: '需要 Cookie 或登录令牌才能签到' },
+    status: (account, ctx) => traeCheckinStatus(account, ctx),
     run: (account, ctx) => traeCheckin(account, ctx),
   },
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {

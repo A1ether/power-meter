@@ -20,6 +20,7 @@ import {
   optString,
   splitByExpiry,
   type CheckinResult,
+  type CheckinRemoteState,
   type ProbeContext,
   type ProviderAdapter,
   type ProviderLogin,
@@ -707,6 +708,37 @@ export async function minimaxCheckin(
   }
 }
 
+/** 只读：今天的签到面板状态（不调用 claim） */
+export async function minimaxCheckinStatus(
+  account: AccountConfig,
+  ctx: ProbeContext,
+): Promise<CheckinRemoteState> {
+  const statusBody = await minimaxGet(account, ctx, '/minimax-cloud/api/v1/signin/status', [
+    ['timezone_id', 'Asia/Shanghai'],
+  ]);
+  assertBaseResp(statusBody, '签到状态请求失败');
+  const statusPayload = isRecord(statusBody) && isRecord(statusBody.data) ? statusBody.data : statusBody;
+  const days = pick(statusPayload, 'days');
+  if (!Array.isArray(days)) throw new Error('签到面板响应缺少 days 字段（接口可能已改版）');
+  const today = days.find((raw) => isRecord(raw) && pick(raw, 'is_today', 'isToday') === true);
+  if (!isRecord(today)) {
+    return { signedToday: false, inactive: true, message: '当前没有可参与的签到活动' };
+  }
+  const points = firstNumber(pick(today, 'points')) ?? 0;
+  const status = firstNumber(pick(today, 'status'));
+  if (status === 3) {
+    return {
+      signedToday: true,
+      ...(points > 0 ? { credit: points } : {}),
+      message: points > 0 ? `今日已签到（${points} 积分）` : '今日已签到',
+    };
+  }
+  if (status === 1 || status === 4) {
+    return { signedToday: false, inactive: true, message: '今天不可签到' };
+  }
+  return { signedToday: false, message: '今天未签到' };
+}
+
 export interface MinimaxCreditDetail {
   /** 1=购买 2=签到 */
   creditType: number;
@@ -1342,6 +1374,7 @@ export const minimaxAdapter: ProviderAdapter = {
         ? { ok: true }
         : { ok: false, reason: '缺少 MiniMax 登录 token / Cookie，无法签到' };
     },
+    status: (account, ctx) => minimaxCheckinStatus(account, ctx),
     run: (account, ctx) => minimaxCheckin(account, ctx),
   },
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {

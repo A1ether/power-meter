@@ -2,7 +2,12 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { resolveRuntimeDir, type AccountConfig } from './config.js';
 import { resolveAdapter } from './providers/index.js';
-import type { CheckinOutcome, CheckinResult, ProbeContext } from './providers/base.js';
+import type {
+  CheckinOutcome,
+  CheckinRemoteState,
+  CheckinResult,
+  ProbeContext,
+} from './providers/base.js';
 
 /**
  * 每日签到的编排层。
@@ -43,6 +48,24 @@ export interface CheckinAccountState {
   supported: boolean;
   reason: string | null;
   record: CheckinRecord | null;
+  /**
+   * 上游只读核对结果：本机没有今天的「已签到/已领取」记录时才会查。
+   * 用于纠正「在官方客户端签到后，看板仍显示未签到」。
+   */
+  remote: CheckinRemoteView | null;
+  /** 上游核对失败的原因（不含凭证）；仅用于诊断 */
+  remoteError: string | null;
+}
+
+/** `CheckinRemoteState` 的下发形态：字段归一化 + 查询时间 */
+export interface CheckinRemoteView {
+  signedToday: boolean;
+  credit: number | null;
+  streak: number | null;
+  inactive: boolean;
+  message: string;
+  /** 查询时间 ISO */
+  at: string;
 }
 
 export interface CheckinStatus {
@@ -74,6 +97,20 @@ const DEFAULT_SETTINGS: CheckinSettings = { auto: false, at: '09:00' };
 const AUTO_RETRY_COOLDOWN_MS = 30 * 60_000;
 const AUTO_MAX_TRIES = 3;
 const AUTO_CONCURRENCY = 2;
+/**
+ * 只读远程状态的缓存：签到状态变化不频繁，5 分钟足够；
+ * 失败只缓存 1 分钟，避免上游临时抖动让状态长期停在「未知」。
+ */
+const REMOTE_STATUS_TTL_MS = 5 * 60_000;
+const REMOTE_STATUS_ERROR_TTL_MS = 60_000;
+const REMOTE_STATUS_CONCURRENCY = 3;
+/**
+ * 单次远程核对的硬上限。
+ *
+ * 平台的 ctx.timeoutMs 是给「探测」用的（最长十几秒），签到状态是列表页的
+ * 附属信息，不该让弹窗等那么久；超时按「查不到」处理，界面回落到本地口径。
+ */
+const REMOTE_STATUS_TIMEOUT_MS = 5_000;
 /**
  * 当天不再重试的结果。
  *
@@ -131,10 +168,48 @@ function toRecord(result: CheckinResult, now: number, tries: number): CheckinRec
   };
 }
 
+function toRemoteView(state: CheckinRemoteState, now: number): CheckinRemoteView {
+  const credit =
+    typeof state.credit === 'number' && Number.isFinite(state.credit) ? state.credit : null;
+  const streak =
+    typeof state.streak === 'number' && Number.isFinite(state.streak) ? state.streak : null;
+  return {
+    signedToday: state.signedToday === true,
+    credit,
+    streak,
+    inactive: state.inactive === true,
+    message: typeof state.message === 'string' ? state.message : '',
+    at: new Date(now).toISOString(),
+  };
+}
+
+/** 给远程核对加硬超时：超时当作「查不到」，不拖住 /api/checkin */
+function withTimeout<T>(task: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label}超时（${ms}ms）`)), ms);
+    timer.unref?.();
+    task.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 export class CheckinManager {
   private readonly filePath: string;
   private file: CheckinFile;
   private readonly inflight = new Map<string, Promise<CheckinRecord>>();
+  /** 上游只读状态缓存：key 与签到记录一致（provider|accountId） */
+  private readonly remoteCache = new Map<
+    string,
+    { at: number; view: CheckinRemoteView | null; error: string | null }
+  >();
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
 
@@ -143,12 +218,18 @@ export class CheckinManager {
     this.file = this.load();
   }
 
-  status(): CheckinStatus {
+  /**
+   * 签到状态：本地结果优先；本地今天没有「已签到/已领取」时，
+   * 向上游做一次只读核对（`checkin.status()`），结果放在 `remote` 里。
+   */
+  async status(): Promise<CheckinStatus> {
     this.host.ensureFresh();
-    const accounts = this.host.accounts().map((account) => this.describe(account));
+    const accounts = this.host.accounts();
+    const entries = accounts.map((account) => this.describe(account));
+    await this.refreshRemoteStates(accounts, entries);
     return {
       settings: { ...this.file.settings },
-      accounts,
+      accounts: entries,
       running: [...this.inflight.keys()],
     };
   }
@@ -257,6 +338,8 @@ export class CheckinManager {
     const key = checkinAccountKey(provider, accountId);
     const running = this.inflight.get(key);
     if (running) return running;
+    // 本次执行会改变上游与本地状态：旧的上游核对结果立即作废
+    this.remoteCache.delete(key);
 
     const task = (async (): Promise<CheckinRecord> => {
       const adapter = resolveAdapter(account.provider);
@@ -313,7 +396,80 @@ export class CheckinManager {
       supported: support.ok,
       reason: support.ok ? null : support.reason,
       record: this.file.accounts[checkinAccountKey(provider, accountId)] ?? null,
+      remote: null,
+      remoteError: null,
     };
+  }
+
+  /**
+   * 本地今天没有「已签到/已领取」记录时，向上游只读核对一次。
+   *
+   * - 只对启用且支持、且适配器声明了 `status()` 的账号发起；
+   * - 结果按账号缓存（成功 5 分钟 / 失败 1 分钟），避免每次打开弹窗都打上游；
+   * - 上游失败只记 `remoteError`，**不**改变本地口径（查不到 ≠ 未签到）。
+   */
+  private async refreshRemoteStates(
+    accounts: AccountConfig[],
+    entries: CheckinAccountState[],
+  ): Promise<void> {
+    const now = Date.now();
+    const day = beijingDayKey(now);
+    const queue: Array<{
+      entry: CheckinAccountState;
+      account: AccountConfig;
+      key: string;
+      status: (account: AccountConfig, ctx: ProbeContext) => Promise<CheckinRemoteState>;
+    }> = [];
+
+    for (let index = 0; index < accounts.length; index += 1) {
+      const account = accounts[index] as AccountConfig;
+      const entry = entries[index] as CheckinAccountState;
+      if (!account.enabled || !entry.supported) continue;
+      // 本地已经确认今天签过（claimed/done），不再打上游；
+      // 其它结果（failed / ineligible / inactive）仍要核对，可能在别处已经签了
+      if (
+        entry.record?.day === day &&
+        (entry.record.outcome === 'claimed' || entry.record.outcome === 'done')
+      ) {
+        continue;
+      }
+      const adapter = resolveAdapter(account.provider);
+      const status = adapter?.checkin?.status;
+      if (!adapter || !status) continue;
+
+      const key = checkinAccountKey(adapter.id, account.displayName ?? '');
+      const cached = this.remoteCache.get(key);
+      if (cached) {
+        const ttl = cached.view ? REMOTE_STATUS_TTL_MS : REMOTE_STATUS_ERROR_TTL_MS;
+        if (now - cached.at < ttl) {
+          entry.remote = cached.view;
+          entry.remoteError = cached.error;
+          continue;
+        }
+      }
+      queue.push({ entry, account, key, status });
+    }
+
+    if (queue.length === 0) return;
+    await this.mapLimit(queue, REMOTE_STATUS_CONCURRENCY, async (item) => {
+      try {
+        const state = await withTimeout(
+          item.status(item.account, this.host.context(item.account)),
+          REMOTE_STATUS_TIMEOUT_MS,
+          '签到状态查询',
+        );
+        const view = toRemoteView(state, Date.now());
+        this.remoteCache.set(item.key, { at: Date.now(), view, error: null });
+        item.entry.remote = view;
+        item.entry.remoteError = null;
+      } catch (error) {
+        const message = (error as Error).message;
+        this.remoteCache.set(item.key, { at: Date.now(), view: null, error: message });
+        item.entry.remote = null;
+        item.entry.remoteError = message;
+        console.warn(`[checkin] ${item.entry.displayName} 签到状态核对失败（按本地口径）：${message}`);
+      }
+    });
   }
 
   private supportOf(

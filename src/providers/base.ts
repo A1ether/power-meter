@@ -100,6 +100,26 @@ export interface CheckinResult {
 }
 
 /**
+ * 上游「今天是否已签到」的只读答案。
+ *
+ * 单独于 `CheckinResult`：这是**观察**，不是本看板执行的结果。
+ * 用户完全可能在官方客户端签到，本地 `.run/checkin.json` 不会有记录；
+ * 没有这个字段，看板会把「没签过」误报成「今天未签到」。
+ */
+export interface CheckinRemoteState {
+  /** 平台确认今天已经签过 */
+  signedToday: boolean;
+  /** 今天这一签对应的积分（平台给出时才有） */
+  credit?: number;
+  /** 平台给出的连续 / 周期天数（有则带） */
+  streak?: number;
+  /** 平台当前没有可参与的签到活动 */
+  inactive?: boolean;
+  /** 面向用户的一句话，不含凭证 */
+  message?: string;
+}
+
+/**
  * 平台的签到能力。
  *
  * `support()` 只做凭证形态判断，不发上游请求；不支持时 UI 直接给出原因，
@@ -107,6 +127,15 @@ export interface CheckinResult {
  */
 export interface ProviderCheckin {
   support(account: AccountConfig): { ok: true } | { ok: false; reason: string };
+  /**
+   * 只读查询「今天签了没有」。
+   *
+   * 约束：
+   *   - **不得**调用任何领取 / 签到写接口；
+   *   - 未声明 = 该平台没有只读状态接口，看板只认本地记录；
+   *   - 抛错表示「查不到」，由编排层降级为本地口径，不当作「未签到」。
+   */
+  status?(account: AccountConfig, ctx: ProbeContext): Promise<CheckinRemoteState>;
   run(account: AccountConfig, ctx: ProbeContext): Promise<CheckinResult>;
 }
 

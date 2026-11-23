@@ -13,12 +13,12 @@ import '../accounts/secret_tile.dart';
 const int _visibleLots = 3;
 const int _visibleEntries = 2;
 
-String _checkinChipText(List<CheckinRecord> claimed) {
-  if (claimed.length == 1) {
-    final credit = claimed.first.credit;
+String _checkinChipText(List<double?> credits) {
+  if (credits.length == 1) {
+    final credit = credits.first;
     return credit == null || credit == 0 ? '已签到' : '签到 +${fmtCheckinCredit(credit)}';
   }
-  return '已签到 ${claimed.length} 个账号';
+  return '已签到 ${credits.length} 个账号';
 }
 
 class ProviderCard extends ConsumerStatefulWidget {
@@ -119,14 +119,28 @@ class _ProviderCardState extends ConsumerState<ProviderCard> {
     final grouped = provider.groupAccounts || provider.entries.isNotEmpty;
     final showManage = canManage && meta != null && meta.manageAccounts;
 
-    // 签到状态是整页共享的一份；这里只取与当前卡片账号相关、且发生在今天的记录。
+    // 签到状态是整页共享的一份；这里只取与当前卡片账号相关、且发生在今天的结论。
+    // 本地记录优先，其次上游只读核对（remote）——用户在官方客户端签到时只有后者。
     final checkinStatus = ref.watch(checkinProvider).valueOrNull;
     final todayCheckins = <CheckinRecord>[];
+    final todaySignedCredits = <double?>[];
+    void collectCheckin(CheckinAccountState? state) {
+      final record = state?.record;
+      final recordToday = record?.isForToday() ?? false;
+      if (record != null && recordToday) todayCheckins.add(record);
+      if (state?.signedToday ?? false) {
+        todaySignedCredits.add(recordToday ? record?.credit : state?.remote?.credit);
+      }
+    }
+
     if (healthy) {
-      for (final entry in provider.entries) {
-        final state = checkinAccountFor(checkinStatus, provider.provider, entry.id);
-        final record = state?.record;
-        if (record != null && record.isForToday()) todayCheckins.add(record);
+      // 非合并卡片没有 entries，账号身份在 provider.accountId 上（与 Web 看板一致）。
+      if (provider.entries.isEmpty) {
+        collectCheckin(checkinAccountFor(checkinStatus, provider.provider, provider.accountId));
+      } else {
+        for (final entry in provider.entries) {
+          collectCheckin(checkinAccountFor(checkinStatus, provider.provider, entry.id));
+        }
       }
     }
 
@@ -204,17 +218,9 @@ class _ProviderCardState extends ConsumerState<ProviderCard> {
                               foreground: tones.critical,
                               background: tones.criticalContainer,
                             ),
-                          if (todayCheckins.any((record) => record.outcome == 'claimed'))
+                          if (todaySignedCredits.isNotEmpty)
                             _Pill(
-                              text: _checkinChipText(
-                                todayCheckins.where((record) => record.outcome == 'claimed').toList(),
-                              ),
-                              foreground: tones.success,
-                              background: tones.successContainer,
-                            )
-                          else if (todayCheckins.any((record) => record.outcome == 'done'))
-                            _Pill(
-                              text: '今日已签到',
+                              text: _checkinChipText(todaySignedCredits),
                               foreground: tones.success,
                               background: tones.successContainer,
                             ),
@@ -233,54 +239,73 @@ class _ProviderCardState extends ConsumerState<ProviderCard> {
               ],
             ),
             const SizedBox(height: 14),
+            // 额度 + 操作按钮同一行：数值可压缩（超长时省略），操作组放不下时换行。
+            // 原来用固定 Row + Spacer，窄卡片下「删除」会被挤出卡片右边界裁掉。
             Row(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
-                Text(
-                  healthy ? fmtNumber(provider.balanceAmount) : '—',
-                  style: theme.textTheme.displaySmall,
-                ),
-                const SizedBox(width: 8),
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 5),
-                  child: Text(
-                    healthy ? provider.currency : '',
-                    style: theme.textTheme.labelLarge?.copyWith(color: scheme.onSurfaceVariant),
+                Flexible(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        Text(
+                          healthy ? fmtNumber(provider.balanceAmount) : '—',
+                          style: theme.textTheme.displaySmall,
+                        ),
+                        const SizedBox(width: 8),
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 5),
+                          child: Text(
+                            healthy ? provider.currency : '',
+                            style: theme.textTheme.labelLarge
+                                ?.copyWith(color: scheme.onSurfaceVariant),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
-                const Spacer(),
+                const SizedBox(width: 8),
                 if (showManage)
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (grouped)
-                        TextButton.icon(
-                          onPressed: () => setState(() => _manageOpen = !_manageOpen),
-                          icon: Icon(_manageOpen ? Icons.expand_less : Icons.add),
-                          label: Text(_manageOpen ? '收起' : '添加账号'),
-                        )
-                      else if (meta.hasLogin)
-                        TextButton(
-                          onPressed: () => setState(() => _manageOpen = !_manageOpen),
-                          child: Text(_manageOpen ? '收起' : '重新登录'),
-                        ),
-                      if (!grouped)
-                        IconButton(
-                          tooltip: '删除账号',
-                          onPressed: _deleting
-                              ? null
-                              : () => _removeAccount(
-                                    provider.accountId,
-                                    provider.displayName.isEmpty ? '未命名账号' : provider.displayName,
-                                  ),
-                          icon: _deleting
-                              ? const SizedBox.square(
-                                  dimension: 18,
-                                  child: CircularProgressIndicator(strokeWidth: 2),
-                                )
-                              : Icon(Icons.delete_outline, color: scheme.error),
-                        ),
-                    ],
+                  Flexible(
+                    child: Wrap(
+                      alignment: WrapAlignment.end,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      spacing: 4,
+                      children: [
+                        if (grouped)
+                          TextButton.icon(
+                            onPressed: () => setState(() => _manageOpen = !_manageOpen),
+                            icon: Icon(_manageOpen ? Icons.expand_less : Icons.add),
+                            label: Text(_manageOpen ? '收起' : '添加账号'),
+                          )
+                        else if (meta.hasLogin)
+                          TextButton(
+                            onPressed: () => setState(() => _manageOpen = !_manageOpen),
+                            child: Text(_manageOpen ? '收起' : '重新登录'),
+                          ),
+                        if (!grouped)
+                          IconButton(
+                            tooltip: '删除账号',
+                            onPressed: _deleting
+                                ? null
+                                : () => _removeAccount(
+                                      provider.accountId,
+                                      provider.displayName.isEmpty ? '未命名账号' : provider.displayName,
+                                    ),
+                            icon: _deleting
+                                ? const SizedBox.square(
+                                    dimension: 18,
+                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                  )
+                                : Icon(Icons.delete_outline, color: scheme.error),
+                          ),
+                      ],
+                    ),
                   ),
               ],
             ),
@@ -447,7 +472,6 @@ class _ProviderCardState extends ConsumerState<ProviderCard> {
     final busySet = ref.watch(checkinBusyProvider);
     final key = checkinKeyOf(provider.provider, entry.id);
     final checkin = checkinAccountFor(checkinStatus, provider.provider, entry.id);
-    final record = checkin?.record;
     return _EntryRow(
       provider: provider,
       entry: entry,
@@ -456,7 +480,7 @@ class _ProviderCardState extends ConsumerState<ProviderCard> {
       canCheckin: ref.watch(runtimeProvider).canManageAccounts,
       checkin: checkin,
       checkinBusy: busySet.contains(key) || (checkinStatus?.running.contains(key) ?? false),
-      checkinSettled: (record?.isForToday() ?? false) && (record?.settled ?? false),
+      checkinSettled: checkin?.signedToday ?? false,
       onCheckin: () => _runCheckin(entry),
       onRemove: () => _removeAccount(entry.id, entry.label.isEmpty ? '未命名账号' : entry.label),
     );
@@ -614,6 +638,8 @@ class _EntryRow extends StatelessWidget {
                 ),
               Text(
                 healthy ? '${fmtNumber(entry.amount)} ${entry.currency}' : entry.status,
+                // 窄卡片下长额度不许撑破这一行（原来会挤掉右侧按钮）
+                overflow: TextOverflow.ellipsis,
                 style: theme.textTheme.labelMedium?.copyWith(
                   color: healthy && !empty ? scheme.onSurface : scheme.error,
                 ),
@@ -630,20 +656,22 @@ class _EntryRow extends StatelessWidget {
           if (empty)
             Text('quota 已用尽，该账号调不动',
                 style: theme.textTheme.labelSmall?.copyWith(color: scheme.error)),
-          if (showCheckin && record != null && recordToday)
+          if (showCheckin && (recordToday || checkin!.signedToday))
             Padding(
               padding: const EdgeInsets.only(top: 4),
               child: Text(
-                '签到：${checkinOutcomeText(record)}'
-                '${record.message.isEmpty ? '' : ' · ${record.message}'}',
+                '签到：${checkin!.todayText}'
+                '${checkin!.todayMessage.isEmpty ? '' : ' · ${checkin!.todayMessage}'}',
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
                 style: theme.textTheme.labelSmall?.copyWith(
-                  color: switch (checkinToneFor(record)) {
-                    CheckinTone.ok => tones.success,
-                    CheckinTone.bad => tones.critical,
-                    CheckinTone.muted => scheme.onSurfaceVariant,
-                  },
+                  color: recordToday
+                      ? switch (checkinToneFor(record)) {
+                          CheckinTone.ok => tones.success,
+                          CheckinTone.bad => tones.critical,
+                          CheckinTone.muted => scheme.onSurfaceVariant,
+                        }
+                      : tones.success,
                 ),
               ),
             ),

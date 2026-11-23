@@ -6,8 +6,10 @@
 - 运行时**零第三方依赖**（只用 Node 内置模块），`npm install` 只装 `tsx` / `typescript`
 - CodeBuddy / Trae 支持**扫码或打开链接登录**；Qoder 只保留**网页端登录**（自动抓 Cookie），授权后自动落库，一个账号一张卡片
 - 支持 **每日签到领积分**：卡片可单独签到，顶栏「每日签到」支持一键全部与自动签到（北京时间、默认关闭）；
-  覆盖 MiniMax / Trae 国内版 / Qoder 令牌账号 / CodeBuddy / CodeArts（AK/SK）/ 商汤小浣熊。
-  Qoder 的纯 Cookie 账号与 CodeArts 的纯 Cookie 账号没有签到所需身份/签名能力，界面会明确显示「不支持」
+  覆盖 MiniMax / Trae 国内版 / Qoder 令牌账号 / CodeBuddy 国内版 / CodeArts（AK/SK）/ WPS 灵犀。
+  Qoder 的纯 Cookie 账号与 CodeArts 的纯 Cookie 账号没有签到所需身份/签名能力，界面会明确显示「不支持」；
+  WorkBuddy 国际版与商汤小浣熊没有签到活动，不提供签到入口。
+  签到状态会向上游只读核对：在官方客户端签到后，看板也会显示「今日已签到」
 - 后端聚合 + 缓存 + 失败降级，前端纯静态（无构建步骤）
 - 凭证默认**不下发到浏览器**：只有被显式声明为「可托管」的密钥才提供
   掩码预览 + 按需复制（默认仅限本机），`accounts.json` / `.env` 改动后**热加载**，无需重启
@@ -737,8 +739,11 @@ Trae 的 OAuth 回调 `/authorize` 是唯一例外：浏览器从 trae.cn 跳回
   （`bonus_credits[]` 活动赠送 / `purchased_credits[]` 加量包，每批带 `expire_time`），
   `GET /api/public/v1/credits/transaction/list` 给逐笔流水。卡片按上游批次拆 `CreditLot`，
   到期时间直接取 `expire_time`，进入「最快到期」；批次合计与余额不一致时以余额为准并注明。
-  团队智点与个人智点不通用，只在 note 提示、不计入余额；本轮**只读**，
-  不调用「获取智点」、任务奖励领取或兑换接口。
+  团队智点与个人智点不通用，只在 note 提示、不计入余额；余额**只读**：
+  不调用「获取智点」（`extra_grant/claim`）、不领一次性任务奖励、不兑换。
+  每日签到单独走任务中心：`GET /api/public/v1/tasks` 读今日状态，
+  `POST /api/public/v1/tasks/daily_check_in/claim` 领取；签到状态以
+  `extra.check_in_days` 中今天那一项的 `status` 为准。
   鉴权只认 **WPS 网页登录态 Cookie**（由 `account.kdocs.cn` 写入 `.kdocs.cn` 父域），未登录时余额接口返回
   `401 UserUnauthorized`，因此 `npm run capture -- lingxi` 按 `kdocs.cn` 收集；看板「网页端登录」
   用「页面自己请求 `/api/public/v1/credits/balance` 拿到 2xx」作为登录判据。

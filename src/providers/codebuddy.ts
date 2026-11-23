@@ -19,6 +19,7 @@ import {
   optString,
   splitByExpiry,
   type CheckinResult,
+  type CheckinRemoteState,
   type ProbeContext,
   type ProviderAdapter,
   type ProviderLogin,
@@ -711,6 +712,59 @@ export async function cbCheckin(
 }
 
 /**
+ * 只读查询「今天签了没有」：与 `cbCheckin` 同一个活动状态接口，只读不领。
+ *
+ * 国际站没有每日签到活动，只在国内站声明签到能力，因此这里也只服务国内站。
+ */
+export async function cbCheckinStatus(
+  site: CodeBuddySiteMeta,
+  adapter: ProviderAdapter,
+  account: AccountConfig,
+  ctx: ProbeContext,
+): Promise<CheckinRemoteState> {
+  const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
+  const token = cred(account, ctx, ['accessToken', 'token']);
+  const timeoutMs = ctx.timeoutMs || CB_TIMEOUT_FALLBACK;
+
+  const read = async (headers: Record<string, string>): Promise<CheckinRemoteState> => {
+    const { body } = await fetchJson(
+      `${site.billingOrigin}/v2/billing/meter/checkin-activity-status`,
+      { method: 'POST', headers, body: '{}', timeoutMs },
+    );
+    const envelope = cbEnvelope(body);
+    if (envelope.code !== 0) throw new Error(`上游返回 code=${envelope.code}`);
+    const status: CbCheckinAnswer = isRecord(envelope.data) ? envelope.data : {};
+    if (status.active === false) {
+      return { signedToday: false, inactive: true, message: '当前没有开启每日签到活动' };
+    }
+    const signed = status.today_checked_in === true || status.todayCheckedIn === true;
+    if (!signed) return { signedToday: false };
+    const credit =
+      firstNumber(pick(status, 'today_credit', 'todayCredit', 'daily_credit', 'dailyCredit')) ?? undefined;
+    return {
+      signedToday: true,
+      ...(credit !== undefined && credit > 0 ? { credit } : {}),
+      message: credit !== undefined && credit > 0 ? `今日已签到（${credit} 积分）` : '今日已签到',
+    };
+  };
+
+  if (cookie) {
+    return read({
+      Cookie: cookie,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      Origin: site.billingOrigin,
+      Referer: site.usageUrl,
+      'x-client-platform': 'web',
+    });
+  }
+  if (!token) throw new Error('缺少 Cookie 或登录令牌');
+  return cbWithToken(site, adapter, account, ctx, token, (fresh) =>
+    read(cbBillingHeaders(site, fresh, cbIdentity(account))),
+  );
+}
+
+/**
  * 资源包列表 → 「获取」记录：每个包的当前周期发放时间（CycleStartTime）
  * 与周期额度（CycleCapacitySizePrecise），即页面资源包列表里的发放口径。
  *
@@ -1384,13 +1438,22 @@ function createCodeBuddyAdapter(siteId: CodeBuddySiteId): ProviderAdapter {
     /** 默认登录方法（扫码）；完整清单在对象外组装成 `loginMethods` */
     login: scanLogin,
 
-    checkin: {
-      support: (account) =>
-        Boolean(account.credentials.cookie || account.credentials.accessToken)
-          ? { ok: true }
-          : { ok: false, reason: '需要 Cookie 或登录令牌才能签到' },
-      run: (account, ctx) => cbCheckin(site, adapter, account, ctx),
-    },
+    // 每日签到只在国内站存在；国际站（WorkBuddy）没有签到活动，不声明能力，
+    // 看板也就不会给国际站账号显示签到按钮（2026-11-23 按用户确认裁剪）。
+    ...(site.id === 'cn'
+      ? {
+          checkin: {
+            support: (account: AccountConfig) =>
+              Boolean(account.credentials.cookie || account.credentials.accessToken)
+                ? { ok: true as const }
+                : { ok: false as const, reason: '需要 Cookie 或登录令牌才能签到' },
+            status: (account: AccountConfig, ctx: ProbeContext) =>
+              cbCheckinStatus(site, adapter, account, ctx),
+            run: (account: AccountConfig, ctx: ProbeContext) =>
+              cbCheckin(site, adapter, account, ctx),
+          },
+        }
+      : {}),
     async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
       const cookie = normalizeCookieHeader(cred(account, ctx, ['cookie', 'cookieHeader']));
       // 令牌分支：手工 Cookie 优先（历史账号行为完全不变），没有 Cookie 才走插件令牌

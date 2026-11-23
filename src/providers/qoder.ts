@@ -20,6 +20,7 @@ import {
   optString,
   splitByExpiry,
   type CheckinResult,
+  type CheckinRemoteState,
   type ProbeContext,
   type ProviderAdapter,
   type ProviderLogin,
@@ -317,6 +318,20 @@ async function qoderCampaignCall(
   return body;
 }
 
+/** 从 `/sash/api/v1/me/campaigns` 的响应里取出「每日可领」活动 */
+function qoderDailyCampaigns(body: unknown): QoderCampaign[] {
+  const campaignsRaw = isRecord(body) ? pick(body, 'campaigns', 'data') : undefined;
+  const list = Array.isArray(campaignsRaw)
+    ? campaignsRaw
+    : isRecord(campaignsRaw) && Array.isArray(pick(campaignsRaw, 'campaigns'))
+      ? (pick(campaignsRaw, 'campaigns') as unknown[])
+      : [];
+  return list.filter(
+    (item): item is QoderCampaign =>
+      isRecord(item) && String(pick(item, 'actionType') ?? '') === 'CLAIM_BENEFIT',
+  );
+}
+
 /**
  * Qoder 的每日 Credits：`campaigns` 里 `actionType === CLAIM_BENEFIT` 的活动，
  * 对 `CLAIMABLE` 的逐个领取（移植自 magpie `qoder_checkin.go`）。
@@ -338,16 +353,7 @@ export async function qoderCheckin(
 
   const run = async (token: string) => {
     const body = await qoderCampaignCall(site, account, ctx, token, '/sash/api/v1/me/campaigns', 'GET');
-    const campaignsRaw = isRecord(body) ? pick(body, 'campaigns', 'data') : undefined;
-    const list = Array.isArray(campaignsRaw)
-      ? campaignsRaw
-      : isRecord(campaignsRaw) && Array.isArray(pick(campaignsRaw, 'campaigns'))
-        ? (pick(campaignsRaw, 'campaigns') as unknown[])
-        : [];
-    const daily = list.filter(
-      (item): item is QoderCampaign =>
-        isRecord(item) && String(pick(item, 'actionType') ?? '') === 'CLAIM_BENEFIT',
-    );
+    const daily = qoderDailyCampaigns(body);
     if (daily.length === 0) {
       return { outcome: 'inactive', message: 'Qoder 当前没有每日领取活动' } satisfies CheckinResult;
     }
@@ -436,6 +442,55 @@ export async function qoderCheckin(
     }
   } catch (error) {
     return { outcome: 'failed', message: `Qoder 签到失败：${(error as Error).message}` };
+  }
+}
+
+/** 只读：今天是否已有 CLAIMED 的每日活动（不发起领取） */
+export async function qoderCheckinStatus(
+  account: AccountConfig,
+  ctx: ProbeContext,
+  site: QoderSiteId,
+): Promise<CheckinRemoteState> {
+  const refreshToken = cred(account, ctx, ['refreshToken', 'refresh_token']);
+  const initial = cred(account, ctx, ['accessToken', 'token']);
+  if (!initial) throw new Error('Qoder Cookie 模式没有设备令牌，无法查询签到状态');
+
+  const run = async (token: string): Promise<CheckinRemoteState> => {
+    const body = await qoderCampaignCall(site, account, ctx, token, '/sash/api/v1/me/campaigns', 'GET');
+    const daily = qoderDailyCampaigns(body);
+    if (daily.length === 0) {
+      return { signedToday: false, inactive: true, message: 'Qoder 当前没有每日领取活动' };
+    }
+    const done = daily.find(
+      (campaign) =>
+        String(campaign.claimStatus ?? '') === 'CLAIMED' && qoderCampaignActive(campaign, ctx.now),
+    );
+    if (!done) return { signedToday: false, message: '今天未签到' };
+    const credit = firstNumber(pick(done.benefit, 'amount')) ?? undefined;
+    return {
+      signedToday: true,
+      ...(credit !== undefined && credit > 0 ? { credit } : {}),
+      message: credit !== undefined && credit > 0 ? `今日已签到（${credit} Credits）` : '今日已签到',
+    };
+  };
+
+  try {
+    try {
+      return await run(initial);
+    } catch (error) {
+      const authError = error instanceof HttpError && (error.status === 401 || error.status === 403);
+      if (!authError || !refreshToken) throw error;
+      ctx.log('Qoder 登录令牌已失效，尝试用 refreshToken 续期');
+      const refreshed = await qoderRefreshToken(account, ctx, refreshToken, site);
+      if (ctx.persistCredentials) {
+        const patch: Record<string, string> = { accessToken: refreshed.accessToken };
+        if (refreshed.refreshToken) patch.refreshToken = refreshed.refreshToken;
+        await ctx.persistCredentials(patch).catch(() => undefined);
+      }
+      return await run(refreshed.accessToken);
+    }
+  } catch (error) {
+    throw new Error(`Qoder 签到状态查询失败：${(error as Error).message}`);
   }
 }
 
@@ -1642,6 +1697,7 @@ function createQoderAdapter(siteId: QoderSiteId): ProviderAdapter {
               ok: false,
               reason: 'Cookie 模式没有设备令牌，Qoder 签到只支持令牌账号（或在 Qoder 客户端签到）',
             },
+      status: (account, ctx) => qoderCheckinStatus(account, ctx, siteId),
       run: (account, ctx) => qoderCheckin(account, ctx, siteId),
     },
     async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {

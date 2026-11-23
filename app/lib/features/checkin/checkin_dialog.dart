@@ -334,7 +334,10 @@ class _CheckinDialogState extends ConsumerState<CheckinDialog> {
     final tones = context.tones;
     final record = account.record;
     final today = record?.isForToday() ?? false;
-    final tone = checkinToneFor(today ? record : null);
+    final remoteSigned = account.remote?.signedToday ?? false;
+    final tone = today
+        ? checkinToneFor(record)
+        : (remoteSigned ? CheckinTone.ok : CheckinTone.muted);
     final color = switch (tone) {
       CheckinTone.ok => tones.success,
       CheckinTone.bad => tones.critical,
@@ -342,7 +345,7 @@ class _CheckinDialogState extends ConsumerState<CheckinDialog> {
     };
     final key = checkinKeyOf(account.provider, account.accountId);
     final busy = ref.watch(checkinBusyProvider).contains(key) || status.running.contains(key);
-    final settled = today && (record?.settled ?? false);
+    final settled = account.signedToday;
 
     Widget trailing;
     if (!account.enabled) {
@@ -395,25 +398,25 @@ class _CheckinDialogState extends ConsumerState<CheckinDialog> {
                   children: [
                     Flexible(
                       child: Text(
-                        today ? checkinOutcomeText(record!) : '今天未签到',
+                        account.todayText,
                         style: theme.textTheme.labelSmall?.copyWith(color: color),
                       ),
                     ),
-                    if (today && record?.at != null) ...[
+                    if (account.todayAt != null) ...[
                       const SizedBox(width: 8),
                       Text(
-                        _timeText(record!.at!),
+                        _timeText(account.todayAt!),
                         style: theme.textTheme.labelSmall
                             ?.copyWith(color: scheme.onSurfaceVariant),
                       ),
                     ],
                   ],
                 ),
-                if (record != null && record.message.isNotEmpty)
+                if (account.todayMessage.isNotEmpty)
                   Padding(
                     padding: const EdgeInsets.only(top: 2),
                     child: Text(
-                      record.message,
+                      account.todayMessage,
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                       style: theme.textTheme.labelSmall

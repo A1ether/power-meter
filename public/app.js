@@ -457,14 +457,15 @@ async function load(force = false) {
     stopPoll();
   }
   try {
+    // 签到状态是独立接口：失败不阻塞余额首屏；它还会向上游只读核对，
+    // 因此只发起、不等待（服务端另有 5s 硬超时兜底）
+    void loadCheckin().catch(() => null);
     // 元信息与聚合结果并发：不要再把 /api/providers 的往返叠加到首屏等待上
     const [, response] = await Promise.all([
       loadAdapterMeta(),
       fetch(`/api/summary?wait=0${force ? '&force=1' : ''}`, {
         headers: { Accept: 'application/json' },
       }),
-      // 签到状态是独立接口：失败不阻塞余额首屏
-      loadCheckin().catch(() => null),
     ]);
     if (!response.ok) throw new Error(`接口返回 ${response.status}`);
     const data = await response.json();
@@ -875,6 +876,40 @@ function checkinOutcomeClass(record) {
   return 'is-muted';
 }
 
+/**
+ * 「今天签了没有」的统一判据。
+ *
+ * 本地记录（本看板执行过）优先；本地没有今天的结论时，用服务端只读核对到的
+ * `remote` 兜底——用户在官方客户端签到后，本地不会留下任何记录。
+ * 两者都没有才显示「今天未签到」。
+ */
+function checkinEffective(account, today = beijingDayKey()) {
+  const record = account?.record ?? null;
+  if (record?.day === today) {
+    return {
+      signed: record.outcome === 'claimed' || record.outcome === 'done',
+      text: checkinOutcomeText(record),
+      tone: checkinOutcomeClass(record),
+      at: record.at ?? null,
+      message: record.message ?? '',
+      source: 'local',
+    };
+  }
+  const remote = account?.remote ?? null;
+  if (remote?.signedToday) {
+    const credit = typeof remote.credit === 'number' && remote.credit > 0 ? remote.credit : null;
+    return {
+      signed: true,
+      text: credit ? `今日已签到 +${credit}` : '今日已签到',
+      tone: 'is-ok',
+      at: remote.at ?? null,
+      message: remote.message ?? '',
+      source: 'remote',
+    };
+  }
+  return { signed: false, text: '今天未签到', tone: '', at: null, message: remote?.message ?? '', source: 'none' };
+}
+
 function showCheckinMessage(text, kind = '') {
   state.checkinMessage = text;
   if (!els.checkinMessage) return;
@@ -934,13 +969,12 @@ function renderCheckin() {
         element('strong', '', account.displayName),
         element('span', 'muted', account.accountId || '默认账号'),
       );
-      const record = account.record;
-      const isToday = record?.day === today;
-      const result = element('div', `checkin-row__result ${checkinOutcomeClass(record)}`);
-      result.append(element('span', '', isToday ? checkinOutcomeText(record) : '今天未签到'));
-      if (record?.message) result.title = record.message;
-      if (isToday && record?.at) {
-        result.append(element('span', 'checkin-row__time muted', fmtDate(record.at)));
+      const effective = checkinEffective(account, today);
+      const result = element('div', `checkin-row__result ${effective.tone}`);
+      result.append(element('span', '', effective.text));
+      if (effective.message) result.title = effective.message;
+      if (effective.at) {
+        result.append(element('span', 'checkin-row__time muted', fmtDate(effective.at)));
       }
       row.append(identity, result);
 
@@ -951,7 +985,7 @@ function renderCheckin() {
         row.append(element('span', 'muted checkin-row__hint', account.reason || '不支持签到'));
       } else {
         const busy = state.checkinBusy.has(key) || running.has(key);
-        const settled = isToday && (record?.outcome === 'claimed' || record?.outcome === 'done');
+        const settled = effective.signed;
         const button = element(
           'button',
           'btn checkin-row__btn',
@@ -1130,37 +1164,38 @@ function buildCard(provider, thresholds) {
 
   /*
    * 每日签到：只对「支持 + 账号启用 + 卡片健康」的账号展示。
-   * 结果今天有效时才把结论做成徽标；隔天的记录只在弹窗里展示，避免卡片长期挂着旧状态。
+   * 结论按 checkinEffective() 取值：本地结果优先，其次上游只读核对。
    */
   const checkin = healthy && !pending
     ? checkinStateFor(provider.provider, provider.accountId)
     : null;
-  const checkinRecord = checkin?.record ?? null;
-  const checkinToday = checkinRecord?.day === beijingDayKey();
-  if (checkin && checkinToday) {
-    const outcome = checkinRecord.outcome;
-    if (outcome === 'claimed') {
-      tags.append(
-        element(
-          'span',
-          'chip chip--ok',
-          checkinRecord.credit ? `签到 +${checkinRecord.credit}` : '已签到',
-        ),
-      );
-    } else if (outcome === 'done') {
-      tags.append(element('span', 'chip chip--ok', '已签到'));
-    } else if (outcome === 'failed') {
-      tags.append(element('span', 'chip chip--danger', '签到失败'));
-    }
+  const checkinResult = checkin ? checkinEffective(checkin) : null;
+  if (checkin && checkinResult?.signed) {
+    const credit =
+      typeof checkin.remote?.credit === 'number' && checkin.remote.credit > 0
+        ? checkin.remote.credit
+        : null;
+    const localClaimed = checkin.record?.day === beijingDayKey() && checkin.record.outcome === 'claimed';
+    tags.append(
+      element(
+        'span',
+        'chip chip--ok',
+        localClaimed && checkin.record.credit
+          ? `签到 +${checkin.record.credit}`
+          : credit
+            ? `签到 +${credit}`
+            : '已签到',
+      ),
+    );
+  } else if (checkin?.record?.day === beijingDayKey() && checkin.record.outcome === 'failed') {
+    tags.append(element('span', 'chip chip--danger', '签到失败'));
   }
   const checkinBtn = node.querySelector('.card__checkin');
   if (checkinBtn) {
     if (checkin?.supported && checkin.enabled) {
       const key = checkinKeyOf(checkin.provider, checkin.accountId);
       const busy = state.checkinBusy.has(key) || (state.checkin?.running ?? []).includes(key);
-      const settled =
-        checkinToday &&
-        (checkinRecord?.outcome === 'claimed' || checkinRecord?.outcome === 'done');
+      const settled = checkinResult?.signed === true;
       checkinBtn.hidden = false;
       checkinBtn.disabled = busy || settled;
       checkinBtn.textContent = busy
@@ -1168,7 +1203,7 @@ function buildCard(provider, thresholds) {
         : settled
           ? '已签到'
           : '签到';
-      checkinBtn.title = checkinRecord?.message || '为该账号执行今天的签到';
+      checkinBtn.title = checkinResult?.message || '为该账号执行今天的签到';
       checkinBtn.addEventListener('click', () =>
         runCheckin(checkin.provider, checkin.accountId, checkinBtn),
       );

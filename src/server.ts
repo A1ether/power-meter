@@ -376,7 +376,7 @@ const server = createServer(async (req, res) => {
      * 结果文件是运行态（.run/checkin.json），不涉及账号配置写入。
      */
     if (pathname === '/api/checkin' && req.method === 'GET') {
-      sendJson(res, 200, checkins.status());
+      sendJson(res, 200, await checkins.status());
       return;
     }
 

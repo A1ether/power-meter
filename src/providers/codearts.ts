@@ -7,6 +7,7 @@ import type { CreditLot, ProviderSnapshot } from '../types.js';
 import {
   buildCodeArtsSnapshot,
   codeartsCheckin,
+  codeartsCheckinStatus,
   fetchCodeArtsSubscription,
   readCodeArtsAkSk,
 } from './codearts-aksk.js';
@@ -802,6 +803,7 @@ export const codeartsAdapter: ProviderAdapter = {
       readCodeArtsAkSk(account) !== null
         ? { ok: true }
         : { ok: false, reason: 'CodeArts 签到需要 AK/SK；Cookie 模式无法签 snap-access' },
+    status: (account, ctx) => codeartsCheckinStatus(account, ctx),
     run: (account, ctx) => codeartsCheckin(account, ctx),
   },
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {

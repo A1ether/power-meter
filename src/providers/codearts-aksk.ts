@@ -13,6 +13,7 @@ import {
   optString,
   splitByExpiry,
   type CheckinResult,
+  type CheckinRemoteState,
   type ProbeContext,
   type ProviderAdapter,
 } from './base.js';
@@ -329,6 +330,46 @@ export async function codeartsCheckin(
   } catch (error) {
     return { outcome: 'failed', message: `CodeArts 签到失败：${(error as Error).message}` };
   }
+}
+
+/** 只读：今天是否已领取每日活动（不调用 claim / confirm） */
+export async function codeartsCheckinStatus(
+  account: AccountConfig,
+  ctx: ProbeContext,
+): Promise<CheckinRemoteState> {
+  const aksk = readCodeArtsAkSk(account, ctx);
+  if (!aksk) throw new Error('CodeArts 签到状态需要 AK/SK');
+  const timeoutMs = ctx.timeoutMs || AK_SK_TIMEOUT_FALLBACK;
+  const listed = await codeartsSnapCall(
+    aksk,
+    'GET',
+    '/v1/ops/delivery?channel=IDE',
+    undefined,
+    timeoutMs,
+  );
+  const items = isRecord(listed) && Array.isArray(listed.items) ? listed.items : [];
+  const daily = items.filter(
+    (item): item is CodeArtsCampaign =>
+      isRecord(item) &&
+      String(pick(item, 'type') ?? '') === DAILY_CHECKIN_TYPE &&
+      DAILY_CHECKIN_TITLE.test(String(pick(item, 'title') ?? '')),
+  );
+  if (daily.length === 0) {
+    return { signedToday: false, inactive: true, message: '当前没有每日领取活动' };
+  }
+  const done = daily.filter(
+    (item) => item.claimable !== true && CLAIMED_STATUSES.has(String(item.status ?? '')),
+  );
+  if (done.length === 0) return { signedToday: false, message: '今天未签到' };
+  const credit = done.reduce(
+    (sum, item) => sum + (firstNumber(pick(item, 'benefitAmount', 'benefit_amount')) ?? 0),
+    0,
+  );
+  return {
+    signedToday: true,
+    ...(credit > 0 ? { credit } : {}),
+    message: credit > 0 ? `今日已领取（${credit} 积分）` : '今日已领取',
+  };
 }
 
 /**

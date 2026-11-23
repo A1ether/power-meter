@@ -18,7 +18,6 @@ import {
   notConfigured,
   optString,
   splitByExpiry,
-  type CheckinResult,
   type ProbeContext,
   type ProviderAdapter,
   type ProviderLogin,
@@ -348,81 +347,6 @@ async function xhxRefresh(
     accessToken,
     refreshToken: firstString(pick(source, 'refresh_token', 'refreshToken')) || null,
   };
-}
-
-/* ------------------------------------------------------------------ *
- * 每日签到
- * ------------------------------------------------------------------ */
-
-function xhxTodayGrants(body: unknown, day: string): Map<string, number> {
-  const items = isRecord(body) && Array.isArray(body.items) ? body.items : [];
-  const out = new Map<string, number>();
-  for (const raw of items) {
-    const bill = parseBill(raw);
-    if (!bill || bill.points <= 0) continue;
-    // 流水时间是 epoch ms，按北京时间归日（上游可能给 UTC 字符串，不能直接切前 10 位）
-    const billDay = new Date(bill.at + 8 * 3_600_000).toISOString().slice(0, 10);
-    if (billDay !== day) continue;
-    if (/expire|consume|spend/i.test(bill.bizType)) continue;
-    out.set(bill.id, bill.points);
-  }
-  return out;
-}
-
-/**
- * 每日签到（移植自 magpie `opencode-raccoon-auth`）：
- * 小浣熊没有独立的「签到」按钮接口；客户端打开资源页时调用的
- * `POST /api/web/office/v3/setting_info` 会触发当日发放。
- * 因此以「调用前后的发放流水差」判定本次是否真的到账。
- */
-export async function xhxCheckin(
-  account: AccountConfig,
-  ctx: ProbeContext,
-): Promise<CheckinResult> {
-  const day = new Date(ctx.now + 8 * 3_600_000).toISOString().slice(0, 10);
-  // 与适配器取明细同源：v2 bills（服务端按 created_at 倒序，取第一页足够比对当天）
-  const billsPath = '/api/web/points/v2/bills?paging.limit=20&type=all';
-  let before: Map<string, number> | null = null;
-  try {
-    before = xhxTodayGrants(await xhxRequest(account, ctx, billsPath, '签到前积分流水'), day);
-  } catch (error) {
-    ctx.log(`小浣熊签到前流水读取失败（继续尝试触发发放）：${(error as Error).message}`);
-  }
-
-  try {
-    await xhxRequest(account, ctx, '/api/web/office/v3/setting_info', '签到触发', {
-      method: 'POST',
-      body: '{}',
-      headers: { 'X-Raccoon-Language': 'zh' },
-    });
-  } catch (error) {
-    return { outcome: 'failed', message: `签到失败：${(error as Error).message}` };
-  }
-
-  if (!before) {
-    return {
-      outcome: 'done',
-      message: '已触发每日签到；积分流水读取失败，无法确认本次到账',
-    };
-  }
-
-  try {
-    const after = xhxTodayGrants(await xhxRequest(account, ctx, billsPath, '签到后积分流水'), day);
-    let credit = 0;
-    for (const [key, points] of after) {
-      if (before.has(key)) continue;
-      credit += points;
-    }
-    if (credit > 0) {
-      return { outcome: 'claimed', credit, message: `签到成功 +${credit} 积分` };
-    }
-    return { outcome: 'done', message: '今日已签到' };
-  } catch (error) {
-    return {
-      outcome: 'done',
-      message: `已触发每日签到；到账确认失败：${(error as Error).message}`,
-    };
-  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -1224,13 +1148,8 @@ export const xiaohuanxiongAdapter: ProviderAdapter = {
     }
   },
 
-  checkin: {
-    support: (account) =>
-      Boolean(account.credentials.token || account.credentials.accessToken || account.credentials.cookie)
-        ? { ok: true }
-        : { ok: false, reason: '需要登录令牌或 Cookie 才能签到' },
-    run: (account, ctx) => xhxCheckin(account, ctx),
-  },
+  // 小浣熊没有每日签到活动（2026-11-23 按用户确认裁剪）：
+  // 原先用「打开设置页触发发放 + 比对流水」冒充签到，语义不成立，已移除。
   async probe(account: AccountConfig, ctx: ProbeContext): Promise<ProviderSnapshot> {
     const adapter = xiaohuanxiongAdapter;
     // 令牌可以由 Cookie 推导，因此「有令牌」等价于「凭证可用」

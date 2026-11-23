@@ -553,6 +553,39 @@ class CheckinRecord {
       );
 }
 
+/// 上游只读核对结果：本机没有今天的记录时才会出现。
+///
+/// 用户可能在官方客户端签到，本机 `.run/checkin.json` 不会有记录；
+/// 这个字段让看板不至于把「没在本机签过」误报成「今天未签到」。
+class CheckinRemoteState {
+  const CheckinRemoteState({
+    required this.signedToday,
+    this.credit,
+    this.streak,
+    this.inactive = false,
+    this.message = '',
+    this.at,
+  });
+
+  final bool signedToday;
+  final double? credit;
+  final int? streak;
+  final bool inactive;
+  final String message;
+
+  /// 核对时间。
+  final DateTime? at;
+
+  factory CheckinRemoteState.fromJson(Map<String, dynamic> json) => CheckinRemoteState(
+        signedToday: _bool(json['signedToday']),
+        credit: _num(json['credit']),
+        streak: _int(json['streak']),
+        inactive: _bool(json['inactive']),
+        message: _str(json['message']),
+        at: _date(json['at']),
+      );
+}
+
 /// 服务端按账号描述签到能力与最近结果。
 class CheckinAccountState {
   const CheckinAccountState({
@@ -563,6 +596,8 @@ class CheckinAccountState {
     this.supported = false,
     this.reason,
     this.record,
+    this.remote,
+    this.remoteError,
   });
 
   final String provider;
@@ -577,6 +612,47 @@ class CheckinAccountState {
   final String? reason;
   final CheckinRecord? record;
 
+  /// 上游只读核对（本地没有今天的结论时才有值）。
+  final CheckinRemoteState? remote;
+
+  /// 核对失败原因（诊断用，不含凭证）。
+  final String? remoteError;
+
+  /// 今天是否已签到：本地记录优先，其次上游核对。
+  bool get signedToday {
+    final local = record;
+    if (local != null && local.isForToday()) return local.settled;
+    return remote?.signedToday ?? false;
+  }
+
+  /// 今天的状态文案（与 Web 看板 `checkinEffective()` 对齐）。
+  String get todayText {
+    final local = record;
+    if (local != null && local.isForToday()) return checkinOutcomeText(local);
+    final upstream = remote;
+    if (upstream != null && upstream.signedToday) {
+      final credit = upstream.credit;
+      return credit == null || credit == 0
+          ? '今日已签到'
+          : '今日已签到 +${fmtCheckinCredit(credit)}';
+    }
+    return '今天未签到';
+  }
+
+  /// 今天状态对应的时间（本地记录时间或核对时间）。
+  DateTime? get todayAt {
+    final local = record;
+    if (local != null && local.isForToday()) return local.at;
+    return remote?.signedToday == true ? remote?.at : null;
+  }
+
+  /// 今天展示用的补充说明。
+  String get todayMessage {
+    final local = record;
+    if (local != null && local.isForToday()) return local.message;
+    return remote?.message ?? '';
+  }
+
   factory CheckinAccountState.fromJson(Map<String, dynamic> json) => CheckinAccountState(
         provider: _str(json['provider']),
         accountId: _str(json['accountId']),
@@ -585,6 +661,8 @@ class CheckinAccountState {
         supported: _bool(json['supported']),
         reason: _strOrNull(json['reason']),
         record: json['record'] == null ? null : CheckinRecord.fromJson(_obj(json['record'])),
+        remote: json['remote'] == null ? null : CheckinRemoteState.fromJson(_obj(json['remote'])),
+        remoteError: _strOrNull(json['remoteError']),
       );
 }
 
